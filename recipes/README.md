@@ -4,9 +4,18 @@
 
 Проверено на Ubuntu 24.04. Поддерживаемые стеки: Next.js.
 
+## Установка
+
+Рецепты ставятся в `/opt/airlok`: по этому пути на них ссылаются команды из дашборда. Повторный запуск обновляет их до свежей версии.
+
+```bash
+sudo apt-get install -y git && (sudo git -C /opt/airlok pull --ff-only 2>/dev/null || sudo git clone --depth 1 https://github.com/airlok-sh/airlok /opt/airlok)
+```
+
 ## Порядок
 
 ```bash
+cd /opt/airlok/recipes
 sudo ./server-base.sh                 # один раз на сервер
 sudo ./server-base.sh confirm-ssh     # после проверки входа по ключу в новом окне
 sudo ./app-deploy.sh /путь/к/проекту  # деплой и каждая следующая выкатка

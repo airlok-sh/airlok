@@ -89,6 +89,9 @@ check_app() {
 }
 
 install -d -m 755 "$STATE_DIR"
+# Отметка «сервер на связи»: о сайтах healthcheck сообщает только при изменениях,
+# и без неё молчащий исправный сервер выглядел бы в дашборде пропавшим.
+[[ -r $DASHBOARD_CONF ]] && dashboard_call GET /agent/v1/ping >/dev/null
 # Заодно досылаем в дашборд события, которые не ушли раньше: таймер и есть повтор.
 flush_events
 for dir in "$APPS_ROOT"/*/; do

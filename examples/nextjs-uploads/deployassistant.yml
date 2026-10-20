@@ -1,0 +1,25 @@
+version: 1
+
+app:
+  name: uploads-demo
+  stack: nextjs
+  repo: github.com/example/nextjs-uploads
+  branch: main
+  domain: app.example.ru
+
+capabilities:
+  database:
+    enabled: true
+  uploads:
+    enabled: true
+    max_size_mb: 5
+    allowed: [jpg, jpeg, png, webp, pdf]
+    public: true
+  outbound_network: true
+  cron: []
+
+env:
+  - OPENAI_API_KEY
+
+resources:
+  memory_mb: 384

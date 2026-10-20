@@ -5,7 +5,7 @@
 сам ничего не деплоит: только кладёт «репозиторий + коммит» в очередь, которую
 разбирает отдельная служба от root. Deploy key ему недоступен.
 
-Адрес: POST /_deployassistant/hook/<владелец>__<репозиторий>
+Адрес: POST /_airlok/hook/<владелец>__<репозиторий>
 """
 import hashlib
 import hmac
@@ -15,11 +15,11 @@ import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SECRETS_DIR = "/etc/deployassistant/webhook"
-QUEUE_DIR = "/var/lib/deployassistant/queue"
+SECRETS_DIR = "/etc/airlok/webhook"
+QUEUE_DIR = "/var/lib/airlok/queue"
 LISTEN = ("127.0.0.1", 9417)
 MAX_BODY = 1 << 20
-PATH = re.compile(r"^/_deployassistant/hook/([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+)$")
+PATH = re.compile(r"^/_airlok/hook/([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+)$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -32,7 +32,7 @@ def read_file(path):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "da-webhook"
+    server_version = "airlok-webhook"
     sys_version = ""
 
     def reply(self, code, text):

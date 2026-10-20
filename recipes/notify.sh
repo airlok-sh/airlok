@@ -11,18 +11,18 @@ TOKEN_RE='^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$'
 
 install_healthcheck() {
 	local changed=no
-	write_if_changed /etc/systemd/system/da-healthcheck.service 0644 <<EOF && changed=yes
+	write_if_changed /etc/systemd/system/airlok-healthcheck.service 0644 <<EOF && changed=yes
 [Unit]
-Description=DeployAssistant: проверка, что сайты отвечают
+Description=airlok: проверка, что сайты отвечают
 After=docker.service nginx.service
 
 [Service]
 Type=oneshot
 ExecStart=${RECIPES_DIR}/healthcheck.sh
 EOF
-	write_if_changed /etc/systemd/system/da-healthcheck.timer 0644 <<'EOF' && changed=yes
+	write_if_changed /etc/systemd/system/airlok-healthcheck.timer 0644 <<'EOF' && changed=yes
 [Unit]
-Description=DeployAssistant: проверять сайты каждую минуту
+Description=airlok: проверять сайты каждую минуту
 
 [Timer]
 OnBootSec=2min
@@ -33,7 +33,7 @@ AccuracySec=5s
 WantedBy=timers.target
 EOF
 	[[ $changed == yes ]] && systemctl daemon-reload
-	systemctl enable --now da-healthcheck.timer >/dev/null 2>&1
+	systemctl enable --now airlok-healthcheck.timer >/dev/null 2>&1
 	ok "сайты проверяются каждую минуту"
 }
 
@@ -66,11 +66,11 @@ EOF
 	chat=$(find_chat_id "$token") || chat=""
 	[[ $chat =~ ^-?[0-9]+$ ]] || die "бот не видит сообщений. Напишите ему и запустите setup ещё раз"
 
-	install -d -m 755 /etc/deployassistant
+	install -d -m 755 /etc/airlok
 	printf 'TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_CHAT_ID=%s\n' "$token" "$chat" | write_if_changed "$TELEGRAM_CONF" 0600 || true
 	ok "бот подключён, настройки в ${TELEGRAM_CONF} (права 600)"
 	install_healthcheck
-	notify "🔔 DeployAssistant подключён к серверу $(hostname). Сюда будут приходить выкатки, откаты и сообщения о том, что сайт не отвечает."
+	notify "🔔 airlok подключён к серверу $(hostname). Сюда будут приходить выкатки, откаты и сообщения о том, что сайт не отвечает."
 	ok "отправили пробное сообщение — проверьте Telegram"
 }
 
@@ -85,12 +85,12 @@ dashboard() {
 	else
 		read -r token
 	fi
-	[[ $token =~ ^da_srv_[A-Za-z0-9_-]{20,}$ ]] || die "это не похоже на токен агента (da_srv_…)"
+	[[ $token =~ ^airlok_srv_[A-Za-z0-9_-]{20,}$ ]] || die "это не похоже на токен агента (airlok_srv_…)"
 
-	install -d -m 755 /etc/deployassistant
+	install -d -m 755 /etc/airlok
 	local tmp
 	tmp=$(mktemp)
-	printf 'DA_API_URL=%s\nDA_AGENT_TOKEN=%s\n' "$url" "$token" >"$tmp"
+	printf 'AIRLOK_API_URL=%s\nAIRLOK_AGENT_TOKEN=%s\n' "$url" "$token" >"$tmp"
 	local code
 	code=$(DASHBOARD_CONF=$tmp dashboard_call GET /agent/v1/ping) || code=000
 	case $code in

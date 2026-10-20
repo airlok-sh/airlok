@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Проверяет deployassistant.yml и печатает его как присваивания для bash.
+"""Проверяет airlok.yml и печатает его как присваивания для bash.
 
 Все значения проходят строгую проверку формата и экранируются: манифест пишет
 пользователь или его ИИ, а результат исполняется через eval от root.
@@ -99,14 +99,14 @@ def parse(data):
 
 def main():
     if len(sys.argv) != 2:
-        sys.exit("использование: manifest.py deployassistant.yml")
+        sys.exit("использование: manifest.py airlok.yml")
     try:
         with open(sys.argv[1], encoding="utf-8") as f:
             values = parse(yaml.safe_load(f))
     except (OSError, yaml.YAMLError) as e:
         sys.exit(f"Ошибка: не удалось прочитать манифест: {e}")
     except ManifestError as e:
-        sys.exit(f"Ошибка в deployassistant.yml: {e}")
+        sys.exit(f"Ошибка в airlok.yml: {e}")
     for key, value in values.items():
         print(f"{key}={shlex.quote(str(value))}")
 

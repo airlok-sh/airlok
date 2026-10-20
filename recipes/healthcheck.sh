@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Проверяет, что каждый сайт отвечает, и сообщает в Telegram, когда это меняется:
 # «перестал отвечать» с причиной и «снова работает» с длительностью простоя.
-# Запускается таймером da-healthcheck раз в минуту.
+# Запускается таймером airlok-healthcheck раз в минуту.
 #
 # Проверка идёт с самого сервера через nginx. Если сервер выключен целиком, сообщить
 # он не сможет: для этого нужна внешняя проверка.
@@ -9,7 +9,7 @@
 source "$(dirname "$0")/lib.sh"
 set +e
 
-STATE_DIR=/var/lib/deployassistant/health
+STATE_DIR=/var/lib/airlok/health
 FAILS_BEFORE_ALERT=2
 
 diagnose() {
@@ -36,12 +36,12 @@ diagnose() {
 
 check_app() {
 	local name=$1 conf domain code
-	conf=/etc/nginx/sites-enabled/da-${name}.conf
+	conf=/etc/nginx/sites-enabled/airlok-${name}.conf
 	[[ -f $conf ]] || return
 	domain=$(awk '$1=="server_name"{gsub(";", "", $2); print $2; exit}' "$conf")
 
 	# Во время выкатки приложение перезапускается — это не простой.
-	exec 7>"/run/da-deploy-${name}.lock"
+	exec 7>"/run/airlok-deploy-${name}.lock"
 	if ! flock -n 7; then
 		exec 7>&-
 		return

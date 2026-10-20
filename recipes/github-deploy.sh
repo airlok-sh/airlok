@@ -11,11 +11,11 @@
 
 source "$(dirname "$0")/lib.sh"
 
-CONF_DIR=/etc/deployassistant/github
-CACHE_DIR=/var/lib/deployassistant/git
-HOOK_USER=da-hook
-HOOK_SECRETS=/etc/deployassistant/webhook
-QUEUE_DIR=/var/lib/deployassistant/queue
+CONF_DIR=/etc/airlok/github
+CACHE_DIR=/var/lib/airlok/git
+HOOK_USER=airlok-hook
+HOOK_SECRETS=/etc/airlok/webhook
+QUEUE_DIR=/var/lib/airlok/queue
 
 # Ключ хоста github.com, сверен с https://api.github.com/meta (SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU).
 # Заранее известный ключ вместо «доверять при первом подключении»: подменить GitHub нельзя.
@@ -34,9 +34,9 @@ parse_repo() {
 }
 
 git_ssh() {
-	install -d -m 755 /etc/deployassistant
-	write_if_changed /etc/deployassistant/github_known_hosts 0644 <<<"$GITHUB_HOST_KEY" || true
-	export GIT_SSH_COMMAND="ssh -i ${KEY} -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/deployassistant/github_known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes"
+	install -d -m 755 /etc/airlok
+	write_if_changed /etc/airlok/github_known_hosts 0644 <<<"$GITHUB_HOST_KEY" || true
+	export GIT_SSH_COMMAND="ssh -i ${KEY} -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/airlok/github_known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes"
 }
 
 setup() {
@@ -44,7 +44,7 @@ setup() {
 	parse_repo "$1"
 	install -d -m 700 "$CONF_DIR" "$CONF_DIR/$SLUG"
 	if [[ ! -s $KEY ]]; then
-		ssh-keygen -q -t ed25519 -N "" -C "deployassistant@$(hostname) ${REPO}" -f "$KEY"
+		ssh-keygen -q -t ed25519 -N "" -C "airlok@$(hostname) ${REPO}" -f "$KEY"
 		ok "создан ключ для ${REPO}"
 	else
 		ok "ключ для ${REPO} уже есть"
@@ -112,16 +112,16 @@ deploy() {
 	trap 'deploy_trap $?' EXIT
 	fetch
 	resolve "$ref"
-	SRC=$(mktemp -d /tmp/da-src.XXXXXX)
+	SRC=$(mktemp -d /tmp/airlok-src.XXXXXX)
 	local src=$SRC
 	# git archive, а не checkout: в релиз попадает только содержимое коммита, без .git и истории.
 	git --git-dir="$GIT_DIR_PATH" archive "$SHA" | tar -x -C "$src"
-	[[ -f $src/deployassistant.yml ]] || die "в корне ${REPO} нет deployassistant.yml"
+	[[ -f $src/airlok.yml ]] || die "в корне ${REPO} нет airlok.yml"
 	local subject
 	subject=$(git --git-dir="$GIT_DIR_PATH" log -1 --format='%s' "$SHA")
 	ok "${REF_KIND}: ${SHA:0:12} «${subject}»"
 	HANDED_OFF=1
-	DA_RELEASE_ID=${SHA:0:12} DA_RELEASE_TITLE=$subject "$RECIPES_DIR/app-deploy.sh" "$src"
+	AIRLOK_RELEASE_ID=${SHA:0:12} AIRLOK_RELEASE_TITLE=$subject "$RECIPES_DIR/app-deploy.sh" "$src"
 }
 
 log() {
@@ -139,9 +139,9 @@ install_webhook_services() {
 	install -d -m 770 -o root -g "$HOOK_USER" "$QUEUE_DIR"
 
 	local changed=no
-	write_if_changed /etc/systemd/system/da-webhook.service 0644 <<EOF && changed=yes
+	write_if_changed /etc/systemd/system/airlok-webhook.service 0644 <<EOF && changed=yes
 [Unit]
-Description=DeployAssistant: приём webhook GitHub
+Description=airlok: приём webhook GitHub
 After=network.target
 
 [Service]
@@ -165,11 +165,11 @@ EOF
 
 	# Очередь разбирает root: деплою нужны его права, но от webhook сюда приходит
 	# только «репозиторий + хеш», и оба значения проверяются ещё раз.
-	write_if_changed /usr/local/sbin/da-deploy-queue 0755 <<EOF || true
+	write_if_changed /usr/local/sbin/airlok-deploy-queue 0755 <<EOF || true
 #!/usr/bin/env bash
 set -uo pipefail
 shopt -s nullglob
-exec 9>/run/da-deploy-queue.lock
+exec 9>/run/airlok-deploy-queue.lock
 flock 9
 while :; do
 	jobs=(${QUEUE_DIR}/*.job)
@@ -192,18 +192,18 @@ while :; do
 done
 EOF
 
-	write_if_changed /etc/systemd/system/da-deploy-queue.service 0644 <<'EOF' && changed=yes
+	write_if_changed /etc/systemd/system/airlok-deploy-queue.service 0644 <<'EOF' && changed=yes
 [Unit]
-Description=DeployAssistant: выкатки из очереди webhook
+Description=airlok: выкатки из очереди webhook
 After=docker.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/da-deploy-queue
+ExecStart=/usr/local/sbin/airlok-deploy-queue
 EOF
-	write_if_changed /etc/systemd/system/da-deploy-queue.path 0644 <<EOF && changed=yes
+	write_if_changed /etc/systemd/system/airlok-deploy-queue.path 0644 <<EOF && changed=yes
 [Unit]
-Description=DeployAssistant: следить за очередью выкаток
+Description=airlok: следить за очередью выкаток
 
 [Path]
 PathExistsGlob=${QUEUE_DIR}/*.job
@@ -212,11 +212,11 @@ PathExistsGlob=${QUEUE_DIR}/*.job
 WantedBy=paths.target
 EOF
 	[[ $changed == yes ]] && systemctl daemon-reload
-	systemctl enable --now da-webhook.service da-deploy-queue.path >/dev/null 2>&1
-	[[ $changed == yes ]] && systemctl restart da-webhook.service
+	systemctl enable --now airlok-webhook.service airlok-deploy-queue.path >/dev/null 2>&1
+	[[ $changed == yes ]] && systemctl restart airlok-webhook.service
 
-	if write_if_changed /etc/nginx/snippets/da-webhook.conf 0644 <<'EOF'; then
-location ^~ /_deployassistant/hook/ {
+	if write_if_changed /etc/nginx/snippets/airlok-webhook.conf 0644 <<'EOF'; then
+location ^~ /_airlok/hook/ {
     proxy_pass http://127.0.0.1:9417;
     client_max_body_size 1m;
 }
@@ -238,20 +238,23 @@ webhook() {
 	local secret=$HOOK_SECRETS/$SLUG.secret
 	if [[ ! -s $secret ]]; then
 		(umask 027 && openssl rand -hex 32 >"$secret")
-		chgrp "$HOOK_USER" "$secret"
 	fi
+	# Права выставляем каждый раз, а не только при создании: иначе секрет, созданный
+	# раньше другим пользователем приёмника, ему будет не прочитать.
+	chown "root:${HOOK_USER}" "$secret"
+	chmod 640 "$secret"
 	printf '%s\n' "$branch" | write_if_changed "$HOOK_SECRETS/$SLUG.branch" 0644 || true
 
 	local domain
-	domain=$(grep -h '^ *server_name' /etc/nginx/sites-enabled/da-*.conf 2>/dev/null | awk '{gsub(";", "", $2); print $2; exit}')
-	if ! grep -qs 'da-webhook' /etc/nginx/sites-enabled/da-*.conf; then
+	domain=$(grep -h '^ *server_name' /etc/nginx/sites-enabled/airlok-*.conf 2>/dev/null | awk '{gsub(";", "", $2); print $2; exit}')
+	if ! grep -qs 'airlok-webhook' /etc/nginx/sites-enabled/airlok-*.conf; then
 		note "сайт ещё не знает про webhook: выкатите приложение один раз, чтобы обновился конфиг nginx"
 	fi
 	ok "push в ветку ${branch} будет выкатываться автоматически"
 	cat <<EOF
 
 Добавьте webhook в GitHub: ${REPO} → Settings → Webhooks → Add webhook.
-  Payload URL:  https://${domain:-ваш-домен}/_deployassistant/hook/${SLUG}
+  Payload URL:  https://${domain:-ваш-домен}/_airlok/hook/${SLUG}
   Content type: application/json
   Secret:       содержимое файла ${secret}
   События:      Just the push event

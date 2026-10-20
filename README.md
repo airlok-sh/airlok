@@ -10,7 +10,7 @@
 | --- | --- |
 | [recipes](recipes) | рецепты: настройка сервера, песочница и деплой приложения, деплой из GitHub и по push, проверка доступности, уведомления |
 | [checkup](checkup) | проверка сервера только на чтение: SSH, открытые порты, файрвол, обновления, бэкапы, Docker, nginx |
-| [examples](examples) | примеры проектов с манифестом `deployassistant.yml` |
+| [examples](examples) | примеры проектов с манифестом `airlok.yml` |
 
 С чего начать — [recipes/README.md](recipes/README.md).
 

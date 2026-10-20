@@ -21,8 +21,8 @@ die() {
 	exit 1
 }
 
-TELEGRAM_CONF=/etc/deployassistant/telegram.env
-DASHBOARD_CONF=/etc/deployassistant/dashboard.env
+TELEGRAM_CONF=/etc/airlok/telegram.env
+DASHBOARD_CONF=/etc/airlok/dashboard.env
 
 # conf_value ФАЙЛ КЛЮЧ — значение из файла вида KEY=value. Файл читается, а не
 # подключается через source: так его содержимое не может выполниться как код.
@@ -47,8 +47,8 @@ notify() {
 # через -K из stdin, а не аргументом, чтобы не светиться в ps. Печатает HTTP-код.
 dashboard_call() {
 	local method=$1 path=$2 body=${3:-} url token
-	url=$(conf_value "$DASHBOARD_CONF" DA_API_URL)
-	token=$(conf_value "$DASHBOARD_CONF" DA_AGENT_TOKEN)
+	url=$(conf_value "$DASHBOARD_CONF" AIRLOK_API_URL)
+	token=$(conf_value "$DASHBOARD_CONF" AIRLOK_AGENT_TOKEN)
 	[[ -n $url && -n $token ]] || return 1
 	local args=(-sS --max-time 10 -o /dev/null -w '%{http_code}' -X "$method" -K -)
 	[[ -n $body ]] && args+=(-H 'Content-Type: application/json' --data-binary "$body")
@@ -59,7 +59,7 @@ header = \"Authorization: Bearer ${token}\"" 2>/dev/null
 # События для дашборда сначала ложатся в очередь на диске, а уже потом отправляются:
 # если дашборд недоступен, они дождутся связи. Имя файла начинается со времени в
 # наносекундах, поэтому сортировка по имени — это порядок событий.
-EVENTS_DIR=/var/lib/deployassistant/events
+EVENTS_DIR=/var/lib/airlok/events
 MAX_QUEUED_EVENTS=1000
 MAX_FAILED_EVENTS=100
 

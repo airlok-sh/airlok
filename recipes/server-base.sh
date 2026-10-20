@@ -7,8 +7,8 @@
 
 source "$(dirname "$0")/lib.sh"
 
-SSH_DROPIN=/etc/ssh/sshd_config.d/00-deployassistant.conf
-SSH_ROLLBACK_UNIT=da-ssh-rollback
+SSH_DROPIN=/etc/ssh/sshd_config.d/00-airlok.conf
+SSH_ROLLBACK_UNIT=airlok-ssh-rollback
 SSH_ROLLBACK_SECONDS=180
 
 preflight() {
@@ -28,7 +28,7 @@ preflight() {
 
 packages() {
 	step "Пакеты и обновления"
-	local log=/var/log/deployassistant-apt.log
+	local log=/var/log/airlok-apt.log
 	if ! { apt-get update -qq && apt-get install -y -qq docker.io docker-compose-v2 nginx ufw fail2ban \
 		unattended-upgrades python3-yaml openssl rsync; } >"$log" 2>&1; then
 		tail -20 "$log" >&2
@@ -106,10 +106,10 @@ bruteforce() {
 web() {
 	step "nginx"
 	local changed=no
-	write_if_changed /etc/nginx/conf.d/00-deployassistant.conf 0644 <<'EOF' && changed=yes
+	write_if_changed /etc/nginx/conf.d/00-airlok.conf 0644 <<'EOF' && changed=yes
 server_tokens off;
 EOF
-	write_if_changed /etc/nginx/snippets/da-security-headers.conf 0644 <<'EOF' && changed=yes
+	write_if_changed /etc/nginx/snippets/airlok-security-headers.conf 0644 <<'EOF' && changed=yes
 add_header X-Content-Type-Options nosniff always;
 add_header X-Frame-Options SAMEORIGIN always;
 add_header Referrer-Policy strict-origin-when-cross-origin always;

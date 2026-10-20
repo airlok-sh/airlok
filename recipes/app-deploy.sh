@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Песочница и деплой приложения по deployassistant.yml из корня проекта.
+# Песочница и деплой приложения по airlok.yml из корня проекта.
 #
 #   app-deploy.sh /путь/к/проекту
 #
@@ -7,7 +7,7 @@
 
 source "$(dirname "$0")/lib.sh"
 
-BUILD_USER=da-build
+BUILD_USER=airlok-build
 NODE_IMAGE=node:22-bookworm-slim
 PG_IMAGE=postgres:16
 KEEP_RELEASES=3
@@ -119,14 +119,14 @@ secrets() {
 prepare_release() {
 	step "Релиз"
 	local src=$1 id
-	id=${DA_RELEASE_ID:-$(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || date +%Y%m%d-%H%M%S)}
+	id=${AIRLOK_RELEASE_ID:-$(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || date +%Y%m%d-%H%M%S)}
 	[[ $id =~ ^[A-Za-z0-9-]+$ ]] || die "некорректный id релиза: ${id}"
 	RELEASE=$APP_DIR/releases/$id
 	RELEASE_ID=$id
 	# Релиз из GitHub однозначно задан коммитом, поэтому уже собранный можно взять
 	# как есть: откат на прошлую версию занимает секунды, а не новую сборку.
 	REUSED=0
-	if [[ -n ${DA_RELEASE_ID:-} && -f ${RELEASE}.built && -d $RELEASE ]]; then
+	if [[ -n ${AIRLOK_RELEASE_ID:-} && -f ${RELEASE}.built && -d $RELEASE ]]; then
 		REUSED=1
 		ok "релиз ${id} уже собран, используем его"
 		return
@@ -147,7 +147,7 @@ build() {
 	local log=${RELEASE}.build.log
 	# npm install выполняет скрипты чужих пакетов, поэтому у сборки нет ни секретов,
 	# ни базы, ни прав: только папка релиза и доступ к реестру npm.
-	if ! docker run --rm --name "da-build-${APP_NAME}" \
+	if ! docker run --rm --name "airlok-build-${APP_NAME}" \
 		--user "${BUILD_UID}:${BUILD_GID}" --cap-drop ALL --security-opt no-new-privileges \
 		--memory 1g --pids-limit 512 \
 		-e HOME=/tmp -e NEXT_TELEMETRY_DISABLED=1 -e npm_config_cache=/tmp/npm \
@@ -225,9 +225,9 @@ compose() { docker compose -f "$APP_DIR/compose.yml" --project-directory "$APP_D
 backup_setup() {
 	((DB_ENABLED)) || return 0
 	step "Бэкапы"
-	write_if_changed /usr/local/sbin/da-backup 0755 <<'EOF' || true
+	write_if_changed /usr/local/sbin/airlok-backup 0755 <<'EOF' || true
 #!/usr/bin/env bash
-# Дамп базы приложения: da-backup ИМЯ. Хранит 7 последних копий.
+# Дамп базы приложения: airlok-backup ИМЯ. Хранит 7 последних копий.
 set -euo pipefail
 dir=/srv/apps/$1
 out=$dir/shared/backups/$(date +%Y%m%d-%H%M%S).sql.gz
@@ -237,16 +237,16 @@ mv "$out.tmp" "$out"
 ls -1t "$dir"/shared/backups/*.sql.gz | tail -n +8 | xargs -r rm -f
 EOF
 	local changed=no
-	write_if_changed /etc/systemd/system/da-backup@.service 0644 <<'EOF' && changed=yes
+	write_if_changed /etc/systemd/system/airlok-backup@.service 0644 <<'EOF' && changed=yes
 [Unit]
 Description=Бэкап базы %i
 After=docker.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/da-backup %i
+ExecStart=/usr/local/sbin/airlok-backup %i
 EOF
-	write_if_changed /etc/systemd/system/da-backup@.timer 0644 <<'EOF' && changed=yes
+	write_if_changed /etc/systemd/system/airlok-backup@.timer 0644 <<'EOF' && changed=yes
 [Unit]
 Description=Ежедневный бэкап базы %i
 
@@ -259,7 +259,7 @@ Persistent=true
 WantedBy=timers.target
 EOF
 	[[ $changed == yes ]] && systemctl daemon-reload
-	systemctl enable --now "da-backup@${APP_NAME}.timer" >/dev/null 2>&1
+	systemctl enable --now "airlok-backup@${APP_NAME}.timer" >/dev/null 2>&1
 	ok "ежедневный дамп в ${APP_DIR}/shared/backups, хранится 7 копий"
 	note "копии лежат на этом же сервере: если пропадёт сервер, пропадут и они"
 }
@@ -280,7 +280,7 @@ deploy() {
 	[[ -L $APP_DIR/current ]] && prev=$(readlink -f "$APP_DIR/current")
 
 	if ((DB_ENABLED)) && [[ -n $prev ]]; then
-		/usr/local/sbin/da-backup "$APP_NAME" || die "бэкап базы перед выкаткой не удался, деплой остановлен"
+		/usr/local/sbin/airlok-backup "$APP_NAME" || die "бэкап базы перед выкаткой не удался, деплой остановлен"
 		ok "бэкап базы перед выкаткой"
 	fi
 
@@ -314,7 +314,7 @@ deploy() {
 
 nginx_site() {
 	step "nginx и HTTPS"
-	local ssl=/etc/ssl/deployassistant cert key
+	local ssl=/etc/ssl/airlok cert key
 	cert=$ssl/${APP_NAME}.crt
 	key=$ssl/${APP_NAME}.key
 	if [[ ! -s $cert ]]; then
@@ -339,14 +339,14 @@ nginx_site() {
 		if ((${#images[@]})); then
 			uploads_block+="
         location ~* \\.($(IFS='|'; echo "${images[*]}"))\$ {
-            include snippets/da-security-headers.conf;
+            include snippets/airlok-security-headers.conf;
             add_header Content-Security-Policy \"default-src 'none'; sandbox\" always;
         }"
 		fi
 		if ((${#others[@]})); then
 			uploads_block+="
         location ~* \\.($(IFS='|'; echo "${others[*]}"))\$ {
-            include snippets/da-security-headers.conf;
+            include snippets/airlok-security-headers.conf;
             add_header Content-Security-Policy \"default-src 'none'; sandbox\" always;
             add_header Content-Disposition attachment always;
         }"
@@ -356,7 +356,7 @@ nginx_site() {
     }"
 	fi
 
-	if write_if_changed "/etc/nginx/sites-available/da-${APP_NAME}.conf" 0644 <<EOF; then
+	if write_if_changed "/etc/nginx/sites-available/airlok-${APP_NAME}.conf" 0644 <<EOF; then
 server {
     listen 80;
     listen [::]:80;
@@ -374,11 +374,11 @@ server {
     ssl_certificate_key ${key};
 
     client_max_body_size ${UPLOAD_MAX_MB}m;
-    include snippets/da-security-headers.conf;
+    include snippets/airlok-security-headers.conf;
 
     location ~ /\\.(?!well-known/) { deny all; }
     # Появляется после github-deploy.sh webhook; пока файла нет, include ничего не добавляет.
-    include snippets/da-webhook*.conf;
+    include snippets/airlok-webhook*.conf;
 ${uploads_block}
 
     location / {
@@ -390,10 +390,10 @@ ${uploads_block}
     }
 }
 EOF
-		ln -sfn "/etc/nginx/sites-available/da-${APP_NAME}.conf" "/etc/nginx/sites-enabled/da-${APP_NAME}.conf"
+		ln -sfn "/etc/nginx/sites-available/airlok-${APP_NAME}.conf" "/etc/nginx/sites-enabled/airlok-${APP_NAME}.conf"
 		if ! nginx -t -q; then
 			# Битый конфиг в sites-enabled сломал бы любой следующий reload nginx, в том числе чужих сайтов.
-			rm -f "/etc/nginx/sites-enabled/da-${APP_NAME}.conf" "/etc/nginx/sites-available/da-${APP_NAME}.conf"
+			rm -f "/etc/nginx/sites-enabled/airlok-${APP_NAME}.conf" "/etc/nginx/sites-available/airlok-${APP_NAME}.conf"
 			die "nginx не принял конфиг сайта, конфиг убран, остальные сайты не затронуты"
 		fi
 		systemctl reload nginx
@@ -404,7 +404,7 @@ EOF
 deploy_finished() {
 	# RELEASE_ID, а не RELEASE: при откате RELEASE указывает уже на предыдущую версию.
 	local code=$1 version=${RELEASE_ID:-} took=$((SECONDS - STARTED))
-	local what="версия ${version}${DA_RELEASE_TITLE:+ «${DA_RELEASE_TITLE}»}" status
+	local what="версия ${version}${AIRLOK_RELEASE_TITLE:+ «${AIRLOK_RELEASE_TITLE}»}" status
 	if ((code == 0)); then
 		status=success
 		notify "✅ ${APP_NAME}: выкачена ${what} за ${took} с. https://${APP_DOMAIN}"
@@ -419,7 +419,7 @@ deploy_finished() {
 		notify "❌ ${APP_NAME}: первая выкатка не удалась: ${DIE_MSG:-неизвестная ошибка}."
 	fi
 	# Выкатка, упавшая до создания релиза (например, уже идёт другая), id ещё не имеет.
-	report_deploy "$APP_NAME" "$APP_DOMAIN" "${version:-unknown}" "${DA_RELEASE_TITLE:-}" "$status" "$took" "${DIE_MSG:-}"
+	report_deploy "$APP_NAME" "$APP_DOMAIN" "${version:-unknown}" "${AIRLOK_RELEASE_TITLE:-}" "$status" "$took" "${DIE_MSG:-}"
 }
 
 main() {
@@ -427,13 +427,13 @@ main() {
 	local src=${1:-}
 	[[ -d $src ]] || die "использование: $0 /путь/к/проекту"
 	src=$(cd "$src" && pwd)
-	load_manifest "$src/deployassistant.yml"
+	load_manifest "$src/airlok.yml"
 	APP_USER=app-$APP_NAME
 	APP_DIR=$APPS_ROOT/$APP_NAME
 
 	# Блокировка: две выкатки одного приложения не идут одновременно, а проверка
 	# доступности не принимает перезапуск во время выкатки за простой.
-	exec 8>"/run/da-deploy-${APP_NAME}.lock"
+	exec 8>"/run/airlok-deploy-${APP_NAME}.lock"
 	flock -n 8 || die "выкатка ${APP_NAME} уже идёт"
 	STARTED=$SECONDS
 	RELEASE=""

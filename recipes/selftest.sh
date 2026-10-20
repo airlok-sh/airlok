@@ -34,14 +34,14 @@ inside_checks() {
 const fs = require("fs"), cp = require("child_process");
 const t = (name, fn) => { let v; try { v = fn(); } catch (e) { v = "ERR:" + (e.code || e.message); } console.log(name + "=" + v); };
 const script = "#!/bin/sh\necho ran\n";
-t("write_code", () => { fs.writeFileSync("/app/da-selftest", "x"); return "written"; });
+t("write_code", () => { fs.writeFileSync("/app/airlok-selftest", "x"); return "written"; });
 t("uid", () => process.getuid());
 t("docker_sock", () => fs.existsSync("/var/run/docker.sock"));
 t("host_apps", () => fs.existsSync("/srv/apps"));
-t("chown_root", () => { fs.writeFileSync("/tmp/da-chown", "x"); fs.chownSync("/tmp/da-chown", 0, 0); return "changed"; });
-t("exec_tmp", () => { fs.writeFileSync("/tmp/da-selftest.sh", script, { mode: 0o755 }); return cp.execFileSync("/tmp/da-selftest.sh").toString().trim(); });
+t("chown_root", () => { fs.writeFileSync("/tmp/airlok-chown", "x"); fs.chownSync("/tmp/airlok-chown", 0, 0); return "changed"; });
+t("exec_tmp", () => { fs.writeFileSync("/tmp/airlok-selftest.sh", script, { mode: 0o755 }); return cp.execFileSync("/tmp/airlok-selftest.sh").toString().trim(); });
 if (process.env.UPLOAD_DIR) {
-  const f = process.env.UPLOAD_DIR + "/da-selftest.sh";
+  const f = process.env.UPLOAD_DIR + "/airlok-selftest.sh";
   t("write_uploads", () => { fs.writeFileSync(f, script, { mode: 0o755 }); return "written"; });
   t("exec_uploads", () => cp.execFileSync(f).toString().trim());
   try { fs.unlinkSync(f); } catch {}
@@ -113,24 +113,24 @@ web_checks() {
 	((UPLOADS_ENABLED && UPLOADS_PUBLIC)) || return 0
 	local dir=$APP_DIR/shared/uploads
 	put() { install -o "$APP_USER" -g www-data -m 640 /dev/stdin "$dir/$1"; }
-	printf '<html><script>alert(1)</script></html>' | put da-selftest.html
-	printf '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>' | put da-selftest.svg
-	base64 -d <<<"$PNG_1PX" | put da-selftest.png
-	printf '%%PDF-1.4\n' | put da-selftest.pdf
+	printf '<html><script>alert(1)</script></html>' | put airlok-selftest.html
+	printf '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>' | put airlok-selftest.svg
+	base64 -d <<<"$PNG_1PX" | put airlok-selftest.png
+	printf '%%PDF-1.4\n' | put airlok-selftest.pdf
 
 	expect "листинг папки загрузок закрыт" "403|404" "$(get /uploads/)"
-	expect "загруженный HTML не открывается как страница" "404" "$(get /uploads/da-selftest.html)"
-	expect "загруженный SVG не отдаётся" "404" "$(get /uploads/da-selftest.svg)"
+	expect "загруженный HTML не открывается как страница" "404" "$(get /uploads/airlok-selftest.html)"
+	expect "загруженный SVG не отдаётся" "404" "$(get /uploads/airlok-selftest.svg)"
 	if [[ " $UPLOAD_EXTS " == *" png "* ]]; then
-		expect "картинка из загрузок отдаётся" "200" "$(get /uploads/da-selftest.png)"
+		expect "картинка из загрузок отдаётся" "200" "$(get /uploads/airlok-selftest.png)"
 		expect "картинка отдаётся с CSP sandbox" ".*sandbox.*" "$(hdr content-security-policy)"
 		expect "картинка отдаётся с nosniff" "nosniff" "$(hdr x-content-type-options)"
 	fi
 	if [[ " $UPLOAD_EXTS " == *" pdf "* ]]; then
-		expect "PDF из загрузок отдаётся" "200" "$(get /uploads/da-selftest.pdf)"
+		expect "PDF из загрузок отдаётся" "200" "$(get /uploads/airlok-selftest.pdf)"
 		expect "PDF только скачивается, а не открывается" "attachment" "$(hdr content-disposition)"
 	fi
-	rm -f "$dir"/da-selftest.*
+	rm -f "$dir"/airlok-selftest.*
 
 	local big=$((UPLOAD_MAX_MB + 1))
 	head -c $((big * 1024 * 1024)) /dev/zero >"$TMP/big"
@@ -141,7 +141,7 @@ main() {
 	need_root
 	local src=${1:-}
 	[[ -d $src ]] || die "использование: $0 /путь/к/проекту"
-	load_manifest "$src/deployassistant.yml"
+	load_manifest "$src/airlok.yml"
 	APP_USER=app-$APP_NAME
 	APP_DIR=$APPS_ROOT/$APP_NAME
 	APP_UID=$(id -u "$APP_USER") || die "приложение ${APP_NAME} ещё не развёрнуто"

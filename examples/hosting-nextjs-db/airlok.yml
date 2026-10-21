@@ -1,0 +1,14 @@
+# Next.js с Postgres на хостинге airlok: базу airlok создаёт сам и передаёт DATABASE_URL.
+# GREETING задаётся на странице приложения в дашборде — без неё выкатка остановится.
+version: 1
+
+app:
+  name: hosting-nextjs-db
+  stack: nextjs
+
+capabilities:
+  database:
+    enabled: true
+
+env:
+  - GREETING

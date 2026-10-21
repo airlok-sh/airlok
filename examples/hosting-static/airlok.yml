@@ -1,0 +1,6 @@
+# Статический сайт на хостинге airlok: без сборки, файлы отдаются как есть.
+version: 1
+
+app:
+  name: hosting-static
+  stack: static

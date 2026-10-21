@@ -1,0 +1,6 @@
+# Next.js без базы на хостинге airlok: страницы рендерятся на сервере по запросу.
+version: 1
+
+app:
+  name: hosting-nextjs
+  stack: nextjs

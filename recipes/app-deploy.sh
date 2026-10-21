@@ -312,9 +312,11 @@ deploy() {
 	done
 }
 
+le_enabled() { [[ $(conf_value "$SERVER_CONF" LETSENCRYPT) == 1 ]]; }
+
 nginx_site() {
 	step "nginx и HTTPS"
-	local ssl=/etc/ssl/airlok cert key
+	local ssl=/etc/ssl/airlok cert key le=/etc/letsencrypt/live/${APP_DOMAIN}
 	cert=$ssl/${APP_NAME}.crt
 	key=$ssl/${APP_NAME}.key
 	if [[ ! -s $cert ]]; then
@@ -322,8 +324,18 @@ nginx_site() {
 		openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=${APP_DOMAIN}" \
 			-addext "subjectAltName=DNS:${APP_DOMAIN}" -keyout "$key" -out "$cert" 2>/dev/null
 		chmod 600 "$key"
-		note "сертификат самоподписанный; для настоящего домена: certbot --nginx -d ${APP_DOMAIN}"
 	fi
+	# Самоподписанный остаётся запасным: без него nginx не поднял бы 443, пока
+	# Let's Encrypt ещё не выдал настоящий.
+	if [[ -s $le/fullchain.pem && -s $le/privkey.pem ]]; then
+		cert=$le/fullchain.pem
+		key=$le/privkey.pem
+		TLS_KIND="Let's Encrypt"
+	else
+		TLS_KIND="самоподписанный"
+		le_enabled || note "сертификат самоподписанный; выпустить настоящий: sudo ${RECIPES_DIR}/server-base.sh letsencrypt"
+	fi
+	ensure_log_format || true
 
 	local uploads_block="" images=() others=() e
 	if ((UPLOADS_ENABLED && UPLOADS_PUBLIC)); then
@@ -385,6 +397,7 @@ ${tls_listen}
 
     client_max_body_size ${UPLOAD_MAX_MB}m;
     include snippets/airlok-security-headers.conf;
+    access_log /var/log/nginx/airlok-${APP_NAME}.access.log airlok;
 
     location ~ /\\.(?!well-known/) { deny all; }
     # Появляется после github-deploy.sh webhook; пока файла нет, include ничего не добавляет.
@@ -408,7 +421,45 @@ EOF
 		fi
 		systemctl reload nginx
 	fi
-	ok "https://${APP_DOMAIN} → 127.0.0.1:${APP_PORT}, HTTP перенаправляется на HTTPS"
+	ok "https://${APP_DOMAIN} → 127.0.0.1:${APP_PORT}, сертификат ${TLS_KIND}, HTTP перенаправляется на HTTPS"
+}
+
+# le_hint ЛОГ — что исправить, по выводу certbot. Чаще всего домен ещё не указывает на сервер.
+le_hint() {
+	local ip
+	if grep -qi 'invalid email' "$1"; then
+		echo "Let's Encrypt не принял email $(conf_value "$SERVER_CONF" LETSENCRYPT_EMAIL): укажите настоящий — sudo ${RECIPES_DIR}/server-base.sh letsencrypt ВАШ_EMAIL"
+	elif grep -qiE 'too many|rate limit' "$1"; then
+		echo "сработал лимит Let's Encrypt на выпуски для этого домена — попробуйте через час"
+	else
+		ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+		echo "Проверьте, что A-запись ${APP_DOMAIN} указывает на этот сервер${ip:+ (${ip})} и порт 80 открыт."
+	fi
+}
+
+# Выпуск через webroot: nginx уже отдаёт /.well-known/acme-challenge/ на 80-м порту,
+# поэтому certbot не трогает его конфиги. Неудача не роняет деплой: сайт работает
+# с самоподписанным сертификатом, а следующая выкатка попробует снова.
+issue_certificate() {
+	le_enabled || return 0
+	[[ -s /etc/letsencrypt/live/${APP_DOMAIN}/fullchain.pem ]] && return 0
+	step "Let's Encrypt"
+	if ! command -v certbot >/dev/null; then
+		note "certbot не установлен, сертификат остался самоподписанным: sudo ${RECIPES_DIR}/server-base.sh letsencrypt"
+		return 0
+	fi
+	local email log=$APP_DIR/shared/letsencrypt.log contact=(--register-unsafely-without-email)
+	email=$(conf_value "$SERVER_CONF" LETSENCRYPT_EMAIL)
+	[[ -n $email ]] && contact=(-m "$email")
+	if ! certbot certonly --webroot -w /var/www/html -d "$APP_DOMAIN" --non-interactive --agree-tos \
+		"${contact[@]}" --deploy-hook "systemctl reload nginx" >"$log" 2>&1; then
+		note "Let's Encrypt не выдал сертификат для ${APP_DOMAIN}, сайт работает с самоподписанным."
+		note "$(le_hint "$log")"
+		note "Следующая выкатка попробует снова. Подробности: ${log}"
+		return 0
+	fi
+	ok "сертификат Let's Encrypt выпущен, продлевается сам (certbot.timer)"
+	nginx_site
 }
 
 deploy_finished() {
@@ -438,6 +489,12 @@ main() {
 	[[ -d $src ]] || die "использование: $0 /путь/к/проекту"
 	src=$(cd "$src" && pwd)
 	load_manifest "$src/airlok.yml"
+	# Агент разворачивает под именем из дашборда: в монорепозитории у фронтенда и бэкенда
+	# свои манифесты, но имена приложений на сервере не должны совпасть.
+	if [[ -n ${AIRLOK_APP_NAME:-} ]]; then
+		[[ $AIRLOK_APP_NAME =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "некорректное имя приложения: ${AIRLOK_APP_NAME}"
+		APP_NAME=$AIRLOK_APP_NAME
+	fi
 	APP_USER=app-$APP_NAME
 	APP_DIR=$APPS_ROOT/$APP_NAME
 
@@ -458,6 +515,7 @@ main() {
 	backup_setup
 	deploy
 	nginx_site
+	issue_certificate
 	printf '\n%sГотово:%s https://%s\n' "$C_B" "$C_0" "$APP_DOMAIN"
 }
 

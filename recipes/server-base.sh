@@ -6,6 +6,7 @@
 #   server-base.sh --skip-ssh  — всё, кроме SSH (так запускает install.sh)
 #   server-base.sh ssh         — только закрыть вход по паролю, если есть ключ
 #   server-base.sh confirm-ssh — подтвердить, что вход по ключу работает, и отменить откат
+#   server-base.sh letsencrypt [EMAIL] — выпускать для сайтов сертификаты Let's Encrypt
 
 source "$(dirname "$0")/lib.sh"
 
@@ -121,6 +122,7 @@ web() {
 server_tokens off;
 EOF
 	fi
+	ensure_log_format && changed=yes
 	write_if_changed /etc/nginx/snippets/airlok-security-headers.conf 0644 <<'EOF' && changed=yes
 server_tokens off;
 add_header X-Content-Type-Options nosniff always;
@@ -139,11 +141,51 @@ EOF
 	ok "версия скрыта, общие заголовки безопасности готовы, стандартная страница убрана"
 }
 
+# letsencrypt [EMAIL] — включить выпуск сертификатов: дальше их выпускает app-deploy.sh
+# при выкатке, потому что сертификат привязан к домену приложения.
+letsencrypt() {
+	local email=${1:-}
+	if [[ -n $email ]]; then
+		[[ $email =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "это не похоже на email: ${email}"
+		conf_set "$SERVER_CONF" LETSENCRYPT_EMAIL "$email"
+	fi
+	conf_set "$SERVER_CONF" LETSENCRYPT 1
+	install_certbot
+	note "сертификат выпускается при выкатке; A-запись домена приложения должна указывать на этот сервер"
+}
+
+install_certbot() {
+	step "Let's Encrypt"
+	if ! command -v certbot >/dev/null; then
+		local log=/var/log/airlok-apt.log
+		if ! { apt-get update -qq && apt-get install -y -qq certbot; } >"$log" 2>&1; then
+			tail -20 "$log" >&2
+			die "не удалось установить certbot, полный лог: ${log}"
+		fi
+	fi
+	systemctl enable --now certbot.timer >/dev/null 2>&1 || true
+	ok "certbot установлен, сертификаты продлеваются сами"
+}
+
+# Ключи root и того, кто вызвал sudo: под Ubuntu часто входят не root'ом, а ubuntu.
+authorized_keys_present() {
+	local keys=(/root/.ssh/authorized_keys) home
+	if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+		home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+		[[ -n $home ]] && keys+=("$home/.ssh/authorized_keys")
+	fi
+	local f
+	for f in "${keys[@]}"; do
+		# Перед ключом бывают опции (from=…, command=…), поэтому тип ищем не только в начале строки.
+		[[ -s $f ]] && grep -qE '(^|[[:space:]])(ssh-(ed25519|rsa|dss)|ecdsa-sha2-|sk-)' "$f" && return 0
+	done
+	return 1
+}
+
 ssh_hardening() {
 	step "SSH"
-	local keys=/root/.ssh/authorized_keys
-	if [[ ! -s $keys ]]; then
-		note "в ${keys} нет ключей — вход по паролю оставлен, иначе доступ к серверу пропадёт"
+	if ! authorized_keys_present; then
+		note "на сервере нет SSH-ключей (authorized_keys у root${SUDO_USER:+ и ${SUDO_USER}}) — вход по паролю оставлен, иначе доступ к серверу пропадёт"
 		return
 	fi
 	local conf
@@ -210,6 +252,10 @@ confirm-ssh) confirm_ssh ;;
 ssh)
 	need_root
 	ssh_hardening
+	;;
+letsencrypt)
+	need_root
+	letsencrypt "${2:-}"
 	;;
 --skip-ssh) main skip-ssh ;;
 "") main ;;

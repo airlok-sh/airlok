@@ -88,12 +88,62 @@ check_app() {
 	echo "${status} ${fails} ${since}" >"$file"
 }
 
+HEARTBEAT_PY='
+import json, os, sys
+
+version, password, letsencrypt = sys.argv[1:4]
+mem = {}
+with open("/proc/meminfo") as f:
+    for line in f:
+        key, value = line.split(":", 1)
+        mem[key] = int(value.split()[0])
+os_name = ""
+try:
+    with open("/etc/os-release") as f:
+        for line in f:
+            if line.startswith("PRETTY_NAME="):
+                os_name = line.split("=", 1)[1].strip().strip("\"")
+except OSError:
+    pass
+with open("/proc/uptime") as f:
+    uptime = int(float(f.read().split()[0]))
+disk = os.statvfs("/")
+print(json.dumps({
+    "agent_version": version,
+    "os": os_name,
+    "uptime_sec": uptime,
+    "load1": round(os.getloadavg()[0], 2),
+    "cpus": os.cpu_count() or 1,
+    "mem_total_mb": mem["MemTotal"] // 1024,
+    "mem_used_mb": (mem["MemTotal"] - mem.get("MemAvailable", mem["MemFree"])) // 1024,
+    "disk_total_mb": disk.f_blocks * disk.f_frsize >> 20,
+    "disk_used_mb": (disk.f_blocks - disk.f_bfree) * disk.f_frsize >> 20,
+    "ssh_password_login": {"true": True, "false": False}.get(password),
+    "letsencrypt": letsencrypt == "true",
+}))
+'
+
+# Отметка «сервер на связи» с его состоянием: о сайтах healthcheck сообщает только при
+# изменениях, и без неё молчащий исправный сервер выглядел бы в дашборде пропавшим.
+heartbeat() {
+	local conf password=null le=false body code
+	if conf=$(sshd -T 2>/dev/null); then
+		password=false
+		grep -qxE '(passwordauthentication|kbdinteractiveauthentication) yes' <<<"$conf" && password=true
+	fi
+	[[ $(conf_value "$SERVER_CONF" LETSENCRYPT) == 1 ]] && le=true
+	body=$(python3 -c "$HEARTBEAT_PY" "$(agent_version)" "$password" "$le") || return
+	code=$(dashboard_call POST /agent/v1/heartbeat "$body") || code=000
+	# Дашборд старой версии heartbeat не знает — отмечаемся, как раньше.
+	[[ $code == 404 ]] && dashboard_call GET /agent/v1/ping >/dev/null
+}
+
 install -d -m 755 "$STATE_DIR"
-# Отметка «сервер на связи»: о сайтах healthcheck сообщает только при изменениях,
-# и без неё молчащий исправный сервер выглядел бы в дашборде пропавшим.
-[[ -r $DASHBOARD_CONF ]] && dashboard_call GET /agent/v1/ping >/dev/null
+[[ -r $DASHBOARD_CONF ]] && heartbeat
 # Заодно досылаем в дашборд события, которые не ушли раньше: таймер и есть повтор.
 flush_events
 for dir in "$APPS_ROOT"/*/; do
 	[[ -f $dir/compose.yml ]] && check_app "$(basename "$dir")"
 done
+# Метрики вторичны: зависший запрос к дашборду не должен задерживать следующую проверку.
+timeout 40 python3 "$RECIPES_DIR/metrics.py" || true

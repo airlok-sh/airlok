@@ -14,7 +14,7 @@ import sys
 DEFAULT_NODE = "22"
 DEFAULT_PYTHON = "3.12"
 NODE_VERSIONS = ["20", "22", "24"]
-PYTHON_VERSIONS = ["3.10", "3.11", "3.12", "3.13"]
+PYTHON_VERSIONS = ["3.10", "3.11", "3.12", "3.13", "3.14"]
 STACKS = ("static", "nextjs", "node", "python")
 
 # Статические сайты: зависимость сборщика → куда он кладёт готовый сайт.
@@ -39,6 +39,9 @@ NODE_SERVERS = [
 PYTHON_ENTRIES = ["main.py", "app.py", "app/main.py", "src/main.py", "server.py", "api.py", "wsgi.py", "asgi.py", "streamlit_app.py"]
 SEGMENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$")
 MAJOR = re.compile(r"\d+(\.\d+)?")
+# Ограничение версии Python из [project] в pyproject.toml.
+REQUIRES_PYTHON = re.compile(r"""^\s*requires-python\s*=\s*["']([^"']+)["']""", re.M)
+SPEC_CLAUSE = re.compile(r"^(>=|<=|==|!=|~=|>|<)\s*(\d+)(?:\.(\d+))?")
 
 NPM_INSTALL = ("if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; "
                "elif [ -f pnpm-lock.yaml ]; then npx --yes pnpm@9 install --frozen-lockfile; "
@@ -305,7 +308,33 @@ def python_version(root, wanted):
         m = MAJOR.search(src.strip().removeprefix("python-"))
         if m and m.group(0) in PYTHON_VERSIONS:
             return m.group(0)
-    return DEFAULT_PYTHON
+    req = REQUIRES_PYTHON.search(read_text(root, "pyproject.toml"))
+    if req is None or fits_python(DEFAULT_PYTHON, req.group(1)):
+        return DEFAULT_PYTHON
+    for v in PYTHON_VERSIONS:
+        if fits_python(v, req.group(1)):
+            return v
+    raise DetectError(f"pyproject.toml требует Python {req.group(1)}, а поддерживаются {PYTHON_VERSIONS[0]}–{PYTHON_VERSIONS[-1]}")
+
+
+def fits_python(version, spec):
+    """Подходит ли X.Y под requires-python вроде ">=3.10,<4" или "~=3.12". Патч не важен:
+    в образе всегда последний патч версии."""
+    v_major, v_minor = (int(x) for x in version.split("."))
+    for clause in spec.split(","):
+        m = SPEC_CLAUSE.match(clause.strip())
+        if not m:
+            continue  # неизвестная форма ограничения — не мешаем сборке
+        major, has_minor = int(m.group(2)), m.group(3) is not None
+        cmp = v_major - major
+        if cmp == 0 and has_minor:
+            cmp = v_minor - int(m.group(3))
+        op = m.group(1)
+        ok = {">=": cmp >= 0, ">": cmp > 0, "<=": cmp <= 0, "<": cmp < 0, "==": cmp == 0,
+              "!=": cmp != 0 or not has_minor, "~=": cmp >= 0 and v_major == major}[op]
+        if not ok:
+            return False
+    return True
 
 
 def subprojects(root):

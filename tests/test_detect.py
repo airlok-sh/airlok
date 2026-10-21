@@ -70,6 +70,14 @@ class DetectTest(unittest.TestCase):
         with self.assertRaises(DetectError):
             detect(project({"package.json": "{}"}), stack="node", node="18")
 
+    def test_python_version_from_requires_python(self):
+        for spec, want in {">=3.14": "3.14", ">=3.10,<4.0": DEFAULT_PYTHON, "~=3.13": "3.13", "==3.11.*": "3.11",
+                           "<4.0,>=3.14": "3.14", ">=3.8": DEFAULT_PYTHON}.items():
+            files = {"pyproject.toml": f'[project]\nrequires-python = "{spec}"\ndependencies = ["fastapi"]\n', "main.py": "app = FastAPI()\n"}
+            self.assertEqual(detect(project(files))["python"], want, spec)
+        with self.assertRaises(DetectError):
+            detect(project({"pyproject.toml": '[project]\nrequires-python = ">=3.15"\n', "main.py": ""}))
+
     def test_static_output(self):
         root = project({"dist/index.html": "", "public/favicon.ico": ""})
         self.assertEqual(static_output(root, "", True), "dist")

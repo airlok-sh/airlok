@@ -462,6 +462,23 @@ issue_certificate() {
 	nginx_site
 }
 
+# Два сайта с одним server_name nginx принимает лишь с предупреждением и отдаёт домен первому
+# по алфавиту: выкатка прошла бы успешно, а по адресу открывалось бы другое приложение.
+ensure_domain_free() {
+	local own=/etc/nginx/sites-enabled/airlok-${APP_NAME}.conf conf owner
+	for conf in /etc/nginx/sites-enabled/*; do
+		[[ -f $conf && $conf != "$own" ]] || continue
+		awk -v d="$APP_DOMAIN" '$1 == "server_name" {
+			for (i = 2; i <= NF; i++) { n = tolower($i); sub(/;$/, "", n); if (n == d) found = 1 }
+		} END { exit !found }' "$conf" || continue
+		owner=$(basename "$conf" .conf)
+		if [[ $owner == airlok-* ]]; then
+			die "домен ${APP_DOMAIN} уже занят приложением ${owner#airlok-} на этом сервере. Укажите в airlok.yml другой app.domain или отключите сайт старого приложения: rm /etc/nginx/sites-enabled/${owner}.conf && systemctl reload nginx"
+		fi
+		die "домен ${APP_DOMAIN} уже обслуживает сайт nginx ${conf}. Укажите в airlok.yml другой app.domain или отключите этот сайт"
+	done
+}
+
 deploy_finished() {
 	# RELEASE_ID, а не RELEASE: при откате RELEASE указывает уже на предыдущую версию.
 	local code=$1 version=${RELEASE_ID:-} took=$((SECONDS - STARTED))
@@ -506,6 +523,8 @@ main() {
 	RELEASE=""
 	trap 'deploy_finished $?' EXIT
 
+	# До сборки: занятый домен выяснится за секунду, а не после нескольких минут npm.
+	ensure_domain_free
 	ensure_users
 	layout
 	allocate_port

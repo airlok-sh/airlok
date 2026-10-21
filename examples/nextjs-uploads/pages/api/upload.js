@@ -2,20 +2,17 @@ import { maxBytes, saveUpload } from "../../lib/uploads";
 
 export const config = { api: { bodyParser: false } };
 
+// Лишнее дочитываем и выбрасываем, а не обрываем соединение: оборванный запрос прокси
+// перед приложением (nginx, airlok) покажет посетителю как 502, а не как понятный 413.
 function readBody(req, limit) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
     req.on("data", (chunk) => {
       size += chunk.length;
-      if (size > limit) {
-        reject(new Error("too_large"));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
+      if (size <= limit) chunks.push(chunk);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("end", () => (size > limit ? reject(new Error("too_large")) : resolve(Buffer.concat(chunks))));
     req.on("error", reject);
   });
 }

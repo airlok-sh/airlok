@@ -3,6 +3,8 @@
 # Повторный запуск безопасен: каждый шаг сначала смотрит, не сделан ли он уже.
 #
 #   server-base.sh             — настроить сервер
+#   server-base.sh --skip-ssh  — всё, кроме SSH (так запускает install.sh)
+#   server-base.sh ssh         — только закрыть вход по паролю, если есть ключ
 #   server-base.sh confirm-ssh — подтвердить, что вход по ключу работает, и отменить откат
 
 source "$(dirname "$0")/lib.sh"
@@ -193,11 +195,23 @@ main() {
 	firewall
 	bruteforce
 	web
+	if [[ ${1:-} == skip-ssh ]]; then
+		# Закрытие пароля требует проверки входа в новом окне, поэтому в автоматической
+		# установке это отдельный осознанный шаг, а не часть одной команды.
+		step "SSH"
+		note "не трогали; закрыть вход по паролю: sudo $0 ssh"
+		return
+	fi
 	ssh_hardening
 }
 
 case ${1:-} in
 confirm-ssh) confirm_ssh ;;
+ssh)
+	need_root
+	ssh_hardening
+	;;
+--skip-ssh) main skip-ssh ;;
 "") main ;;
 *) die "неизвестная команда: $1" ;;
 esac

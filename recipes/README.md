@@ -6,17 +6,26 @@
 
 ## Установка
 
-Рецепты ставятся в `/opt/airlok`: по этому пути на них ссылаются команды из дашборда. Повторный запуск обновляет их до свежей версии.
+Одна команда ставит рецепты в `/opt/airlok`, готовит сервер (пакеты, Docker, nginx, ufw, fail2ban) и подключает его к дашборду. Её с токеном сервера показывает дашборд; повторный запуск обновляет рецепты и досоздаёт недостающее.
 
 ```bash
-sudo apt-get install -y git && (sudo git -C /opt/airlok pull --ff-only 2>/dev/null || sudo git clone --depth 1 https://github.com/airlok-sh/airlok /opt/airlok)
+echo "ТОКЕН" | sudo bash -c "$(curl -fsSL https://airlok.ru/install.sh)" install https://app.airlok.ru
 ```
 
-## Порядок
+Без дашборда — то же без токена и адреса: `sudo bash -c "$(curl -fsSL https://airlok.ru/install.sh)"`.
+
+Вход по паролю установщик не трогает: закрыть его — отдельный шаг с проверкой входа по ключу в новом окне:
+
+```bash
+sudo /opt/airlok/recipes/server-base.sh ssh
+sudo /opt/airlok/recipes/server-base.sh confirm-ssh
+```
+
+## Порядок вручную
 
 ```bash
 cd /opt/airlok/recipes
-sudo ./server-base.sh                 # один раз на сервер
+sudo ./server-base.sh                 # один раз на сервер, вместе с SSH
 sudo ./server-base.sh confirm-ssh     # после проверки входа по ключу в новом окне
 sudo ./app-deploy.sh /путь/к/проекту  # деплой и каждая следующая выкатка
 sudo ./selftest.sh /путь/к/проекту    # проверка, что песочница работает как обещано

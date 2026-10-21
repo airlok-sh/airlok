@@ -15,7 +15,7 @@ preflight() {
 	step "Предварительная проверка"
 	local os mem disk
 	os=$(. /etc/os-release && echo "${ID}-${VERSION_ID}")
-	[[ $os == ubuntu-24.04 ]] || die "рецепт проверен только на Ubuntu 24.04, здесь ${os}"
+	[[ $os == ubuntu-24.04 || $os == ubuntu-26.04 ]] || die "рецепт проверен только на Ubuntu 24.04 и 26.04, здесь ${os}"
 	mem=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
 	((mem >= 700)) || die "нужно хотя бы 1 ГБ памяти, здесь ${mem} МБ"
 	disk=$(df -Pm / | awk 'NR==2{print $4}')
@@ -23,7 +23,7 @@ preflight() {
 	local busy
 	busy=$(ss -H -tlnp '( sport = :80 or sport = :443 )' | grep -v nginx || true)
 	[[ -z $busy ]] || die "порты 80/443 заняты не nginx: ${busy}"
-	ok "Ubuntu 24.04, ${mem} МБ памяти, ${disk} МБ на диске"
+	ok "Ubuntu ${os#ubuntu-}, ${mem} МБ памяти, ${disk} МБ на диске"
 }
 
 packages() {
@@ -106,10 +106,21 @@ bruteforce() {
 web() {
 	step "nginx"
 	local changed=no
-	write_if_changed /etc/nginx/conf.d/00-airlok.conf 0644 <<'EOF' && changed=yes
+	# В nginx.conf из Ubuntu 26.04 уже стоит server_tokens build, и вторую такую директиву
+	# на уровне http nginx не примет. Сам nginx.conf не правим: изменённый пакетный конфиг
+	# останавливает автообновления nginx. Версию тогда прячет сниппет в каждом server.
+	if grep -qE '^[[:space:]]*server_tokens[[:space:]]' /etc/nginx/nginx.conf; then
+		if [[ -e /etc/nginx/conf.d/00-airlok.conf ]]; then
+			rm -f /etc/nginx/conf.d/00-airlok.conf
+			changed=yes
+		fi
+	else
+		write_if_changed /etc/nginx/conf.d/00-airlok.conf 0644 <<'EOF' && changed=yes
 server_tokens off;
 EOF
+	fi
 	write_if_changed /etc/nginx/snippets/airlok-security-headers.conf 0644 <<'EOF' && changed=yes
+server_tokens off;
 add_header X-Content-Type-Options nosniff always;
 add_header X-Frame-Options SAMEORIGIN always;
 add_header Referrer-Policy strict-origin-when-cross-origin always;
@@ -135,7 +146,8 @@ ssh_hardening() {
 	fi
 	local conf
 	conf=$(sshd -T)
-	if grep -qx 'passwordauthentication no' <<<"$conf" && grep -qx 'permitrootlogin without-password' <<<"$conf"; then
+	# OpenSSH до 10-й версии (Ubuntu 24.04) печатает prohibit-password старым именем without-password.
+	if grep -qx 'passwordauthentication no' <<<"$conf" && grep -qxE 'permitrootlogin (prohibit|without)-password' <<<"$conf"; then
 		ok "вход только по ключу уже настроен"
 		return
 	fi

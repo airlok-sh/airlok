@@ -356,18 +356,28 @@ nginx_site() {
     }"
 	fi
 
+	# С nginx 1.25.1 (Ubuntu 26.04) HTTP/2 включается директивой http2, а параметр listen … http2
+	# устарел; в 1.24 (Ubuntu 24.04) директивы ещё нет.
+	local tls_listen="    listen 443 ssl http2;
+    listen [::]:443 ssl http2;"
+	if dpkg --compare-versions "$(nginx -v 2>&1 | sed -n 's|^nginx version: nginx/\([0-9.]*\).*|\1|p')" ge 1.25.1; then
+		tls_listen="    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;"
+	fi
+
 	if write_if_changed "/etc/nginx/sites-available/airlok-${APP_NAME}.conf" 0644 <<EOF; then
 server {
     listen 80;
     listen [::]:80;
     server_name ${APP_DOMAIN};
+    include snippets/airlok-security-headers.conf;
     location /.well-known/acme-challenge/ { root /var/www/html; }
     location / { return 301 https://\$host\$request_uri; }
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+${tls_listen}
     server_name ${APP_DOMAIN};
 
     ssl_certificate ${cert};

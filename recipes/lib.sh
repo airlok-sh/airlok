@@ -23,10 +23,29 @@ die() {
 
 TELEGRAM_CONF=/etc/airlok/telegram.env
 DASHBOARD_CONF=/etc/airlok/dashboard.env
+# Настройки сервера, выбранные при установке: Let's Encrypt и т. п.
+SERVER_CONF=/etc/airlok/server.env
 
 # conf_value ФАЙЛ КЛЮЧ — значение из файла вида KEY=value. Файл читается, а не
 # подключается через source: так его содержимое не может выполниться как код.
-conf_value() { sed -n "s/^$2=//p" "$1" | tail -1; }
+conf_value() { [[ -r $1 ]] || return 0; sed -n "s/^$2=//p" "$1" | tail -1; }
+
+# conf_set ФАЙЛ КЛЮЧ ЗНАЧЕНИЕ — заменить или добавить KEY=value, остальное не трогать.
+# Значение проверяет вызывающий: переводов строк и мусора в файле быть не должно.
+conf_set() {
+	local file=$1 key=$2 value=$3
+	install -d -m 755 "$(dirname "$file")"
+	{
+		# grep без совпадений возвращает 1, а под set -e это оборвало бы запись.
+		[[ -r $file ]] && { grep -v "^${key}=" "$file" || true; }
+		printf '%s=%s\n' "$key" "$value"
+	} | write_if_changed "$file" 0644 || true
+}
+
+# Версия рецептов для дашборда: дата и хеш коммита /opt/airlok, без git — dev.
+agent_version() {
+	git -C "$RECIPES_DIR" log -1 --format='%cd+%h' --date=format:'%Y.%m.%d' 2>/dev/null || echo dev
+}
 
 # notify ТЕКСТ — сообщение в Telegram, если бот подключён (notify.sh setup).
 # Никогда не роняет вызывающий скрипт: уведомление вторично по отношению к деплою.
@@ -43,18 +62,23 @@ notify() {
 		<<<"url = \"${api:-https://api.telegram.org}/bot${token}/sendMessage\"" >/dev/null 2>&1 || true
 }
 
-# dashboard_call МЕТОД ПУТЬ [JSON] — запрос к API агента в дашборде. Токен идёт
-# через -K из stdin, а не аргументом, чтобы не светиться в ps. Печатает HTTP-код.
-dashboard_call() {
-	local method=$1 path=$2 body=${3:-} url token
+# dashboard_fetch МЕТОД ПУТЬ ФАЙЛ_ОТВЕТА [JSON|@ФАЙЛ] [ТАЙМАУТ] — запрос к API агента
+# в дашборде, тело ответа пишется в файл. Токен идёт через -K из stdin, а не аргументом,
+# чтобы не светиться в ps. Большое тело передаём как @файл: аргументы тоже видны в ps.
+# Печатает HTTP-код.
+dashboard_fetch() {
+	local method=$1 path=$2 out=$3 body=${4:-} max_time=${5:-10} url token
 	url=$(conf_value "$DASHBOARD_CONF" AIRLOK_API_URL)
 	token=$(conf_value "$DASHBOARD_CONF" AIRLOK_AGENT_TOKEN)
 	[[ -n $url && -n $token ]] || return 1
-	local args=(-sS --max-time 10 -o /dev/null -w '%{http_code}' -X "$method" -K -)
+	local args=(-sS --max-time "$max_time" -o "$out" -w '%{http_code}' -X "$method" -K -)
 	[[ -n $body ]] && args+=(-H 'Content-Type: application/json' --data-binary "$body")
 	curl "${args[@]}" <<<"url = \"${url%/}${path}\"
 header = \"Authorization: Bearer ${token}\"" 2>/dev/null
 }
+
+# dashboard_call МЕТОД ПУТЬ [JSON] — то же без тела ответа.
+dashboard_call() { dashboard_fetch "$1" "$2" /dev/null "${3:-}"; }
 
 # События для дашборда сначала ложатся в очередь на диске, а уже потом отправляются:
 # если дашборд недоступен, они дождутся связи. Имя файла начинается со времени в
@@ -154,6 +178,16 @@ write_if_changed() {
 	install -D -m "$mode" "$tmp" "$path"
 	rm -f "$tmp"
 	return 0
+}
+
+# Формат логов nginx для метрик: только время, код, длительность и размер ответа.
+# Ни IP, ни адресов страниц — персональные данные посетителей серверу airlok не нужны.
+# Нужен и server-base.sh, и app-deploy.sh: сайт с access_log … airlok без формата
+# nginx не примет.
+ensure_log_format() {
+	write_if_changed /etc/nginx/conf.d/airlok-log.conf 0644 <<'EOF'
+log_format airlok '$msec $status $request_time $body_bytes_sent';
+EOF
 }
 
 load_manifest() {

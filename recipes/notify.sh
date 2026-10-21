@@ -37,6 +37,36 @@ EOF
 	ok "сайты проверяются каждую минуту"
 }
 
+# Агент выполняет команды из дашборда. Служба перезапускается только при изменении
+# юнита: перезапуск убил бы идущую выкатку, а новый agent.sh агент подхватит сам.
+install_agent() {
+	local changed=no
+	write_if_changed /etc/systemd/system/airlok-agent.service 0644 <<EOF && changed=yes
+[Unit]
+Description=airlok: команды из дашборда (выкатка коммитов из GitHub)
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+ExecStart=${RECIPES_DIR}/agent.sh
+Restart=always
+RestartSec=10
+RuntimeDirectory=airlok-agent
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target
+EOF
+	[[ $changed == yes ]] && systemctl daemon-reload
+	systemctl enable airlok-agent.service >/dev/null 2>&1
+	if [[ $changed == yes ]]; then
+		systemctl restart airlok-agent.service
+	else
+		systemctl start airlok-agent.service
+	fi
+	ok "агент ждёт команды из дашборда: выкатить коммит из GitHub"
+}
+
 # chat_id берём из последнего сообщения боту, чтобы человеку не искать его вручную.
 find_chat_id() {
 	local token=$1
@@ -101,6 +131,7 @@ dashboard() {
 	install -m 600 "$tmp" "$DASHBOARD_CONF"
 	rm -f "$tmp"
 	install_healthcheck
+	install_agent
 	ok "сервер подключён к ${url}: выкатки и доступность сайтов будут видны в дашборде"
 }
 
@@ -117,5 +148,9 @@ install-healthcheck)
 	need_root
 	install_healthcheck
 	;;
-*) die "использование: $0 setup|test" ;;
+install-agent)
+	need_root
+	install_agent
+	;;
+*) die "использование: $0 setup|test|dashboard АДРЕС" ;;
 esac

@@ -4,6 +4,13 @@
 #   github-deploy.sh setup  владелец/репозиторий   — создать ключ и показать, куда его добавить
 #   github-deploy.sh deploy владелец/репозиторий [ветка|коммит]
 #                                                  — забрать код и выкатить; по умолчанию main
+#
+# Агент (agent.sh) вызывает deploy с переменными окружения вместо deploy key:
+#   AIRLOK_GITHUB_TOKEN  — токен GitHub App только на чтение, код забирается по HTTPS;
+#   AIRLOK_GITHUB_PUBLIC — 1: публичный репозиторий, по HTTPS без токена;
+#   AIRLOK_FETCH_REF     — ветка, в которой искать коммит (забирается только она);
+#   AIRLOK_ROOT_DIR      — каталог с airlok.yml внутри репозитория;
+#   AIRLOK_APP_NAME      — имя приложения на сервере вместо app.name из манифеста.
 #   github-deploy.sh log    владелец/репозиторий [ветка]
 #                                                  — последние коммиты, чтобы выбрать, что выкатить
 #   github-deploy.sh webhook владелец/репозиторий [ветка]
@@ -60,30 +67,66 @@ $(cat "${KEY}.pub")
 EOF
 }
 
-fetch() {
-	git_ssh
-	[[ -s $KEY ]] || die "нет ключа для ${REPO}, сначала: $0 setup ${REPO}"
-	install -d -m 700 "$CACHE_DIR"
-	if [[ ! -d $GIT_DIR_PATH ]]; then
-		git init -q --bare "$GIT_DIR_PATH"
-		git --git-dir="$GIT_DIR_PATH" remote add origin "git@github.com:${REPO}.git"
+# Токен попадает в git только через переменные окружения: в аргументах и URL его
+# было бы видно в ps, а git пишет URL в сообщения об ошибках.
+git_https() {
+	export GIT_TERMINAL_PROMPT=0
+	if [[ -n ${AIRLOK_GITHUB_TOKEN:-} ]]; then
+		local basic
+		basic=$(printf 'x-access-token:%s' "$AIRLOK_GITHUB_TOKEN" | base64 -w0)
+		export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+			GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic}"
 	fi
+}
+
+https_mode() { [[ -n ${AIRLOK_GITHUB_TOKEN:-} || ${AIRLOK_GITHUB_PUBLIC:-} == 1 ]]; }
+
+# fetch [ВЕТКА] — забрать код в кэш. URL передаётся прямо в git fetch, а не через remote:
+# один и тот же кэш забирают и по deploy key, и по HTTPS.
+fetch() {
+	local branch=${1:-} url
+	if https_mode; then
+		git_https
+		url=https://github.com/${REPO}.git
+	else
+		git_ssh
+		[[ -s $KEY ]] || die "нет ключа для ${REPO}, сначала: $0 setup ${REPO}"
+		url=git@github.com:${REPO}.git
+	fi
+	install -d -m 700 "$CACHE_DIR"
+	[[ -d $GIT_DIR_PATH ]] || git init -q --bare "$GIT_DIR_PATH"
+	local refspec='+refs/heads/*:refs/heads/*'
+	[[ -n $branch ]] && refspec="+refs/heads/${branch}:refs/heads/${branch}"
 	local err
-	if ! err=$(git --git-dir="$GIT_DIR_PATH" fetch -q --prune origin '+refs/heads/*:refs/heads/*' 2>&1); then
-		case $err in
-		*"Permission denied"* | *"Repository not found"* | *"Could not read from remote"*)
-			die "GitHub не пустил по ключу. Проверьте, что ключ добавлен в Deploy keys репозитория ${REPO}: $0 setup ${REPO}" ;;
-		*) die "не удалось получить код из GitHub: ${err}" ;;
-		esac
+	if ! err=$(git --git-dir="$GIT_DIR_PATH" fetch -q --prune "$url" "$refspec" 2>&1); then
+		fetch_failed "$err"
 	fi
 	ok "код получен из github.com/${REPO}"
 }
 
+fetch_failed() {
+	local err=$1
+	case $err in
+	*"Permission denied"* | *"Repository not found"* | *"Could not read from remote"* | *"Authentication failed"* | \
+		*"could not read Username"* | *"returned error: 401"* | *"returned error: 403"* | *"returned error: 404"*)
+		if [[ -n ${AIRLOK_GITHUB_TOKEN:-} ]]; then
+			die "GitHub не дал доступ к репозиторию ${REPO}: проверьте, что приложение airlok установлено и у него есть доступ к этому репозиторию"
+		elif [[ ${AIRLOK_GITHUB_PUBLIC:-} == 1 ]]; then
+			die "репозиторий ${REPO} не найден или закрытый: для закрытого репозитория подключите GitHub в дашборде"
+		fi
+		die "GitHub не пустил по ключу. Проверьте, что ключ добавлен в Deploy keys репозитория ${REPO}: $0 setup ${REPO}" ;;
+	*"couldn't find remote ref"*) die "в ${REPO} нет такой ветки" ;;
+	*) die "не удалось получить код из GitHub: ${err}" ;;
+	esac
+}
+
 # Ветку или коммит превращаем в полный хеш. Ссылку проверяем по формату заранее:
 # значение, начинающееся с «-», git принял бы за опцию.
+REF_RE='^[A-Za-z0-9._/][A-Za-z0-9._/-]*$'
+
 resolve() {
 	local ref=$1 sha
-	[[ $ref =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ ]] || die "некорректное имя ветки или коммита: ${ref}"
+	[[ $ref =~ $REF_RE ]] || die "некорректное имя ветки или коммита: ${ref}"
 	if sha=$(git --git-dir="$GIT_DIR_PATH" rev-parse -q --verify "refs/heads/${ref}^{commit}" 2>/dev/null); then
 		REF_KIND="ветка ${ref}"
 	elif [[ $ref =~ ^[0-9a-f]{7,40}$ ]] && sha=$(git --git-dir="$GIT_DIR_PATH" rev-parse -q --verify "${ref}^{commit}" 2>/dev/null); then
@@ -106,20 +149,40 @@ deploy_trap() {
 deploy() {
 	need_root
 	parse_repo "$1"
-	local ref=${2:-main}
+	local ref=${2:-main} branch=${AIRLOK_FETCH_REF:-} root=${AIRLOK_ROOT_DIR:-}
 	HANDED_OFF=0
 	SRC=""
 	trap 'deploy_trap $?' EXIT
-	fetch
+	[[ -z $branch || $branch =~ $REF_RE ]] || die "некорректное имя ветки: ${branch}"
+	# Тот же формат, что проверяют дашборд и агент: сегменты через /, каждый не с точки
+	# и не с дефиса — так отсекаются «..» и скрытые каталоги.
+	if [[ -n $root ]]; then
+		[[ $root =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$ ]] ||
+			die "некорректный каталог в репозитории: ${root}"
+	fi
+	fetch "$branch"
+	# Коммит мог уйти из ветки (force push) или быть в другой — GitHub отдаёт его и по хешу.
+	if https_mode && [[ $ref =~ ^[0-9a-f]{40}$ ]] &&
+		! git --git-dir="$GIT_DIR_PATH" cat-file -e "${ref}^{commit}" 2>/dev/null; then
+		local err
+		err=$(git --git-dir="$GIT_DIR_PATH" fetch -q "https://github.com/${REPO}.git" "$ref" 2>&1) || fetch_failed "$err"
+	fi
 	resolve "$ref"
 	SRC=$(mktemp -d /tmp/airlok-src.XXXXXX)
-	local src=$SRC
+	local src=$SRC tree=$SHA
+	if [[ -n $root ]]; then
+		[[ $(git --git-dir="$GIT_DIR_PATH" cat-file -t "${SHA}:${root}" 2>/dev/null) == tree ]] ||
+			die "в ${REPO} на коммите ${SHA:0:12} нет каталога ${root}"
+		tree=${SHA}:${root}
+	fi
 	# git archive, а не checkout: в релиз попадает только содержимое коммита, без .git и истории.
-	git --git-dir="$GIT_DIR_PATH" archive "$SHA" | tar -x -C "$src"
-	[[ -f $src/airlok.yml ]] || die "в корне ${REPO} нет airlok.yml"
+	git --git-dir="$GIT_DIR_PATH" archive "$tree" | tar -x -C "$src"
+	[[ -f $src/airlok.yml ]] || die "в ${REPO}${root:+/${root}} нет airlok.yml"
 	local subject
 	subject=$(git --git-dir="$GIT_DIR_PATH" log -1 --format='%s' "$SHA")
 	ok "${REF_KIND}: ${SHA:0:12} «${subject}»"
+	# Дальше код уже на диске: сборке и приложению токен не нужен.
+	unset AIRLOK_GITHUB_TOKEN GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 	HANDED_OFF=1
 	AIRLOK_RELEASE_ID=${SHA:0:12} AIRLOK_RELEASE_TITLE=$subject "$RECIPES_DIR/app-deploy.sh" "$src"
 }

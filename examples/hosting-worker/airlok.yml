@@ -1,0 +1,18 @@
+# Фоновое приложение на хостинге airlok: без сайта, работает всё время, плюс задача по
+# расписанию. Время в расписании — московское.
+version: 1
+
+app:
+  name: hosting-worker
+  stack: python
+  type: worker
+
+run:
+  command: python worker.py
+
+capabilities:
+  cron:
+    - name: отчёт
+      schedule: "* * * * *"
+      command: python report.py
+      timeout_min: 1

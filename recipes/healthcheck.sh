@@ -34,11 +34,26 @@ diagnose() {
 	printf '%s; ' "${reasons[@]}" | sed 's/; $//'
 }
 
+# worker_code — «ответ» фонового приложения: сайта у него нет, работает — значит, контейнер
+# жив и не перезапускается по кругу.
+worker_code() {
+	local dir=$APPS_ROOT/$1 cid
+	cid=$(docker compose -f "$dir/compose.yml" --project-directory "$dir" ps -aq app </dev/null 2>/dev/null)
+	[[ -n $cid && $(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' "$cid" 2>/dev/null) == "true false" ]] &&
+		echo 200 || echo 000
+}
+
 check_app() {
-	local name=$1 conf domain code
+	local name=$1 conf domain="" code what=сайт
 	conf=/etc/nginx/sites-enabled/airlok-${name}.conf
-	[[ -f $conf ]] || return
-	domain=$(awk '$1=="server_name"{gsub(";", "", $2); print $2; exit}' "$conf")
+	if [[ -f $conf ]]; then
+		domain=$(awk '$1=="server_name"{gsub(";", "", $2); print $2; exit}' "$conf")
+	elif grep -qs '^    ports:' "$APPS_ROOT/$name/compose.yml"; then
+		# Сайт приложения отключён руками: проверять нечего.
+		return
+	else
+		what="фоновое приложение"
+	fi
 
 	# Во время выкатки приложение перезапускается — это не простой.
 	exec 7>"/run/airlok-deploy-${name}.lock"
@@ -48,8 +63,12 @@ check_app() {
 	fi
 	exec 7>&-
 
-	code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
-		--resolve "${domain}:443:127.0.0.1" "https://${domain}/")
+	if [[ -n $domain ]]; then
+		code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+			--resolve "${domain}:443:127.0.0.1" "https://${domain}/")
+	else
+		code=$(worker_code "$name")
+	fi
 
 	local file=$STATE_DIR/$name status=up fails=0 since now first=no
 	now=$(date +%s)
@@ -64,7 +83,7 @@ check_app() {
 		if [[ $status == down ]]; then
 			# Точность — интервал проверок (минута), поэтому округляем и пишем «около».
 			local minutes=$(((now - since + 30) / 60))
-			notify "✅ ${name}: сайт снова отвечает. Простой: около $((minutes > 0 ? minutes : 1)) мин. https://${domain}"
+			notify "✅ ${name}: ${what} снова работает. Простой: около $((minutes > 0 ? minutes : 1)) мин.${domain:+ https://${domain}}"
 			report_health "$name" "$domain" up "$code" ""
 			echo "${name}: снова отвечает"
 		elif [[ $first == yes ]]; then
@@ -80,7 +99,7 @@ check_app() {
 	if [[ $status != down ]] && ((fails >= FAILS_BEFORE_ALERT)); then
 		local reason
 		reason=$(diagnose "$name")
-		notify "🔴 ${name}: сайт не отвечает с $(date -d "@${since}" '+%H:%M %Z') (код ${code}). Причина: ${reason}. https://${domain}"
+		notify "🔴 ${name}: ${what} не работает с $(date -d "@${since}" '+%H:%M %Z') (код ${code}). Причина: ${reason}.${domain:+ https://${domain}}"
 		report_health "$name" "$domain" down "$code" "$reason"
 		echo "${name}: не отвечает (${code}): ${reason}"
 		status=down

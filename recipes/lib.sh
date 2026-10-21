@@ -190,9 +190,9 @@ log_format airlok '$msec $status $request_time $body_bytes_sent';
 EOF
 }
 
+# load_manifest КАТАЛОГ — настройки приложения из airlok.yml, а без него — по файлам проекта.
 load_manifest() {
-	local manifest=$1 vars
-	[[ -f $manifest ]] || die "не найден манифест ${manifest}"
-	vars=$(python3 "$RECIPES_DIR/manifest.py" "$manifest") || exit 1
+	local vars
+	vars=$(python3 "$RECIPES_DIR/manifest.py" "$1") || exit 1
 	eval "$vars"
 }

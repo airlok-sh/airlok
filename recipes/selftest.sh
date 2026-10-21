@@ -29,23 +29,37 @@ compose() { docker compose -f "$APP_DIR/compose.yml" --project-directory "$APP_D
 inside_checks() {
 	step "Изнутри контейнера приложения"
 	local out
+	# Проверки на sh: он есть в образе любого стека, а node или python — нет.
 	# </dev/null: иначе exec съедает stdin вызывающего скрипта.
-	out=$(compose exec -T app node </dev/null -e '
-const fs = require("fs"), cp = require("child_process");
-const t = (name, fn) => { let v; try { v = fn(); } catch (e) { v = "ERR:" + (e.code || e.message); } console.log(name + "=" + v); };
-const script = "#!/bin/sh\necho ran\n";
-t("write_code", () => { fs.writeFileSync("/app/airlok-selftest", "x"); return "written"; });
-t("uid", () => process.getuid());
-t("docker_sock", () => fs.existsSync("/var/run/docker.sock"));
-t("host_apps", () => fs.existsSync("/srv/apps"));
-t("chown_root", () => { fs.writeFileSync("/tmp/airlok-chown", "x"); fs.chownSync("/tmp/airlok-chown", 0, 0); return "changed"; });
-t("exec_tmp", () => { fs.writeFileSync("/tmp/airlok-selftest.sh", script, { mode: 0o755 }); return cp.execFileSync("/tmp/airlok-selftest.sh").toString().trim(); });
-if (process.env.UPLOAD_DIR) {
-  const f = process.env.UPLOAD_DIR + "/airlok-selftest.sh";
-  t("write_uploads", () => { fs.writeFileSync(f, script, { mode: 0o755 }); return "written"; });
-  t("exec_uploads", () => cp.execFileSync(f).toString().trim());
-  try { fs.unlinkSync(f); } catch {}
+	# shellcheck disable=SC2016 # переменные раскрывает sh внутри контейнера
+	out=$(compose exec -T app sh </dev/null -c '
+t() {
+	name=$1
+	shift
+	if res=$("$@" 2>&1); then
+		echo "$name=$res"
+		return
+	fi
+	case $res in
+	*"Read-only file system"*) echo "$name=ERR:EROFS" ;;
+	*"Operation not permitted"*) echo "$name=ERR:EPERM" ;;
+	*"Permission denied"*) echo "$name=ERR:EACCES" ;;
+	*) echo "$name=ERR:$res" ;;
+	esac
 }
+script() { printf "#!/bin/sh\necho ran\n" >"$1" && chmod 755 "$1" && echo written; }
+t write_code sh -c "echo x >/app/airlok-selftest && echo written"
+t uid id -u
+t docker_sock sh -c "test -e /var/run/docker.sock && echo true || echo false"
+t host_apps sh -c "test -e /srv/apps && echo true || echo false"
+t chown_root sh -c "echo x >/tmp/airlok-chown && chown 0:0 /tmp/airlok-chown && echo changed"
+script /tmp/airlok-selftest.sh >/dev/null
+t exec_tmp /tmp/airlok-selftest.sh
+if [ -n "$UPLOAD_DIR" ]; then
+	t write_uploads script "$UPLOAD_DIR/airlok-selftest.sh"
+	t exec_uploads "$UPLOAD_DIR/airlok-selftest.sh"
+	rm -f "$UPLOAD_DIR/airlok-selftest.sh"
+fi
 ' 2>&1)
 	val() { sed -n "s/^$1=//p" <<<"$out"; }
 
@@ -81,9 +95,13 @@ host_checks() {
 	done
 	expect "файлы секретов с правами 600" "(600 )+" "$perms"
 
-	local port_bind
-	port_bind=$(ss -H -tln "( sport = :${APP_PORT} )" | awk '{print $4}' | sort -u | paste -sd' ' -)
-	expect "порт приложения слушает только 127.0.0.1" "127\.0\.0\.1:${APP_PORT}" "$port_bind"
+	if [[ $APP_KIND == web ]]; then
+		local port_bind
+		port_bind=$(ss -H -tln "( sport = :${APP_PORT} )" | awk '{print $4}' | sort -u | paste -sd' ' -)
+		expect "порт приложения слушает только 127.0.0.1" "127\.0\.0\.1:${APP_PORT}" "$port_bind"
+	else
+		expect "у фонового приложения нет открытых портов" "\{\}|map\[\]" "$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$cid")"
+	fi
 	if ((DB_ENABLED)); then
 		expect "база не опубликована на сервере" "\{\}|map\[\]" "$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$(compose ps -q db)")"
 	fi
@@ -141,17 +159,21 @@ main() {
 	need_root
 	local src=${1:-}
 	[[ -d $src ]] || die "использование: $0 /путь/к/проекту"
-	load_manifest "$src/airlok.yml"
+	load_manifest "$src"
+	[[ -n ${AIRLOK_APP_NAME:-} ]] && APP_NAME=$AIRLOK_APP_NAME
+	[[ -n $APP_NAME ]] || APP_NAME=$(basename "$src" | tr '[:upper:]_. ' '[:lower:]---' | tr -cd 'a-z0-9-' | sed 's/^[^a-z]*//; s/-*$//' | cut -c1-31)
 	APP_USER=app-$APP_NAME
 	APP_DIR=$APPS_ROOT/$APP_NAME
 	APP_UID=$(id -u "$APP_USER") || die "приложение ${APP_NAME} ещё не развёрнуто"
-	APP_PORT=$(<"$APP_DIR/shared/port")
+	[[ $APP_KIND == web ]] && APP_PORT=$(<"$APP_DIR/shared/port")
+	[[ -n $APP_DOMAIN || $APP_KIND == worker ]] ||
+		APP_DOMAIN=$(awk '$1=="server_name"{gsub(";", "", $2); print $2; exit}' "/etc/nginx/sites-enabled/airlok-${APP_NAME}.conf")
 	TMP=$(mktemp -d)
 	trap 'rm -rf "$TMP"' EXIT
 
 	inside_checks
 	host_checks
-	web_checks
+	[[ $APP_KIND == web ]] && web_checks
 
 	printf '\n%sПроверок пройдено: %d, не пройдено: %d%s\n' "$C_B" "$PASS" "$FAIL" "$C_0"
 	((FAIL == 0))

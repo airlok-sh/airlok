@@ -9,7 +9,7 @@
 #   AIRLOK_GITHUB_TOKEN  — токен GitHub App только на чтение, код забирается по HTTPS;
 #   AIRLOK_GITHUB_PUBLIC — 1: публичный репозиторий, по HTTPS без токена;
 #   AIRLOK_FETCH_REF     — ветка, в которой искать коммит (забирается только она);
-#   AIRLOK_ROOT_DIR      — каталог с airlok.yml внутри репозитория;
+#   AIRLOK_ROOT_DIR      — каталог проекта внутри репозитория (там airlok.yml, если он есть);
 #   AIRLOK_APP_NAME      — имя приложения на сервере вместо app.name из манифеста.
 #   github-deploy.sh log    владелец/репозиторий [ветка]
 #                                                  — последние коммиты, чтобы выбрать, что выкатить
@@ -177,7 +177,6 @@ deploy() {
 	fi
 	# git archive, а не checkout: в релиз попадает только содержимое коммита, без .git и истории.
 	git --git-dir="$GIT_DIR_PATH" archive "$tree" | tar -x -C "$src"
-	[[ -f $src/airlok.yml ]] || die "в ${REPO}${root:+/${root}} нет airlok.yml"
 	local subject
 	subject=$(git --git-dir="$GIT_DIR_PATH" log -1 --format='%s' "$SHA")
 	ok "${REF_KIND}: ${SHA:0:12} «${subject}»"

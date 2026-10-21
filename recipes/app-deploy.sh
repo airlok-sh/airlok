@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Песочница и деплой приложения по airlok.yml из корня проекта.
+# Песочница и деплой приложения: по airlok.yml из корня проекта, а без него — по файлам
+# проекта (Next.js, Node, Python, статика), как на хостинге airlok.
 #
 #   app-deploy.sh /путь/к/проекту
 #
@@ -8,8 +9,12 @@
 source "$(dirname "$0")/lib.sh"
 
 BUILD_USER=airlok-build
-NODE_IMAGE=node:22-bookworm-slim
 PG_IMAGE=postgres:16
+# Статику отдаёт nginx без root внутри контейнера: тот же откат, проверки и изоляция,
+# что у приложений.
+STATIC_IMAGE=nginxinc/nginx-unprivileged:1.27-alpine
+# Порт приложения внутри контейнера; снаружи он доступен только nginx сервера.
+CONTAINER_PORT=8080
 KEEP_RELEASES=3
 IMAGE_EXTS="jpg jpeg png webp gif avif"
 
@@ -98,6 +103,9 @@ secrets() {
 		echo "NODE_ENV=production"
 		echo "NEXT_TELEMETRY_DISABLED=1"
 		echo "HOME=/tmp"
+		echo "PORT=${CONTAINER_PORT}"
+		echo "HOST=0.0.0.0"
+		echo "HOSTNAME=0.0.0.0"
 		if ((DB_ENABLED)); then echo "DATABASE_URL=postgres://app:${pw}@db:5432/app"; fi
 		if ((UPLOADS_ENABLED)); then
 			echo "UPLOAD_DIR=/data/uploads"
@@ -133,7 +141,8 @@ prepare_release() {
 	fi
 	rm -rf "$RELEASE" "${RELEASE}.built"
 	install -d -m 755 "$RELEASE"
-	rsync -a --exclude .git --exclude node_modules --exclude .next --exclude '.env*' "$src/" "$RELEASE/"
+	rsync -a --exclude .git --exclude node_modules --exclude .next --exclude .venv --exclude __pycache__ \
+		--exclude '.env*' "$src/" "$RELEASE/"
 	chown -R "$BUILD_USER:$BUILD_USER" "$RELEASE"
 	if [[ -n $(find "$src" -maxdepth 1 -name '.env*' ! -name '*.example') ]]; then
 		note ".env из проекта не копируется: секреты задаются в ${APP_DIR}/shared/user.env"
@@ -141,23 +150,42 @@ prepare_release() {
 	ok "релиз ${id}"
 }
 
+# Образы сборки и запуска: версии только из списка, который проверил detect.py.
+images() {
+	case $APP_STACK in
+	python) BUILD_IMAGE=python:${PYTHON_VERSION}-slim-bookworm RUN_IMAGE=$BUILD_IMAGE ;;
+	static) BUILD_IMAGE=node:${NODE_VERSION}-bookworm-slim RUN_IMAGE=$STATIC_IMAGE ;;
+	*) BUILD_IMAGE=node:${NODE_VERSION}-bookworm-slim RUN_IMAGE=$BUILD_IMAGE ;;
+	esac
+}
+
 build() {
 	((REUSED)) && return 0
-	step "Сборка"
-	local log=${RELEASE}.build.log
-	# npm install выполняет скрипты чужих пакетов, поэтому у сборки нет ни секретов,
-	# ни базы, ни прав: только папка релиза и доступ к реестру npm.
-	if ! docker run --rm --name "airlok-build-${APP_NAME}" \
+	step "Сборка: ${APP_FRAMEWORK}"
+	local log=${RELEASE}.build.log script
+	script=$BUILD_INSTALL
+	[[ -n $script && -n $BUILD_CMD ]] && script+=" && "
+	script+=$BUILD_CMD
+	# Установка зависимостей выполняет скрипты чужих пакетов, поэтому у сборки нет ни
+	# секретов, ни базы, ни прав: только папка релиза и доступ к реестрам пакетов.
+	if [[ -n $script ]] && ! docker run --rm --name "airlok-build-${APP_NAME}" \
 		--user "${BUILD_UID}:${BUILD_GID}" --cap-drop ALL --security-opt no-new-privileges \
 		--memory 1g --pids-limit 512 \
-		-e HOME=/tmp -e NEXT_TELEMETRY_DISABLED=1 -e npm_config_cache=/tmp/npm \
-		-v "${RELEASE}:/app" -w /app "$NODE_IMAGE" \
-		sh -c 'if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi && npm run build' \
+		-e HOME=/tmp -e NEXT_TELEMETRY_DISABLED=1 -e npm_config_cache=/tmp/npm -e PIP_CACHE_DIR=/tmp/pip \
+		-e PYTHONDONTWRITEBYTECODE=1 \
+		-v "${RELEASE}:/app" -w /app "$BUILD_IMAGE" sh -c "$script" \
 		>"$log" 2>&1; then
 		tail -30 "$log" >&2
+		local outside
+		outside=$(grep -oE "EACCES: permission denied, [a-z]+ '/[^']*'" "$log" | grep -vE "'/(app|tmp)(/|')" | head -1)
+		if [[ -n $outside ]]; then
+			die "сборка пишет за пределы папки проекта (${outside#*, }): так бывает в монорепозитории, где фронтенд собирается в каталог бэкенда. Выкатывайте каталог, в котором собирается всё приложение, или поправьте путь сборки. Полный лог: ${log}"
+		fi
 		die "сборка не удалась, полный лог: ${log}"
 	fi
-	install -d "${RELEASE}/.next/cache"
+	[[ $APP_STACK == nextjs ]] && install -d "${RELEASE}/.next/cache"
+	# Каталог сайта проверяем сразу: без index.html выкатывать нечего.
+	[[ $APP_STACK == static ]] && { static_root >/dev/null || exit 1; }
 	chown -R root:root "$RELEASE"
 	# Права задаём явно, а не наследуем от исходников: временный каталог из mktemp
 	# имеет 700, и приложение не смогло бы прочитать собственный код.
@@ -166,22 +194,70 @@ build() {
 	ok "собрано в изолированном контейнере, код передан root и закрыт на запись"
 }
 
+static_root() {
+	local built=()
+	[[ -n $BUILD_CMD ]] && built=(built)
+	python3 "$RECIPES_DIR/detect.py" static-output "$RELEASE" "$BUILD_OUTPUT" "${built[@]}"
+}
+
+# static_conf — сайт для nginx внутри контейнера. Есть 404.html — сайт многостраничный и
+# свою страницу ошибки отдаёт сам; нет — это SPA, и любой путь ведёт на index.html.
+static_conf() {
+	local root fallback="/index.html"
+	root=$(static_root) || exit 1
+	[[ -f $RELEASE/$root/404.html ]] && fallback="=404"
+	write_if_changed "$APP_DIR/shared/static.conf" 0644 <<EOF || true
+server {
+    listen ${CONTAINER_PORT};
+    server_tokens off;
+    root /app/${root};
+    index index.html;
+    error_page 404 /404.html;
+    location / { try_files \$uri \$uri/ \$uri.html ${fallback}; }
+}
+EOF
+}
+
+# compose_command — команда запуска в compose.yml. JSON — это YAML, а $ удваиваем: иначе
+# compose подставил бы вместо него переменные своего окружения.
+compose_command() {
+	case $APP_STACK in
+	nextjs) echo '["node", "node_modules/next/dist/bin/next", "start", "-p", "'"$CONTAINER_PORT"'", "-H", "0.0.0.0"]' ;;
+	static) echo '["nginx", "-g", "daemon off;"]' ;;
+	*) python3 -c 'import json, sys; print(json.dumps(["sh", "-c", sys.argv[1]]).replace("$", "$$"))' "$RUN_CMD" ;;
+	esac
+}
+
 write_compose() {
 	{
 		cat <<EOF
 name: ${APP_NAME}
 services:
   app:
-    image: ${NODE_IMAGE}
+    image: ${RUN_IMAGE}
     working_dir: /app
-    command: ["node", "node_modules/next/dist/bin/next", "start", "-p", "3000", "-H", "0.0.0.0"]
+    command: $(compose_command)
     user: "${APP_UID}:${APP_GID}"
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     tmpfs:
       - /tmp:size=64m,noexec,nosuid,nodev
-      - /app/.next/cache:size=128m,noexec,nosuid,nodev,uid=${APP_UID},gid=${APP_GID}
+EOF
+		if [[ $APP_STACK == nextjs ]]; then
+			echo "      - /app/.next/cache:size=128m,noexec,nosuid,nodev,uid=${APP_UID},gid=${APP_GID}"
+		fi
+		if [[ $APP_STACK == python ]]; then
+			cat <<EOF
+    environment:
+      PATH: /app/.venv/bin:/usr/local/bin:/usr/bin:/bin
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      GRADIO_SERVER_NAME: 0.0.0.0
+      GRADIO_SERVER_PORT: "${CONTAINER_PORT}"
+EOF
+		fi
+		cat <<EOF
     env_file:
       - path: shared/app.env
       - path: shared/user.env
@@ -189,9 +265,10 @@ services:
     volumes:
       - ${RELEASE}:/app:ro
 EOF
+		if [[ $APP_STACK == static ]]; then echo "      - ${APP_DIR}/shared/static.conf:/etc/nginx/conf.d/default.conf:ro"; fi
 		if ((UPLOADS_ENABLED)); then echo "      - ${APP_DIR}/shared/uploads:/data/uploads"; fi
+		if [[ $APP_KIND == web ]]; then echo "    ports: [\"127.0.0.1:${APP_PORT}:${CONTAINER_PORT}\"]"; fi
 		cat <<EOF
-    ports: ["127.0.0.1:${APP_PORT}:3000"]
     mem_limit: ${MEMORY_MB}m
     pids_limit: 200
     restart: unless-stopped
@@ -264,7 +341,17 @@ EOF
 	note "копии лежат на этом же сервере: если пропадёт сервер, пропадут и они"
 }
 
+# wait_running — фоновое приложение запустилось и не упало в первые секунды: порта у
+# него нет, и «работает» значит только, что контейнер жив.
+wait_running() {
+	local state
+	sleep 10
+	state=$(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' "$(compose ps -aq app)" 2>/dev/null)
+	[[ $state == "true false" ]]
+}
+
 wait_healthy() {
+	[[ $APP_KIND == worker ]] && { wait_running; return; }
 	local i code
 	for ((i = 0; i < 60; i++)); do
 		code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${APP_PORT}/" || true)
@@ -284,6 +371,7 @@ deploy() {
 		ok "бэкап базы перед выкаткой"
 	fi
 
+	[[ $APP_STACK == static ]] && static_conf
 	write_compose
 	if ((DB_ENABLED)); then
 		compose up -d --wait db >"$log" 2>&1 || die "база не запустилась, лог: ${log}"
@@ -295,15 +383,21 @@ deploy() {
 		compose logs --tail 30 app >&2 || true
 		if [[ -n $prev && $prev != "$RELEASE" ]]; then
 			RELEASE=$prev
+			[[ $APP_STACK == static ]] && static_conf
 			write_compose
 			compose up -d --force-recreate --no-deps app >>"$log" 2>&1 || true
 			ROLLED_BACK=$(basename "$prev")
-			die "новая версия не ответила за 2 минуты, вернули предыдущую (${ROLLED_BACK})"
+			die "новая версия не запустилась, вернули предыдущую (${ROLLED_BACK})"
 		fi
-		die "приложение не ответило за 2 минуты"
+		[[ $APP_KIND == worker ]] && die "фоновое приложение завершилось сразу после запуска — причина в логе выше"
+		die "приложение не ответило за 2 минуты: оно должно слушать порт из переменной PORT на 0.0.0.0"
 	fi
 	ln -sfn "$RELEASE" "$APP_DIR/current"
-	ok "приложение отвечает на 127.0.0.1:${APP_PORT}"
+	if [[ $APP_KIND == worker ]]; then
+		ok "фоновое приложение работает"
+	else
+		ok "приложение отвечает на 127.0.0.1:${APP_PORT}"
+	fi
 
 	local old
 	for old in $(ls -1dt "$APP_DIR"/releases/*/ | tail -n +$((KEEP_RELEASES + 1))); do
@@ -485,7 +579,7 @@ deploy_finished() {
 	local what="версия ${version}${AIRLOK_RELEASE_TITLE:+ «${AIRLOK_RELEASE_TITLE}»}" status
 	if ((code == 0)); then
 		status=success
-		notify "✅ ${APP_NAME}: выкачена ${what} за ${took} с. https://${APP_DOMAIN}"
+		notify "✅ ${APP_NAME}: выкачена ${what} за ${took} с.${APP_DOMAIN:+ https://${APP_DOMAIN}}"
 	elif [[ -n ${ROLLED_BACK:-} ]]; then
 		status=rolled_back
 		notify "⚠️ ${APP_NAME}: ${what} не поднялась, вернули предыдущую (${ROLLED_BACK}). Сайт работает на ней. Логи: ${APP_DIR}/shared/deploy.log"
@@ -500,18 +594,44 @@ deploy_finished() {
 	report_deploy "$APP_NAME" "$APP_DOMAIN" "${version:-unknown}" "${AIRLOK_RELEASE_TITLE:-}" "$status" "$took" "${DIE_MSG:-}"
 }
 
+# default_name — имя приложения по папке проекта: для выкатки руками без airlok.yml.
+default_name() {
+	local name
+	name=$(basename "$1" | tr '[:upper:]_. ' '[:lower:]---' | tr -cd 'a-z0-9-' | sed 's/^[^a-z]*//; s/-*$//' | cut -c1-31)
+	[[ $name =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "не получилось придумать имя по папке ${1}: укажите app.name в airlok.yml"
+	echo "$name"
+}
+
+# default_domain — адрес, который работает без своего домена: ИМЯ.IP.sslip.io указывает на
+# этот сервер, и на него можно выпустить сертификат Let's Encrypt.
+default_domain() {
+	local ip
+	ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}')
+	[[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "не нашли IP сервера: укажите app.domain в airlok.yml"
+	if [[ $ip =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]]; then
+		die "у сервера внутренний адрес ${ip}, снаружи по нему не открыть: укажите app.domain в airlok.yml"
+	fi
+	echo "${APP_NAME}.${ip//./-}.sslip.io"
+}
+
 main() {
 	need_root
 	local src=${1:-}
 	[[ -d $src ]] || die "использование: $0 /путь/к/проекту"
 	src=$(cd "$src" && pwd)
-	load_manifest "$src/airlok.yml"
+	load_manifest "$src"
 	# Агент разворачивает под именем из дашборда: в монорепозитории у фронтенда и бэкенда
 	# свои манифесты, но имена приложений на сервере не должны совпасть.
 	if [[ -n ${AIRLOK_APP_NAME:-} ]]; then
 		[[ $AIRLOK_APP_NAME =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "некорректное имя приложения: ${AIRLOK_APP_NAME}"
 		APP_NAME=$AIRLOK_APP_NAME
 	fi
+	[[ -n $APP_NAME ]] || APP_NAME=$(default_name "$src")
+	if [[ $APP_KIND == web && -z $APP_DOMAIN ]]; then
+		APP_DOMAIN=$(default_domain)
+		[[ -f $src/airlok.yml ]] || note "airlok.yml нет: ${APP_FRAMEWORK}, адрес ${APP_DOMAIN}, без базы и загрузок"
+	fi
+	images
 	APP_USER=app-$APP_NAME
 	APP_DIR=$APPS_ROOT/$APP_NAME
 
@@ -524,15 +644,19 @@ main() {
 	trap 'deploy_finished $?' EXIT
 
 	# До сборки: занятый домен выяснится за секунду, а не после нескольких минут npm.
-	ensure_domain_free
+	[[ $APP_KIND == web ]] && ensure_domain_free
 	ensure_users
 	layout
-	allocate_port
+	[[ $APP_KIND == web ]] && allocate_port
 	secrets
 	prepare_release "$src"
 	build
 	backup_setup
 	deploy
+	if [[ $APP_KIND == worker ]]; then
+		printf '\n%sГотово:%s фоновое приложение %s работает, логи: docker compose -f %s/compose.yml logs app\n' "$C_B" "$C_0" "$APP_NAME" "$APP_DIR"
+		return
+	fi
 	nginx_site
 	issue_certificate
 	printf '\n%sГотово:%s https://%s\n' "$C_B" "$C_0" "$APP_DOMAIN"

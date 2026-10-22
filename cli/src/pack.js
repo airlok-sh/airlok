@@ -20,6 +20,11 @@ const skipDirs = new Set([
   '.venv', 'venv', '__pycache__', '.pytest_cache', '.mypy_cache', '.idea', '.vscode', '.airlok',
 ])
 
+// MTIME — время файлов в архиве. Постоянное, чтобы одинаковый код давал одинаковый архив:
+// по хешу архива дашборд не пересобирает уже собранную версию. 2000-01-01, а не 1970:
+// некоторые инструменты сборки недолюбливают нулевое время.
+export const MTIME = 946_684_800
+
 export class PackError extends Error {}
 
 // skipped — файл не попадает в архив. .env.example и подобные оставляем: в них нет секретов,
@@ -128,10 +133,10 @@ export async function pack(dir, files, top = 'src') {
     gz.on('error', fail)
   })
   const write = (buf) => new Promise((ok) => (gz.write(buf) ? ok() : gz.once('drain', ok)))
-  const now = Math.floor(Date.now() / 1000)
-  for (const f of files) {
+  // Порядок файлов — тоже часть архива: сортируем, чтобы он не зависел от вызывающего.
+  for (const f of [...files].sort((a, b) => (a.path < b.path ? -1 : 1))) {
     if (total > MAX_ARCHIVE) break
-    await write(tarHeader(`${top}/${f.path}`, f.size, f.mode, now))
+    await write(tarHeader(`${top}/${f.path}`, f.size, f.mode, MTIME))
     let left = f.size
     for await (const chunk of createReadStream(join(dir, ...f.path.split('/')))) {
       const part = chunk.subarray(0, left)

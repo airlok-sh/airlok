@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { chmod, mkdir, mkdtemp, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -68,4 +69,19 @@ test('splitName moves folders to prefix and refuses long file names', () => {
 test('checkFiles explains an empty folder', () => {
   assert.match(checkFiles([]), /нет файлов/)
   assert.equal(checkFiles([{ path: 'a', size: 1 }]), '')
+})
+
+test('pack gives the same archive for the same code', async (t) => {
+  const dir = await project({ 'index.html': '<h1>hi</h1>', 'src/app.js': 'x', 'run.sh': '#!/bin/sh' })
+  const { files } = await listFiles(dir)
+  const sha = (b) => createHash('sha256').update(b).digest('hex')
+  const first = sha(await pack(dir, files))
+  // Ни время файлов, ни текущее время, ни порядок в списке не меняют архив.
+  await utimes(join(dir, 'index.html'), new Date(Date.UTC(2030, 0, 1)), new Date(Date.UTC(2030, 0, 1)))
+  t.mock.method(Date, 'now', () => Date.UTC(2031, 0, 1))
+  assert.equal(sha(await pack(dir, [...files].reverse())), first)
+
+  await writeFile(join(dir, 'index.html'), '<h1>hello</h1>')
+  const changed = (await listFiles(dir)).files
+  assert.notEqual(sha(await pack(dir, changed)), first, 'другой код — другой архив')
 })

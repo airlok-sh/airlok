@@ -1,20 +1,22 @@
 {
   "name": "airlok-cli",
   "version": "0.1.0",
-  "description": "Выкатка проекта на хостинг airlok из терминала: npx airlok-cli deploy",
+  "description": "Выкатка проекта на хостинг airlok из терминала и подключение ИИ-агентов: npx airlok-cli setup",
   "type": "module",
   "bin": {
     "airlok": "bin/airlok.js"
   },
   "files": [
     "bin",
-    "src"
+    "src",
+    "skills"
   ],
   "engines": {
     "node": ">=18.17"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "prepack": "node -e \"const fs=require('fs');fs.rmSync('skills',{recursive:true,force:true});fs.cpSync('../skills','skills',{recursive:true})\""
   },
   "repository": {
     "type": "git",

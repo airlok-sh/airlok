@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import { readFile, stat } from 'node:fs/promises'
-import { hostname } from 'node:os'
+import { homedir, hostname } from 'node:os'
 import { basename, resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { parseArgs, promisify } from 'node:util'
@@ -8,6 +8,7 @@ import { parseArgs, promisify } from 'node:util'
 import { Api, ApiError } from './api.js'
 import { forgetSession, readLink, saveLink, saveSession, session } from './config.js'
 import { checkFiles, listFiles, pack, PackError } from './pack.js'
+import { agents, detect, homePath, onPath, setupAgents } from './setup.js'
 
 const run = promisify(execFile)
 const POLL_MS = 2000
@@ -15,6 +16,7 @@ const FOLLOW_LIMIT_MS = 30 * 60_000
 
 const help = `airlok — выкатка проекта на хостинг airlok из терминала
 
+  npx airlok-cli setup              один раз: вход и подключение ИИ-агентов (Claude Code, Codex, Antigravity, Cursor)
   npx airlok-cli login              войти через браузер
   npx airlok-cli deploy [папка]     собрать и выкатить папку (по умолчанию текущую)
   npx airlok-cli whoami             под кем выполнен вход
@@ -26,6 +28,10 @@ const help = `airlok — выкатка проекта на хостинг airlo
   --title <текст>   название выкатки (по умолчанию — последний коммит)
   --no-wait         не ждать конца сборки
   --json            итог одной строкой JSON — для скриптов и ИИ-агентов
+
+Для setup:
+  --agents <список> каких агентов настроить: claude,codex,antigravity,cursor (по умолчанию — найденных)
+  --yes             не спрашивать подтверждения
 
 Переменные окружения: AIRLOK_TOKEN — токен вместо входа (для CI), AIRLOK_URL — адрес дашборда.`
 
@@ -89,7 +95,7 @@ export async function main(argv, io = makeIO(), env = process.env) {
       args: argv,
       allowPositionals: true,
       options: {
-        app: { type: 'string' }, new: { type: 'string' }, title: { type: 'string' },
+        app: { type: 'string' }, new: { type: 'string' }, title: { type: 'string' }, agents: { type: 'string' }, yes: { type: 'boolean', short: 'y' },
         'no-wait': { type: 'boolean' }, json: { type: 'boolean' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       },
     })
@@ -125,6 +131,8 @@ export async function main(argv, io = makeIO(), env = process.env) {
       }
       case 'deploy':
         return await deploy(positionals[1] ?? '.', opts, io, env)
+      case 'setup':
+        return await setup(opts, io, env)
       default:
         io.err(`Нет такой команды: ${command}\n\n${help}`)
         return 2
@@ -179,6 +187,42 @@ function openBrowser(url) {
   } catch {
     // Браузер не открылся — ссылка уже напечатана.
   }
+}
+
+// setup — вход и подключение агентов: MCP-сервер airlok с токеном и навык airlok.
+async function setup(opts, io, env) {
+  let s = await session(env)
+  if (!s.token) {
+    await login(io, env)
+    s = await session(env)
+  }
+  const home = env.HOME || env.USERPROFILE || homedir()
+  const list = agents(home)
+  let chosen
+  if (opts.agents) {
+    const ids = opts.agents.split(',').map((x) => x.trim()).filter(Boolean)
+    const unknown = ids.filter((id) => !list.some((a) => a.id === id))
+    if (unknown.length) throw new UserError(`Не знаю таких агентов: ${unknown.join(', ')}. Есть: ${list.map((a) => a.id).join(', ')}.`)
+    chosen = []
+    for (const a of list.filter((a) => ids.includes(a.id))) chosen.push({ ...a, hasBin: await onPath(a.bin, env) })
+  } else {
+    chosen = await detect(list, env)
+    if (chosen.length === 0) {
+      throw new UserError(`Не нашёл ни одного агента. Укажите явно: --agents ${list.map((a) => a.id).join(',')}`)
+    }
+  }
+  io.err(`Подключу к airlok (${s.url}): ${chosen.map((a) => a.label).join(', ')}.`)
+  if (io.interactive && !opts.yes) {
+    const answer = (await io.ask('Продолжить? [Y/n] ')).toLowerCase()
+    if (answer && !['y', 'yes', 'д', 'да'].includes(answer)) return 0
+  }
+  const report = await setupAgents({ chosen, url: s.url, token: s.token, home })
+  for (const r of report) {
+    if (r.ok) io.err(`  ✓ ${r.agent.padEnd(12)} MCP: ${homePath(r.mcp, home)} · навык: ${r.skills.map((d) => homePath(d, home)).join(', ')}`)
+    else io.err(`  ✗ ${r.agent.padEnd(12)} ${r.error}`)
+  }
+  io.err('\nПерезапустите агентов, чтобы они увидели airlok. Проверка: спросите агента «какие у меня приложения на airlok?».')
+  return report.every((r) => r.ok) ? 0 : 1
 }
 
 async function deploy(target, opts, io, env) {

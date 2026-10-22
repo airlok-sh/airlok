@@ -1,0 +1,30 @@
+{
+  "name": "airlok-cli",
+  "version": "0.1.0",
+  "description": "Выкатка проекта на хостинг airlok из терминала: npx airlok-cli deploy",
+  "type": "module",
+  "bin": {
+    "airlok": "bin/airlok.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/airlok-sh/airlok.git",
+    "directory": "cli"
+  },
+  "homepage": "https://airlok.ru",
+  "keywords": [
+    "deploy",
+    "hosting",
+    "airlok"
+  ]
+}

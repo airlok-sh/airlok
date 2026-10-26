@@ -124,13 +124,18 @@ async function writeConfig(file, edit) {
   await writeFile(file, after, { mode: 0o600 })
 }
 
-// skillSource — SKILL.md навыка: в опубликованном пакете он лежит в cli/skills, в репозитории — в корне.
-export async function skillSource() {
-  for (const rel of ['../skills/airlok/SKILL.md', '../../skills/airlok/SKILL.md']) {
-    const p = fileURLToPath(new URL(rel, import.meta.url))
-    if (await exists(p)) return p
+// SKILLS — навыки для агентов: работа с airlok и подготовка airlok.yml проекта.
+export const SKILLS = ['airlok', 'airlok-yml']
+
+// skillSources — SKILL.md навыков по именам: в опубликованном пакете они лежат в cli/skills,
+// в репозитории — в корне.
+export async function skillSources() {
+  for (const rel of ['../skills/', '../../skills/']) {
+    const dir = fileURLToPath(new URL(rel, import.meta.url))
+    const paths = Object.fromEntries(SKILLS.map((name) => [name, join(dir, name, 'SKILL.md')]))
+    if ((await Promise.all(Object.values(paths).map(exists))).every(Boolean)) return paths
   }
-  throw new Error('В пакете нет навыка airlok (skills/airlok/SKILL.md)')
+  throw new Error(`В пакете нет навыков ${SKILLS.join(', ')} (skills/<имя>/SKILL.md)`)
 }
 
 // detect — какие агенты стоят: по папке в домашнем каталоге или программе в PATH.
@@ -146,8 +151,8 @@ export async function detect(list, env = process.env) {
 const execAsync = promisify(execFile)
 
 // setupAgents настраивает выбранных агентов и возвращает по строке отчёта на каждого.
-export async function setupAgents({ chosen, url, token, run, skill }) {
-  const source = skill ?? (await skillSource())
+export async function setupAgents({ chosen, url, token, run, skills }) {
+  const sources = skills ?? (await skillSources())
   const exec = run ?? ((cmd, args) => execAsync(cmd, args, { shell: process.platform === 'win32' }))
   const done = new Set()
   const report = []
@@ -158,13 +163,14 @@ export async function setupAgents({ chosen, url, token, run, skill }) {
       for (const dir of a.skills) {
         // Каталог CLI Antigravity — только если он уже есть: CLI может быть не установлен.
         if (dir.includes('antigravity-cli') && !(await exists(dirname(dir)))) continue
-        const target = join(dir, 'airlok', 'SKILL.md')
-        if (!done.has(target)) {
+        for (const [name, source] of Object.entries(sources)) {
+          const target = join(dir, name, 'SKILL.md')
+          if (done.has(target)) continue
           await mkdir(dirname(target), { recursive: true })
           await copyFile(source, target)
           done.add(target)
         }
-        skills.push(dirname(target))
+        skills.push(dir)
       }
       report.push({ agent: a.label, ok: true, mcp: where, skills })
     } catch (err) {

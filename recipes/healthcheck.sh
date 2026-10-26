@@ -110,7 +110,7 @@ check_app() {
 HEARTBEAT_PY='
 import json, os, sys
 
-version, password, letsencrypt = sys.argv[1:4]
+version, password, letsencrypt, env_key = sys.argv[1:5]
 mem = {}
 with open("/proc/meminfo") as f:
     for line in f:
@@ -139,19 +139,21 @@ print(json.dumps({
     "disk_used_mb": (disk.f_blocks - disk.f_bfree) * disk.f_frsize >> 20,
     "ssh_password_login": {"true": True, "false": False}.get(password),
     "letsencrypt": letsencrypt == "true",
+    "env_key": env_key,
 }))
 '
 
 # Отметка «сервер на связи» с его состоянием: о сайтах healthcheck сообщает только при
 # изменениях, и без неё молчащий исправный сервер выглядел бы в дашборде пропавшим.
 heartbeat() {
-	local conf password=null le=false body code
+	local conf password=null le=false key="" body code
 	if conf=$(sshd -T 2>/dev/null); then
 		password=false
 		grep -qxE '(passwordauthentication|kbdinteractiveauthentication) yes' <<<"$conf" && password=true
 	fi
 	[[ $(conf_value "$SERVER_CONF" LETSENCRYPT) == 1 ]] && le=true
-	body=$(python3 -c "$HEARTBEAT_PY" "$(agent_version)" "$password" "$le") || return
+	ensure_env_key && key=$(env_key_public)
+	body=$(python3 -c "$HEARTBEAT_PY" "$(agent_version)" "$password" "$le" "$key") || return
 	code=$(dashboard_call POST /agent/v1/heartbeat "$body") || code=000
 	# Дашборд старой версии heartbeat не знает — отмечаемся, как раньше.
 	[[ $code == 404 ]] && dashboard_call GET /agent/v1/ping >/dev/null

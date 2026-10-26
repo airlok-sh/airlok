@@ -37,6 +37,8 @@ DASHBOARD_CONF=/etc/airlok/dashboard.env
 AGENT_RESTART_FLAG=/run/airlok-agent/restart
 # Настройки сервера, выбранные при установке: Let's Encrypt и т. п.
 SERVER_CONF=/etc/airlok/server.env
+# Закрытый ключ для переменных окружения из дашборда (envkey.py): сервер он не покидает.
+ENV_KEY=/etc/airlok/env.key
 
 # conf_value ФАЙЛ КЛЮЧ — значение из файла вида KEY=value. Файл читается, а не
 # подключается через source: так его содержимое не может выполниться как код.
@@ -52,6 +54,30 @@ conf_set() {
 		[[ -r $file ]] && { grep -v "^${key}=" "$file" || true; }
 		printf '%s=%s\n' "$key" "$value"
 	} | write_if_changed "$file" 0644 || true
+}
+
+# ensure_env_key — создать ключ для переменных из дашборда, если его ещё нет. Агент и
+# healthcheck могут начать одновременно: ln не заменяет уже созданный файл.
+ensure_env_key() {
+	[[ -s $ENV_KEY ]] && return 0
+	local tmp
+	install -d -m 755 "$(dirname "$ENV_KEY")"
+	tmp=$(mktemp "${ENV_KEY}.XXXXXX") || return 1
+	if openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$tmp" 2>/dev/null; then
+		chmod 600 "$tmp"
+		ln "$tmp" "$ENV_KEY" 2>/dev/null || true
+	fi
+	rm -f "$tmp"
+	[[ -s $ENV_KEY ]]
+}
+
+# env_key_public — открытый ключ (DER в base64) для дашборда; env_key_id — его отпечаток
+# в том же виде, что показывает дашборд: по нему человек сверяет, что шифрует под этот сервер.
+env_key_public() { openssl pkey -in "$ENV_KEY" -pubout -outform DER 2>/dev/null | base64 -w0; }
+env_key_id() {
+	local sum
+	sum=$(openssl pkey -in "$ENV_KEY" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 -binary | base64 -w0) || return 1
+	echo "SHA256:${sum%%=*}"
 }
 
 # Версия рецептов для дашборда: дата и хеш коммита /opt/airlok, без git — dev.

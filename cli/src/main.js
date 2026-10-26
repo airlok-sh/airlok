@@ -7,8 +7,9 @@ import { parseArgs, promisify } from 'node:util'
 
 import { Api, ApiError } from './api.js'
 import { forgetSession, readLink, saveLink, saveSession, session } from './config.js'
+import { EnvError, envCommand } from './env.js'
 import { checkFiles, listFiles, pack, PackError } from './pack.js'
-import { agents, detect, homePath, onPath, setupAgents } from './setup.js'
+import { agents, detect, homePath, onPath, setupAgents, SKILLS } from './setup.js'
 
 const run = promisify(execFile)
 const POLL_MS = 2000
@@ -19,6 +20,10 @@ const help = `airlok — выкатка проекта на хостинг airlo
   npx @airlok/cli setup             один раз: вход и подключение ИИ-агентов (Claude Code, Codex, Antigravity, Cursor)
   npx @airlok/cli login             войти через браузер
   npx @airlok/cli deploy [папка]    собрать и выкатить папку (по умолчанию текущую)
+  npx @airlok/cli env list --app <имя>          переменные окружения приложения (без значений)
+  npx @airlok/cli env set ИМЯ… --app <имя>      задать: значение спросит без показа на экране или прочитает из stdin
+  npx @airlok/cli env set --app <имя> --from .env   задать все переменные из файла
+  npx @airlok/cli env rm ИМЯ --app <имя>        удалить
   npx @airlok/cli whoami            под кем выполнен вход
   npx @airlok/cli logout            забыть вход на этом компьютере
 
@@ -28,6 +33,11 @@ const help = `airlok — выкатка проекта на хостинг airlo
   --title <текст>   название выкатки (по умолчанию — последний коммит)
   --no-wait         не ждать конца сборки
   --json            итог одной строкой JSON — для скриптов и ИИ-агентов
+
+Для env:
+  --app <имя>       приложение; если имя есть на нескольких серверах — <сервер>/<имя>
+  --from <файл>     взять значения из .env-файла (с именами — только эти)
+  У приложения на своём сервере значения шифруются здесь, под ключ агента сервера: дашборд их не видит.
 
 Для setup:
   --agents <список> каких агентов настроить: claude,codex,antigravity,cursor (по умолчанию — найденных)
@@ -75,8 +85,41 @@ const APP_NAME = /^[a-z][a-z0-9-]{1,27}$/
 function makeIO(stdin = process.stdin, stdout = process.stdout, stderr = process.stderr) {
   return {
     interactive: Boolean(stdin.isTTY && stderr.isTTY),
+    stdinIsTTY: Boolean(stdin.isTTY),
     out: (s) => stdout.write(s + '\n'),
     err: (s) => stderr.write(s + '\n'),
+    async readStdin() {
+      const chunks = []
+      for await (const c of stdin) chunks.push(c)
+      return Buffer.concat(chunks).toString('utf8')
+    },
+    // askSecret — значение без эха: секрет не должен остаться на экране или в записи терминала.
+    askSecret(question) {
+      return new Promise((done, fail) => {
+        stderr.write(question)
+        let value = ''
+        const finish = (err) => {
+          stdin.off('data', onData)
+          stdin.setRawMode(false)
+          stdin.pause()
+          stderr.write('\n')
+          if (err) fail(err)
+          else done(value)
+        }
+        const onData = (chunk) => {
+          for (const ch of chunk) {
+            if (ch === '\r' || ch === '\n') return finish()
+            if (ch === '\u0003') return finish(new UserError('Отменено.'))
+            if (ch === '\u007f' || ch === '\b') value = Array.from(value).slice(0, -1).join('')
+            else if (ch >= ' ') value += ch
+          }
+        }
+        stdin.setRawMode(true)
+        stdin.setEncoding('utf8')
+        stdin.on('data', onData)
+        stdin.resume()
+      })
+    },
     async ask(question) {
       const rl = createInterface({ input: stdin, output: stderr })
       try {
@@ -96,6 +139,7 @@ export async function main(argv, io = makeIO(), env = process.env) {
       allowPositionals: true,
       options: {
         app: { type: 'string' }, new: { type: 'string' }, title: { type: 'string' }, agents: { type: 'string' }, yes: { type: 'boolean', short: 'y' },
+        from: { type: 'string' },
         'no-wait': { type: 'boolean' }, json: { type: 'boolean' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       },
     })
@@ -133,6 +177,11 @@ export async function main(argv, io = makeIO(), env = process.env) {
         return await deploy(positionals[1] ?? '.', opts, io, env)
       case 'setup':
         return await setup(opts, io, env)
+      case 'env': {
+        const s = await session(env)
+        if (!s.token) throw new UserError('Вы не вошли: npx @airlok/cli login (или задайте AIRLOK_TOKEN)')
+        return await envCommand(new Api(s.url, s.token), positionals[1], positionals.slice(2), opts, io)
+      }
       default:
         io.err(`Нет такой команды: ${command}\n\n${help}`)
         return 2
@@ -147,7 +196,7 @@ export async function main(argv, io = makeIO(), env = process.env) {
 class UserError extends Error {}
 
 function errorText(err) {
-  if (err instanceof UserError || err instanceof PackError) return err.message
+  if (err instanceof UserError || err instanceof PackError || err instanceof EnvError) return err.message
   if (err instanceof ApiError) {
     if (err.status === 401) return 'Вход устарел или токен отозван: npx @airlok/cli login'
     if (err.code === 'read_only_token') return 'Этот токен только читает. Войдите заново (npx @airlok/cli login) или задайте токен с правом выкатывать.'
@@ -218,7 +267,7 @@ async function setup(opts, io, env) {
   }
   const report = await setupAgents({ chosen, url: s.url, token: s.token, home })
   for (const r of report) {
-    if (r.ok) io.err(`  ✓ ${r.agent.padEnd(12)} MCP: ${homePath(r.mcp, home)} · навык: ${r.skills.map((d) => homePath(d, home)).join(', ')}`)
+    if (r.ok) io.err(`  ✓ ${r.agent.padEnd(12)} MCP: ${homePath(r.mcp, home)} · навыки ${SKILLS.join(', ')}: ${r.skills.map((d) => homePath(d, home)).join(', ')}`)
     else io.err(`  ✗ ${r.agent.padEnd(12)} ${r.error}`)
   }
   io.err('\nПерезапустите агентов, чтобы они увидели airlok. Проверка: спросите агента «какие у меня приложения на airlok?».')

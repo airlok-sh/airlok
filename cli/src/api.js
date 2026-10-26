@@ -49,8 +49,37 @@ export class Api {
 
   // apps — приложения на хостинге: архивом выкатывают только туда.
   async apps() {
-    const { data } = await this.request('GET', '/api/cli/v1/apps')
-    return data.apps.filter((a) => a.hosted)
+    return (await this.allApps()).filter((a) => a.hosted)
+  }
+
+  allApps() {
+    return this.request('GET', '/api/cli/v1/apps').then((r) => r.data.apps)
+  }
+
+  // Переменные приложения на хостинге: значения шифрует дашборд.
+  env(appId) {
+    return this.request('GET', `/api/cli/v1/apps/${encodeURIComponent(appId)}/env`).then((r) => r.data.vars)
+  }
+
+  putEnv(appId, vars) {
+    return this.request('PUT', `/api/cli/v1/apps/${encodeURIComponent(appId)}/env`, { vars })
+  }
+
+  deleteEnv(appId, name) {
+    return this.request('DELETE', `/api/cli/v1/apps/${encodeURIComponent(appId)}/env/${encodeURIComponent(name)}`)
+  }
+
+  // Переменные приложения на своём сервере: ключ агента и шифротексты, которые сделал CLI.
+  serverEnv(appId) {
+    return this.request('GET', `/api/cli/v1/apps/${encodeURIComponent(appId)}/server-env`).then((r) => r.data)
+  }
+
+  putServerEnv(appId, keyId, vars) {
+    return this.request('PUT', `/api/cli/v1/apps/${encodeURIComponent(appId)}/server-env`, { key_id: keyId, vars })
+  }
+
+  deleteServerEnv(appId, name) {
+    return this.request('DELETE', `/api/cli/v1/apps/${encodeURIComponent(appId)}/server-env/${encodeURIComponent(name)}`)
   }
 
   createApp(name) {

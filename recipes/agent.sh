@@ -17,13 +17,17 @@ STATE_DIR=/var/lib/airlok/agent
 DEPLOY_TIMEOUT=3600
 UPDATE_TIMEOUT=1800
 PROGRESS_EVERY=3
+# Шифротексты из команды и расшифрованные значения — только на tmpfs и только на время выкатки.
+ENV_JSON=$RUN_DIR/env.json
+PANEL_ENV=$RUN_DIR/panel.env
 
 SELF=$(readlink -f "$0")
 SELF_INODE=$(stat -c %i "$SELF" 2>/dev/null)
 
 # Разбор команды. Поля выводятся через NUL в фиксированном порядке и в shell не
 # исполняются; первое поле — ok или bad, второе — id команды (если его удалось понять),
-# третье у ok — вид команды.
+# третье у ok — вид команды. Зашифрованные переменные из дашборда пишутся в файл из
+# аргумента, последнее поле выкатки — 1, если они пришли.
 PARSE_PY='
 import json, re, sys
 
@@ -37,6 +41,8 @@ REF = re.compile(r"^[A-Za-z0-9._/][A-Za-z0-9._/-]*$")
 SEGMENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
 # Токены установки GitHub App бывают и короткими ghs_…, и длинными, с точками (около 400 символов).
 TOKEN = re.compile(r"^[A-Za-z0-9_.-]{1,2048}$")
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+SEALED = re.compile(r"^v1:[A-Za-z0-9+/=]{1,65536}$")
 
 
 def emit(*fields):
@@ -87,7 +93,16 @@ if root and not all(SEGMENT.match(s) for s in root.split("/")):
     emit("bad", cid, "некорректный каталог в репозитории")
 if token and not TOKEN.match(token):
     emit("bad", cid, "некорректный токен GitHub")
-emit("ok", cid, "deploy", app, repo, sha, ref, root, " ".join(title.split())[:200], token)
+# Нет поля — у дашборда нет ключа сервера или он старый: файл переменных не трогаем.
+env = d.get("env")
+if env is not None:
+    if not isinstance(env, list) or len(env) > 100 or not all(
+            isinstance(v, dict) and isinstance(v.get("name"), str) and ENV_NAME.match(v["name"])
+            and isinstance(v.get("value"), str) and SEALED.match(v["value"]) for v in env):
+        emit("bad", cid, "некорректные переменные окружения в команде")
+    with open(sys.argv[1], "w", encoding="utf-8") as f:
+        json.dump([{"name": v["name"], "value": v["value"]} for v in env], f)
+emit("ok", cid, "deploy", app, repo, sha, ref, root, " ".join(title.split())[:200], token, "0" if env is None else "1")
 '
 
 # Тело запроса к дашборду в JSON: режим progress — хвост лога и этапы идущей выкатки,
@@ -208,11 +223,32 @@ stream_progress() {
 	done
 }
 
+# open_env APP — расшифровать переменные из дашборда в файл на tmpfs. Ключ сервера только
+# у агента: дашборд прислал шифротексты, открытых значений у него нет.
+open_env() {
+	local app=$1 err=$RUN_DIR/env.err
+	install -m 600 /dev/null "$PANEL_ENV"
+	if ! ensure_env_key; then
+		echo "не удалось создать ключ сервера ${ENV_KEY}" >"$err"
+		return 1
+	fi
+	python3 "$RECIPES_DIR/envkey.py" panel "$ENV_KEY" "$app" <"$ENV_JSON" >"$PANEL_ENV" 2>"$err"
+}
+
 run_deploy() {
-	local id=$1 app=$2 repo=$3 sha=$4 ref=$5 root=$6 title=$7 token=$8
-	local log=$STATE_DIR/command.log stages=$STATE_DIR/command.stages public=0 rc message="" streamer
+	local id=$1 app=$2 repo=$3 sha=$4 ref=$5 root=$6 title=$7 token=$8 has_env=$9
+	local log=$STATE_DIR/command.log stages=$STATE_DIR/command.stages public=0 rc message="" streamer panel=""
 	[[ -z $token ]] && public=1
 	echo "команда ${id}: выкатка ${repo}${root:+/${root}} ${sha:0:12} «${title}» как ${app}"
+	if [[ $has_env == 1 ]]; then
+		if ! open_env "$app"; then
+			send_result "$id" failed "переменные окружения из дашборда: $(head -c 1000 "$RUN_DIR/env.err")"
+			rm -f "$ENV_JSON" "$PANEL_ENV" "$RUN_DIR/env.err"
+			return
+		fi
+		panel=$PANEL_ENV
+	fi
+	rm -f "$ENV_JSON" "$RUN_DIR/env.err"
 	install -m 600 /dev/null "$log"
 	install -m 600 /dev/null "$stages"
 	stream_progress "$id" "$log" "$stages" &
@@ -220,12 +256,13 @@ run_deploy() {
 	# Токен — только в окружении дочернего процесса: в аргументах его было бы видно в ps.
 	AIRLOK_GITHUB_TOKEN=$token AIRLOK_GITHUB_PUBLIC=$public AIRLOK_FETCH_REF=$ref \
 		AIRLOK_ROOT_DIR=$root AIRLOK_APP_NAME=$app AIRLOK_STAGE_FILE=$stages AIRLOK_BUILD_OUTPUT=1 \
+		AIRLOK_PANEL_ENV=$panel \
 		timeout --kill-after=60 "$DEPLOY_TIMEOUT" "$RECIPES_DIR/github-deploy.sh" deploy "$repo" "$sha" \
 		</dev/null >"$log" 2>&1
 	rc=$?
 	kill "$streamer" 2>/dev/null
 	wait "$streamer" 2>/dev/null
-	rm -f "$RUN_DIR/progress.json"
+	rm -f "$RUN_DIR/progress.json" "$PANEL_ENV"
 	if ((rc == 124 || rc == 137)); then
 		message="выкатка не уложилась в $((DEPLOY_TIMEOUT / 60)) минут и была остановлена"
 	fi
@@ -266,7 +303,8 @@ run_update() {
 
 handle() {
 	local f=()
-	mapfile -d '' -t f < <(python3 -c "$PARSE_PY" <"$1")
+	rm -f "$ENV_JSON"
+	mapfile -d '' -t f < <(python3 -c "$PARSE_PY" "$ENV_JSON" <"$1")
 	rm -f "$1"
 	if [[ ${f[0]:-} != ok ]]; then
 		echo "команда ${f[1]:-без id} отклонена: ${f[2]:-ответ дашборда не разобрать}"
@@ -284,6 +322,11 @@ main() {
 	install -d -m 700 "$RUN_DIR" "$STATE_DIR"
 	local backoff=5 code started resp=$RUN_DIR/next.json
 	echo "агент запущен, версия $(agent_version)"
+	if ensure_env_key; then
+		echo "ключ переменных окружения: $(env_key_id) — тот же отпечаток показывает дашборд"
+	else
+		echo "не удалось создать ключ ${ENV_KEY}: переменные из дашборда не расшифровать"
+	fi
 	while :; do
 		# git pull заменяет файл новым: между командами перезапускаемся на свежем коде.
 		if [[ $(stat -c %i "$SELF" 2>/dev/null) != "$SELF_INODE" ]]; then

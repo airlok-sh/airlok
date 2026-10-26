@@ -19,8 +19,8 @@ PAYLOAD_PY = re.search(r"PAYLOAD_PY='\n(.*?)\n'\n", SOURCE, re.S).group(1)
 CID = "0192e000-0000-7000-8000-000000000001"
 
 
-def parse(cmd):
-    out = subprocess.run([sys.executable, "-c", PARSE_PY], input=json.dumps(cmd).encode(), capture_output=True, check=True)
+def parse(cmd, env_path=os.devnull):
+    out = subprocess.run([sys.executable, "-c", PARSE_PY, env_path], input=json.dumps(cmd).encode(), capture_output=True, check=True)
     return out.stdout.decode().split("\0")[:-1]
 
 
@@ -34,7 +34,22 @@ class ParseTest(unittest.TestCase):
         sha = "a" * 40
         got = parse({"id": CID, "kind": "deploy", "deploy": {"app": "shop", "repo": "acme/shop", "sha": sha, "ref": "main",
                                                              "root_dir": "web", "title": "Новая  корзина\n", "github_token": ""}})
-        self.assertEqual(got, ["ok", CID, "deploy", "shop", "acme/shop", sha, "main", "web", "Новая корзина", ""])
+        self.assertEqual(got, ["ok", CID, "deploy", "shop", "acme/shop", sha, "main", "web", "Новая корзина", "", "0"],
+                         "без env в команде агент не трогает файл переменных")
+
+    def test_deploy_env(self):
+        deploy = {"app": "shop", "repo": "acme/shop", "sha": "a" * 40}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "env.json")
+            env = [{"name": "API_KEY", "value": "v1:QUJD", "extra": "x"}]
+            self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "env": env}}, path)[-1], "1")
+            with open(path) as f:
+                self.assertEqual(json.load(f), [{"name": "API_KEY", "value": "v1:QUJD"}])
+            self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "env": []}}, path)[-1], "1",
+                             "пустой список — в дашборде переменных не осталось, файл очистится")
+            for env in ("x", [{"name": "A B", "value": "v1:QUJD"}], [{"name": "A", "value": "plain"}],
+                        [{"name": "A", "value": "v1:QUJD\nB=1"}], [{"name": "A"}]):
+                self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "env": env}}, path)[0], "bad", env)
 
     def test_rejects(self):
         for cmd in ({"id": CID, "kind": "reboot"},

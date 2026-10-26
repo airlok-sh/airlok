@@ -89,7 +89,7 @@ allocate_port() {
 
 secrets() {
 	step "Секреты"
-	local db_env=$APP_DIR/shared/db.env user_env=$APP_DIR/shared/user.env pw=""
+	local db_env=$APP_DIR/shared/db.env user_env=$APP_DIR/shared/user.env panel_env=$APP_DIR/shared/panel.env pw=""
 	if ((DB_ENABLED)); then
 		if [[ ! -s $db_env ]]; then
 			printf 'POSTGRES_USER=app\nPOSTGRES_DB=app\nPOSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 24)" |
@@ -113,16 +113,22 @@ secrets() {
 		fi
 	} | write_if_changed "$APP_DIR/shared/app.env" 0600 || true
 	[[ -f $user_env ]] || install -m 600 /dev/null "$user_env"
+	# Переменные из дашборда агент расшифровал перед выкаткой; файл заменяется целиком, так
+	# что удалённая в дашборде переменная пропадёт. Выкатка без агента его не трогает.
+	if [[ -n ${AIRLOK_PANEL_ENV:-} ]]; then
+		write_if_changed "$panel_env" 0600 <"$AIRLOK_PANEL_ENV" || true
+	fi
+	[[ -f $panel_env ]] || install -m 600 /dev/null "$panel_env"
 	ok "секреты в ${APP_DIR}/shared, права 600, в репозиторий не попадают"
 
 	# Обязательные — из airlok.yml и .env.example проекта. Без них приложение упало бы при
 	# запуске, а узнать об этом лучше до сборки, чем через несколько минут.
 	local name missing=()
 	for name in $ENV_NAMES; do
-		grep -q "^${name}=." "$user_env" || missing+=("$name")
+		grep -qE "^${name}=['\"]?[^'\"]" "$panel_env" "$user_env" || missing+=("$name")
 	done
 	if ((${#missing[@]})); then
-		die "не заданы обязательные переменные: ${missing[*]}. Впишите их в ${user_env} в виде ИМЯ=значение и выкатите снова — что в них, описано в airlok.yml или .env.example проекта"
+		die "не заданы обязательные переменные: ${missing[*]}. Задайте их на странице приложения в дашборде airlok или впишите в ${user_env} в виде ИМЯ=значение и выкатите снова — что в них, описано в airlok.yml или .env.example проекта"
 	fi
 }
 
@@ -281,6 +287,8 @@ EOF
     env_file:
       - path: shared/app.env
       - path: shared/user.env
+        required: false
+      - path: shared/panel.env
         required: false
     volumes:
       - ${RELEASE}:/app:ro

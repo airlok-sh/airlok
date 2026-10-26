@@ -50,19 +50,22 @@ test('upsertTomlServer replaces only the airlok section', () => {
 
 async function fakeHome() {
   const home = await mkdtemp(join(tmpdir(), 'airlok-home-'))
-  const skill = join(home, 'SKILL.md')
-  await writeFile(skill, '---\nname: airlok\ndescription: test\n---\n')
-  return { home, skill }
+  const skills = {}
+  for (const name of ['airlok', 'airlok-yml']) {
+    skills[name] = join(home, `${name}.md`)
+    await writeFile(skills[name], `---\nname: ${name}\ndescription: test\n---\n`)
+  }
+  return { home, skills }
 }
 
 test('setupAgents configures every agent and copies the skill', async () => {
-  const { home, skill } = await fakeHome()
+  const { home, skills } = await fakeHome()
   await mkdir(join(home, '.cursor'), { recursive: true })
   await writeFile(join(home, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { other: { url: 'o' } } }))
   const calls = []
   const run = async (cmd, args) => calls.push([cmd, ...args])
   const chosen = agents(home).map((a) => ({ ...a, hasBin: a.id === 'claude' }))
-  const report = await setupAgents({ chosen, url: URL_, token: TOKEN, run, skill })
+  const report = await setupAgents({ chosen, url: URL_, token: TOKEN, run, skills })
   assert.ok(report.every((r) => r.ok), JSON.stringify(report))
 
   const add = calls.find((c) => c[2] === 'add-json')
@@ -82,21 +85,22 @@ test('setupAgents configures every agent and copies the skill', async () => {
   assert.match(await readFile(join(home, '.cursor', 'mcp.json.airlok-backup'), 'utf8'), /"other"/, 'прежний файл сохранён')
 
   for (const dir of ['.claude/skills', '.agents/skills', '.gemini/config/skills']) {
-    assert.match(await readFile(join(home, dir, 'airlok', 'SKILL.md'), 'utf8'), /name: airlok/, dir)
+    assert.match(await readFile(join(home, dir, 'airlok', 'SKILL.md'), 'utf8'), /name: airlok\n/, dir)
+    assert.match(await readFile(join(home, dir, 'airlok-yml', 'SKILL.md'), 'utf8'), /name: airlok-yml/, dir)
   }
   await assert.rejects(stat(join(home, '.gemini', 'antigravity-cli')), 'CLI Antigravity не установлен — его каталог не заводим')
 
-  const again = await setupAgents({ chosen, url: URL_, token: TOKEN, run, skill })
+  const again = await setupAgents({ chosen, url: URL_, token: TOKEN, run, skills })
   assert.ok(again.every((r) => r.ok))
   assert.equal((await readFile(join(home, '.codex', 'config.toml'), 'utf8')).match(/\[mcp_servers\.airlok\]/g).length, 1)
 })
 
 test('setupAgents reports a broken config instead of overwriting it', async () => {
-  const { home, skill } = await fakeHome()
+  const { home, skills } = await fakeHome()
   await mkdir(join(home, '.cursor'), { recursive: true })
   await writeFile(join(home, '.cursor', 'mcp.json'), '{ oops')
   const cursor = agents(home).filter((a) => a.id === 'cursor').map((a) => ({ ...a, hasBin: false }))
-  const [r] = await setupAgents({ chosen: cursor, url: URL_, token: TOKEN, run: async () => {}, skill })
+  const [r] = await setupAgents({ chosen: cursor, url: URL_, token: TOKEN, run: async () => {}, skills })
   assert.equal(r.ok, false)
   assert.match(r.error, /не JSON/)
   assert.equal(await readFile(join(home, '.cursor', 'mcp.json'), 'utf8'), '{ oops')
@@ -111,6 +115,7 @@ test('airlok setup with a token from the environment', async () => {
   assert.match(io.errLines.join('\n'), /✓ Codex/)
   assert.match(await readFile(join(home, '.codex', 'config.toml'), 'utf8'), /Bearer airlok_pat_test/)
   assert.match(await readFile(join(home, '.agents', 'skills', 'airlok', 'SKILL.md'), 'utf8'), /name: airlok/, 'настоящий навык из репозитория')
+  assert.match(await readFile(join(home, '.agents', 'skills', 'airlok-yml', 'SKILL.md'), 'utf8'), /name: airlok-yml/)
 
   const none = { ...io, errLines: [] }
   none.err = (s) => none.errLines.push(s)

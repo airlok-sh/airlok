@@ -115,12 +115,14 @@ secrets() {
 	[[ -f $user_env ]] || install -m 600 /dev/null "$user_env"
 	ok "секреты в ${APP_DIR}/shared, права 600, в репозиторий не попадают"
 
+	# Обязательные — из airlok.yml и .env.example проекта. Без них приложение упало бы при
+	# запуске, а узнать об этом лучше до сборки, чем через несколько минут.
 	local name missing=()
 	for name in $ENV_NAMES; do
-		grep -q "^${name}=" "$user_env" || missing+=("$name")
+		grep -q "^${name}=." "$user_env" || missing+=("$name")
 	done
 	if ((${#missing[@]})); then
-		note "не заданы переменные: ${missing[*]} — впишите их в ${user_env} и запустите деплой снова"
+		die "не заданы обязательные переменные: ${missing[*]}. Впишите их в ${user_env} в виде ИМЯ=значение и выкатите снова — что в них, описано в airlok.yml или .env.example проекта"
 	fi
 }
 

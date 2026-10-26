@@ -22,6 +22,15 @@ DOMAIN = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]
 EXT = re.compile(r"^[a-z0-9]{1,8}$")
 ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 RESERVED_ENV = {"DATABASE_URL", "UPLOAD_DIR", "UPLOAD_MAX_BYTES", "PORT", "HOSTNAME", "NODE_ENV", "HOME"}
+# Переменные, которые проект описывает сам. Правила те же, что у сборщика хостинга airlok
+# (internal/builder/env.go): дашборд и рецепт должны спрашивать одно и то же.
+EXAMPLE_FILES = (".env.example", ".env.sample", ".env.template")
+EXAMPLE_LINE = re.compile(r"^(#\s*)?(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+# Значение-заглушка: его всё равно нужно заменить своим.
+PLACEHOLDER = re.compile(r"^(<.*>|your[-_ ].*|change[-_ ]?me|replace[-_ ]?me|x{3,}|\.\.\.|todo)$", re.I)
+# Комментарий говорит, что без значения можно обойтись.
+OPTIONAL_HINT = re.compile(r"необязательн|по умолчанию|можно не |optional|default", re.I)
+EXAMPLE_RESERVED = {"PORT", "HOST", "HOSTNAME", "HOME", "NODE_ENV"}
 # Каталог готового сайта: путь внутри проекта без выходов наверх и скрытых каталогов
 # (кроме .vitepress/dist — так его кладёт VitePress).
 OUTPUT = re.compile(r"^(\.|(\.vitepress/)?[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*)$")
@@ -66,6 +75,87 @@ def choice(data, key, allowed, label):
     if not isinstance(value, str) or value not in allowed:
         raise ManifestError(f"{label}: одно из значений {', '.join(allowed)}")
     return value
+
+
+def env_spec(value):
+    """env из airlok.yml: список имён (все обязательные) или словарь «ИМЯ: описание» /
+    «ИМЯ: {required, secret, description, default}»; без default переменная обязательна."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        if not all(isinstance(n, str) for n in value):
+            raise ManifestError("env: список имён переменных вида OPENAI_API_KEY")
+        return [{"name": n, "required": True} for n in value]
+    if not isinstance(value, dict):
+        raise ManifestError("env: список имён переменных или словарь «ИМЯ: описание»")
+    out = []
+    for name, spec in value.items():
+        if spec is None or isinstance(spec, str):
+            out.append({"name": name, "required": True})
+            continue
+        if not isinstance(spec, dict) or set(spec) - {"required", "secret", "description", "default"}:
+            raise ManifestError(f"env.{name}: описание строкой или поля required, secret, description, default")
+        default = spec.get("default", "")
+        required = spec.get("required", default in ("", None))
+        if not isinstance(required, bool):
+            raise ManifestError(f"env.{name}.required должен быть true или false")
+        out.append({"name": name, "required": required})
+    return out
+
+
+def example_value(raw):
+    """Значение из .env.example без кавычек и без комментария в конце строки."""
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] in "\"'":
+        end = raw.find(raw[0], 1)
+        if end > 0:
+            return raw[1:end]
+    if " #" in raw:
+        raw = raw[:raw.index(" #")]
+    return raw.strip()
+
+
+def parse_env_example(text):
+    """Пустое значение или заглушка — переменная обязательна, заполненное или закомментированная
+    строка — необязательна. «По умолчанию» или «необязательно» в комментарии над строкой тоже
+    делают её необязательной."""
+    out, notes = [], []
+    for line in text.splitlines():
+        line = line.strip()
+        m = EXAMPLE_LINE.match(line)
+        if not line:
+            notes = []
+            continue
+        if m is None:
+            notes = notes + [line.lstrip("#").strip()] if line.startswith("#") else []
+            continue
+        commented, name, value = m.group(1), m.group(2), example_value(m.group(3))
+        desc, notes = " ".join(notes), []
+        if name in EXAMPLE_RESERVED or any(v["name"] == name for v in out):
+            continue
+        required = not commented and (value == "" or PLACEHOLDER.match(value) is not None) and not OPTIONAL_HINT.search(desc)
+        out.append({"name": name, "required": required})
+    return out
+
+
+def merge_env(*sources):
+    """Первый источник важнее: airlok.yml, потом .env.example."""
+    out = []
+    for src in sources:
+        for v in src:
+            if not any(o["name"] == v["name"] for o in out):
+                out.append(v)
+    return out
+
+
+def read_example(root):
+    for name in EXAMPLE_FILES:
+        try:
+            with open(os.path.join(root, name), encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except OSError:
+            continue
+    return ""
 
 
 def parse(data, root):
@@ -122,12 +212,17 @@ def parse(data, root):
     if caps.get("cron"):
         raise ManifestError("cron пока не поддерживается, уберите задачи или оставьте cron: []")
 
-    env = data.get("env", [])
-    if not isinstance(env, list) or not all(isinstance(e, str) and ENV_NAME.match(e) for e in env):
-        raise ManifestError("env: список имён переменных вида OPENAI_API_KEY")
-    clash = RESERVED_ENV.intersection(env)
+    declared = env_spec(data.get("env"))
+    names = [v["name"] for v in declared]
+    if len(names) > 100 or not all(isinstance(n, str) and ENV_NAME.match(n) for n in names):
+        raise ManifestError("env: до 100 имён переменных вида OPENAI_API_KEY")
+    clash = RESERVED_ENV.intersection(names)
     if clash:
         raise ManifestError(f"env: {', '.join(sorted(clash))} задаёт сам рецепт, уберите из списка")
+    # Что задаёт рецепт, спрашивать незачем; DATABASE_URL — только когда базу заводит он сам.
+    provided = RESERVED_ENV - ({"DATABASE_URL"} if not flag(db, "enabled") else set())
+    env = [v["name"] for v in merge_env(declared, parse_env_example(read_example(root)))
+           if v["required"] and v["name"] not in provided]
 
     resources = section(data, "resources")
     return {

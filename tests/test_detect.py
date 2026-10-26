@@ -138,6 +138,32 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual((values["APP_DOMAIN"], values["RUN_CMD"], values["NODE_VERSION"]),
                          ("shop.example.ru", "node dist/server.js", "20"))
 
+    def test_env_from_example(self):
+        # Как .env.example у PonchesDev/favicon-uploader; правила те же, что у сборщика хостинга.
+        example = ("LISTEN_ADDR=:8080\nPORT=8080\n\nS3_BUCKET=\nS3_ACCESS_KEY=\nS3_SECRET_KEY=your-secret-key\n\n"
+                   "# По умолчанию https://storage.yandexcloud.net/<S3_BUCKET>.\nPUBLIC_BASE_URL=\n# CACHE_CONTROL=\n"
+                   "export MAX_FILE_SIZE_MB=\"10\" # мегабайты\n\n# Токен, минимум 16 символов\nUPLOAD_TOKEN=\n")
+        files = {"go.mod": "module x\n", "main.go": "package main\n", ".env.example": example}
+        values = parse(None, project(files))
+        self.assertEqual(values["ENV_NAMES"], "S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY UPLOAD_TOKEN",
+                         "пустое значение и заглушка обязательны, «по умолчанию», значение и комментарий — нет")
+        values = parse({"version": 1, "env": {"UPLOAD_TOKEN": {"required": False}, "ADMIN_ID": "Telegram id администратора"}},
+                       project(files))
+        self.assertEqual(values["ENV_NAMES"], "ADMIN_ID S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY", "airlok.yml важнее .env.example")
+
+    def test_env_spec(self):
+        root = project({"go.mod": "module x\n", "main.go": "package main\n"})
+        values = parse({"version": 1, "env": {"S3_BUCKET": "Бакет", "SECRET": {"secret": True},
+                                              "LIMIT": {"default": "10"}, "REGION": {"default": "ru", "required": True}}}, root)
+        self.assertEqual(values["ENV_NAMES"], "S3_BUCKET SECRET REGION", "без default — обязательная")
+        self.assertEqual(parse({"version": 1, "env": ["A", "B"]}, root)["ENV_NAMES"], "A B", "список — все обязательные")
+        values = parse({"version": 1, "capabilities": {"database": {"enabled": True}}},
+                       project({"go.mod": "module x\n", "main.go": "package main\n", ".env.example": "DATABASE_URL=\nDEBUG=\n"}))
+        self.assertEqual(values["ENV_NAMES"], "DEBUG", "DATABASE_URL задаёт рецепт, когда заводит базу сам")
+        for env in ({"A": {"unknown": 1}}, {"A": {"required": "yes"}}, 5, ["lower"], {"PORT": "порт"}):
+            with self.assertRaises(ManifestError, msg=env):
+                parse({"version": 1, "env": env}, root)
+
     def test_rejects(self):
         root = project({"index.html": ""})
         for data in ({"version": 2},

@@ -79,27 +79,31 @@ def choice(data, key, allowed, label):
 
 def env_spec(value):
     """env из airlok.yml: список имён (все обязательные) или словарь «ИМЯ: описание» /
-    «ИМЯ: {required, secret, description, default}»; без default переменная обязательна."""
+    «ИМЯ: {required, secret, description, default, build}»; без default переменная обязательна.
+    build — явно указанное «нужна ли сборке», None — решает имя (build_by_default)."""
     if value is None:
         return []
     if isinstance(value, list):
         if not all(isinstance(n, str) for n in value):
             raise ManifestError("env: список имён переменных вида OPENAI_API_KEY")
-        return [{"name": n, "required": True} for n in value]
+        return [{"name": n, "required": True, "build": None} for n in value]
     if not isinstance(value, dict):
         raise ManifestError("env: список имён переменных или словарь «ИМЯ: описание»")
     out = []
     for name, spec in value.items():
         if spec is None or isinstance(spec, str):
-            out.append({"name": name, "required": True})
+            out.append({"name": name, "required": True, "build": None})
             continue
-        if not isinstance(spec, dict) or set(spec) - {"required", "secret", "description", "default"}:
-            raise ManifestError(f"env.{name}: описание строкой или поля required, secret, description, default")
+        if not isinstance(spec, dict) or set(spec) - {"required", "secret", "description", "default", "build"}:
+            raise ManifestError(f"env.{name}: описание строкой или поля required, secret, description, default, build")
         default = spec.get("default", "")
         required = spec.get("required", default in ("", None))
         if not isinstance(required, bool):
             raise ManifestError(f"env.{name}.required должен быть true или false")
-        out.append({"name": name, "required": required})
+        build = spec.get("build")
+        if build is not None and not isinstance(build, bool):
+            raise ManifestError(f"env.{name}.build должен быть true или false")
+        out.append({"name": name, "required": required, "build": build})
     return out
 
 
@@ -244,6 +248,9 @@ def parse(data, root):
         "UPLOAD_MAX_MB": number(uploads, "max_size_mb", 10, 1, 512),
         "UPLOAD_EXTS": " ".join(sorted(set(exts))),
         "ENV_NAMES": " ".join(env),
+        # Явное build из airlok.yml; остальное решает имя (envkey.py build-env).
+        "ENV_BUILD": " ".join(v["name"] for v in declared if v["build"] is True),
+        "ENV_NO_BUILD": " ".join(v["name"] for v in declared if v["build"] is False),
         "MEMORY_MB": number(resources, "memory_mb", 512, 128, 8192),
     }
 

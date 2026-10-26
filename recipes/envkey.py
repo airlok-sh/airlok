@@ -9,6 +9,7 @@
 подменить блоком другой переменной или приложения, не переставить и не отрезать.
 
   python3 envkey.py panel КЛЮЧ ПРИЛОЖЕНИЕ < env.json > panel.env
+  python3 envkey.py build-env "ИМЕНА" "ИСКЛЮЧЕНИЯ" user.env panel.env   # переменные сборки через NUL
 """
 import base64
 import json
@@ -19,6 +20,8 @@ import sys
 BLOCK = 384
 NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 APP = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+# Эти фреймворки встраивают переменные в код на сборке: без них в браузере будет undefined.
+BUILD_PREFIXES = ("NEXT_PUBLIC_", "VITE_")
 # Их задают рецепты: значение из дашборда сломало бы запуск или базу.
 RESERVED = {"DATABASE_URL", "UPLOAD_DIR", "UPLOAD_MAX_BYTES", "PORT", "HOST", "HOSTNAME", "HOME", "PATH",
             "NODE_ENV", "NEXT_TELEMETRY_DISABLED"}
@@ -91,16 +94,75 @@ def panel(key, app, data):
     return "".join(line + "\n" for line in lines)
 
 
-def main(argv):
-    if len(argv) != 4 or argv[1] != "panel":
-        print(__doc__.strip().splitlines()[-1].strip(), file=sys.stderr)
-        return 2
+def dotenv_value(raw):
+    """Значение строки env_file так, как его читает docker compose: в одинарных кавычках — как
+    есть, в двойных — с \\n, \\t, \\r, \\", \\\\ и $$, без кавычек — до « #»."""
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] == "'":
+        return raw[1:-1]
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        out, i, body = [], 0, raw[1:-1]
+        while i < len(body):
+            c = body[i]
+            if c == "\\" and i + 1 < len(body):
+                out.append({"n": "\n", "t": "\t", "r": "\r"}.get(body[i + 1], body[i + 1]))
+                i += 2
+            elif c == "$" and body[i + 1:i + 2] == "$":
+                out.append("$")
+                i += 2
+            else:
+                out.append(c)
+                i += 1
+        return "".join(out)
+    return raw.split(" #", 1)[0].strip()
+
+
+def read_dotenv(path):
+    values = {}
     try:
-        sys.stdout.write(panel(argv[2], argv[3], json.load(sys.stdin)))
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        name, eq, raw = line.partition("=")
+        name = name.strip()
+        if eq and valid_name(name):
+            values[name] = dotenv_value(raw)
+    return values
+
+
+def build_env(build, no_build, paths):
+    """Переменные сборки из файлов переменных (последний важнее): отмеченные build: true и
+    NEXT_PUBLIC_* / VITE_*, кроме отмеченных build: false. Остальное сборка не видит."""
+    values = {}
+    for path in paths:
+        values.update(read_dotenv(path))
+    pick = set(build.split())
+    skip = set(no_build.split())
+    return {n: v for n, v in sorted(values.items())
+            if n not in skip and (n in pick or n.startswith(BUILD_PREFIXES)) and "\0" not in v}
+
+
+def main(argv):
+    try:
+        if len(argv) == 4 and argv[1] == "panel":
+            sys.stdout.write(panel(argv[2], argv[3], json.load(sys.stdin)))
+            return 0
+        if len(argv) >= 4 and argv[1] == "build-env":
+            env = build_env(argv[2], argv[3], argv[4:])
+            sys.stdout.write("".join(f"{n}={v}\0" for n, v in env.items()))
+            return 0
     except (EnvError, ValueError) as e:
         print(e, file=sys.stderr)
         return 1
-    return 0
+    print("\n".join(line.strip() for line in __doc__.strip().splitlines()[-2:]), file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

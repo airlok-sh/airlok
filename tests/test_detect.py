@@ -160,7 +160,11 @@ class ManifestTest(unittest.TestCase):
         values = parse({"version": 1, "capabilities": {"database": {"enabled": True}}},
                        project({"go.mod": "module x\n", "main.go": "package main\n", ".env.example": "DATABASE_URL=\nDEBUG=\n"}))
         self.assertEqual(values["ENV_NAMES"], "DEBUG", "DATABASE_URL задаёт рецепт, когда заводит базу сам")
-        for env in ({"A": {"unknown": 1}}, {"A": {"required": "yes"}}, 5, ["lower"], {"PORT": "порт"}):
+        values = parse({"version": 1, "env": {"SENTRY_AUTH_TOKEN": {"secret": True, "build": True},
+                                              "NEXT_PUBLIC_DEBUG": {"default": "0", "build": False}, "API_URL": "Адрес API"}}, root)
+        self.assertEqual((values["ENV_BUILD"], values["ENV_NO_BUILD"]), ("SENTRY_AUTH_TOKEN", "NEXT_PUBLIC_DEBUG"),
+                         "без build решает имя: это делает сборка по файлам переменных")
+        for env in ({"A": {"unknown": 1}}, {"A": {"required": "yes"}}, {"A": {"build": "yes"}}, 5, ["lower"], {"PORT": "порт"}):
             with self.assertRaises(ManifestError, msg=env):
                 parse({"version": 1, "env": env}, root)
 

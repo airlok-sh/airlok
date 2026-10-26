@@ -89,6 +89,31 @@ class EnvKeyTest(unittest.TestCase):
 
 
 class DotenvTest(unittest.TestCase):
+    def test_reads_what_it_writes(self):
+        for value in ("plain", "", "with $VAR # hash", "it's", 'back\\slash "q"\nnext $X\ttab\r', "$$"):
+            line = envkey.dotenv_line("A", value)
+            self.assertEqual(envkey.dotenv_value(line.split("=", 1)[1]), value, line)
+
+    def test_reads_hand_written(self):
+        cases = {"x # comment": "x", "  spaced  ": "spaced", "'a # b'": "a # b", '"a\\nb"': "a\nb", "a=b": "a=b"}
+        for raw, value in cases.items():
+            self.assertEqual(envkey.dotenv_value(raw), value, raw)
+
+    def test_build_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            user, panel = os.path.join(tmp, "user.env"), os.path.join(tmp, "panel.env")
+            with open(user, "w") as f:
+                f.write("# мои\nexport NEXT_PUBLIC_API=http://old\nVITE_TITLE='Свечи'\nSECRET=s\nSENTRY_AUTH_TOKEN=t\nPORT=1\nbad line\n")
+            with open(panel, "w") as f:
+                f.write(envkey.dotenv_line("NEXT_PUBLIC_API", "https://api.example.ru") + "\n" +
+                        envkey.dotenv_line("NEXT_PUBLIC_DEBUG", "1") + "\n")
+            got = envkey.build_env("SENTRY_AUTH_TOKEN", "NEXT_PUBLIC_DEBUG", [user, panel, os.path.join(tmp, "нет")])
+            self.assertEqual(got, {"NEXT_PUBLIC_API": "https://api.example.ru", "SENTRY_AUTH_TOKEN": "t", "VITE_TITLE": "Свечи"},
+                             "panel.env важнее user.env; секреты без build: true в сборку не идут")
+            script = os.path.join(os.path.dirname(envkey.__file__), "envkey.py")
+            r = subprocess.run([sys.executable, script, "build-env", "", "", user], capture_output=True, check=True)
+            self.assertEqual(r.stdout.split(b"\0")[:-1], ["NEXT_PUBLIC_API=http://old".encode(), "VITE_TITLE=Свечи".encode()])
+
     def test_quoting(self):
         cases = {
             "plain": "A='plain'",

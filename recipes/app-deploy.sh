@@ -130,6 +130,14 @@ secrets() {
 	if ((${#missing[@]})); then
 		die "не заданы обязательные переменные: ${missing[*]}. Задайте их на странице приложения в дашборде airlok или впишите в ${user_env} в виде ИМЯ=значение и выкатите снова — что в них, описано в airlok.yml или .env.example проекта"
 	fi
+
+	# Переменные сборки: NEXT_PUBLIC_*, VITE_* и отмеченные build: true в airlok.yml — их
+	# встраивают в код. Остальные значения сборка не получает: в ней работают скрипты чужих пакетов.
+	mapfile -d '' -t BUILD_ENV < <(python3 "$RECIPES_DIR/envkey.py" build-env "${ENV_BUILD:-}" "${ENV_NO_BUILD:-}" "$user_env" "$panel_env")
+	BUILD_ENV_SUM=""
+	if ((${#BUILD_ENV[@]})); then
+		BUILD_ENV_SUM=$(printf '%s\0' "${BUILD_ENV[@]}" | sha256sum | cut -d' ' -f1)
+	fi
 }
 
 prepare_release() {
@@ -139,13 +147,16 @@ prepare_release() {
 	[[ $id =~ ^[A-Za-z0-9-]+$ ]] || die "некорректный id релиза: ${id}"
 	RELEASE=$APP_DIR/releases/$id
 	RELEASE_ID=$id
-	# Релиз из GitHub однозначно задан коммитом, поэтому уже собранный можно взять
-	# как есть: откат на прошлую версию занимает секунды, а не новую сборку.
+	# Релиз из GitHub однозначно задан коммитом и переменными сборки (их отпечаток лежит в
+	# .built), поэтому уже собранный можно взять как есть: откат занимает секунды, а не новую сборку.
 	REUSED=0
 	if [[ -n ${AIRLOK_RELEASE_ID:-} && -f ${RELEASE}.built && -d $RELEASE ]]; then
-		REUSED=1
-		ok "релиз ${id} уже собран, используем его"
-		return
+		if [[ $(<"${RELEASE}.built") == "$BUILD_ENV_SUM" ]]; then
+			REUSED=1
+			ok "релиз ${id} уже собран, используем его"
+			return
+		fi
+		note "переменные сборки изменились с прошлой сборки ${id} — собираем заново"
 	fi
 	rm -rf "$RELEASE" "${RELEASE}.built"
 	install -d -m 755 "$RELEASE"
@@ -170,17 +181,20 @@ images() {
 	esac
 }
 
-# build_container СКРИПТ ЛОГ — установка зависимостей и сборка в контейнере. Агенту вывод
+# build_container СКРИПТ ЛОГ — установка зависимостей и сборка в контейнере. Значения
+# переменных сборки идут через окружение docker, а не аргументами: в ps их не видно. Агенту вывод
 # нужен и в общем логе: дашборд показывает его по ходу выкатки. sh -x печатает каждую команду
 # перед запуском: go build и go mod download молчат минутами, а так видно, какой шаг идёт.
 build_container() {
 	# Установка зависимостей выполняет скрипты чужих пакетов, поэтому у сборки нет ни
 	# секретов, ни базы, ни прав: только папка релиза и доступ к реестрам пакетов.
-	local run=(docker run --rm --name "airlok-build-${APP_NAME}"
+	local pair passed=()
+	for pair in "${BUILD_ENV[@]}"; do passed+=(-e "${pair%%=*}"); done
+	local run=(env "${BUILD_ENV[@]}" docker run --rm --name "airlok-build-${APP_NAME}"
 		--user "${BUILD_UID}:${BUILD_GID}" --cap-drop ALL --security-opt no-new-privileges
 		--memory 1g --pids-limit 512
 		-e HOME=/tmp -e NEXT_TELEMETRY_DISABLED=1 -e npm_config_cache=/tmp/npm -e PIP_CACHE_DIR=/tmp/pip
-		-e PYTHONDONTWRITEBYTECODE=1
+		-e PYTHONDONTWRITEBYTECODE=1 "${passed[@]}"
 		-v "${RELEASE}:/app" -w /app "$BUILD_IMAGE" sh -xc "$1")
 	if [[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]]; then
 		"${run[@]}" 2>&1 | tee "$2"
@@ -196,7 +210,9 @@ build() {
 	fi
 	step "Сборка: ${APP_FRAMEWORK}"
 	stage build "$APP_FRAMEWORK"
-	local log=${RELEASE}.build.log script
+	local log=${RELEASE}.build.log script pair names=()
+	for pair in "${BUILD_ENV[@]}"; do names+=("${pair%%=*}"); done
+	((${#names[@]})) && note "переменные сборки: ${names[*]}"
 	script=$BUILD_INSTALL
 	[[ -n $script && -n $BUILD_CMD ]] && script+=" && "
 	script+=$BUILD_CMD
@@ -216,7 +232,7 @@ build() {
 	# Права задаём явно, а не наследуем от исходников: временный каталог из mktemp
 	# имеет 700, и приложение не смогло бы прочитать собственный код.
 	chmod -R u+rwX,go+rX,go-w "$RELEASE"
-	touch "${RELEASE}.built"
+	printf '%s' "$BUILD_ENV_SUM" >"${RELEASE}.built"
 	ok "собрано в изолированном контейнере, код передан root и закрыт на запись"
 }
 
@@ -434,7 +450,7 @@ deploy() {
 			die "новая версия не запустилась, вернули предыдущую (${ROLLED_BACK})"
 		fi
 		if ((crashed)) || [[ $APP_KIND == worker ]]; then
-			die "приложение падает при запуске — причина в логе выше. Если ему не хватает переменных окружения, впишите их в ${APP_DIR}/shared/user.env и выкатите снова"
+			die "приложение падает при запуске — причина в логе выше. Если ему не хватает переменных окружения, задайте их на странице приложения в дашборде airlok или впишите в ${APP_DIR}/shared/user.env и выкатите снова"
 		fi
 		die "приложение не ответило за 2 минуты: оно должно слушать порт из переменной PORT на 0.0.0.0"
 	fi

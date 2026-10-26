@@ -30,6 +30,10 @@ description: >-
      умолчанию). Иначе `required: false` или `default`;
    - `secret: true` — ключи, токены, пароли, строки подключения: дашборд предложит сгенерировать случайное значение;
    - `default` — значение, с которым код работает без переменной (возьми из кода, не придумывай);
+   - `build: true` — значение нужно **сборке**, а не только запуску: читается в `next.config.js`, `vite.config.ts`,
+     скриптах сборки (загрузка source maps в Sentry, генерация страниц из API). `NEXT_PUBLIC_*` и `VITE_*` идут в
+     сборку сами — фреймворк встраивает их в код, отмечать не нужно. Секреты отмечай, только если без них сборка не
+     пройдёт: сборка запускает скрипты чужих пакетов;
    - `description` — по-русски, для человека без опыта: что это и **где взять**. «Токен бота — выдаёт @BotFather»,
      «Ключ API из кабинета OpenAI → API keys», «Любая длинная случайная строка: openssl rand -hex 24».
 4. **Не вписывай то, что задаёт airlok**: `PORT`, `HOST`, `HOSTNAME`, `HOME`, `PATH`, `NODE_ENV`, `DATABASE_URL`,
@@ -76,6 +80,12 @@ env:
   OPENAI_API_KEY:
     secret: true
     description: Ключ API из кабинета OpenAI → API keys
+  NEXT_PUBLIC_SITE_URL: Адрес сайта для ссылок и мета-тегов, например https://shop.ru   # попадёт и в сборку
+  SENTRY_AUTH_TOKEN:
+    secret: true
+    build: true
+    required: false
+    description: Токен Sentry для загрузки source maps при сборке
   ADMIN_CHAT_ID: ID чата администратора — узнать у @userinfobot   # строка — обязательная с описанием
   LOG_LEVEL:
     default: info

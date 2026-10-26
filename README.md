@@ -11,8 +11,8 @@
 | [recipes](recipes) | рецепты: настройка сервера, песочница и деплой приложения, деплой из GitHub и по push, агент для выкатки кнопкой из дашборда, Let's Encrypt, проверка доступности и метрики, уведомления |
 | [checkup](checkup) | проверка сервера только на чтение: SSH, открытые порты, файрвол, обновления, бэкапы, Docker, nginx |
 | [examples](examples) | примеры проектов: с манифестом `airlok.yml` и без него |
-| [cli](cli) | `npx airlok-cli deploy` — выкатка папки на хостинг airlok из терминала, без GitHub |
-| [skills](skills) | навык airlok для ИИ-агентов; ставится `npx airlok-cli setup` вместе с MCP или отдельно — `npx skills add airlok-sh/airlok` |
+| [cli](cli) | `npx @airlok/cli deploy` — выкатка папки на хостинг airlok из терминала, без GitHub |
+| [skills](skills) | навык airlok для ИИ-агентов; ставится `npx @airlok/cli setup` вместе с MCP или отдельно — `npx skills add airlok-sh/airlok` |
 
 С чего начать — [recipes/README.md](recipes/README.md).
 

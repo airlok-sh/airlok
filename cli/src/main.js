@@ -16,11 +16,11 @@ const FOLLOW_LIMIT_MS = 30 * 60_000
 
 const help = `airlok — выкатка проекта на хостинг airlok из терминала
 
-  npx airlok-cli setup              один раз: вход и подключение ИИ-агентов (Claude Code, Codex, Antigravity, Cursor)
-  npx airlok-cli login              войти через браузер
-  npx airlok-cli deploy [папка]     собрать и выкатить папку (по умолчанию текущую)
-  npx airlok-cli whoami             под кем выполнен вход
-  npx airlok-cli logout             забыть вход на этом компьютере
+  npx @airlok/cli setup             один раз: вход и подключение ИИ-агентов (Claude Code, Codex, Antigravity, Cursor)
+  npx @airlok/cli login             войти через браузер
+  npx @airlok/cli deploy [папка]    собрать и выкатить папку (по умолчанию текущую)
+  npx @airlok/cli whoami            под кем выполнен вход
+  npx @airlok/cli logout            забыть вход на этом компьютере
 
 Для deploy:
   --app <имя>       выкатить в существующее приложение
@@ -124,7 +124,7 @@ export async function main(argv, io = makeIO(), env = process.env) {
         return 0
       case 'whoami': {
         const s = await session(env)
-        if (!s.token) throw new UserError('Вы не вошли: npx airlok-cli login')
+        if (!s.token) throw new UserError('Вы не вошли: npx @airlok/cli login')
         const me = await new Api(s.url, s.token).me()
         io.out(`${me.login}${me.name ? ` (${me.name})` : ''} · ${s.url}`)
         return 0
@@ -149,8 +149,8 @@ class UserError extends Error {}
 function errorText(err) {
   if (err instanceof UserError || err instanceof PackError) return err.message
   if (err instanceof ApiError) {
-    if (err.status === 401) return 'Вход устарел или токен отозван: npx airlok-cli login'
-    if (err.code === 'read_only_token') return 'Этот токен только читает. Войдите заново (npx airlok-cli login) или задайте токен с правом выкатывать.'
+    if (err.status === 401) return 'Вход устарел или токен отозван: npx @airlok/cli login'
+    if (err.code === 'read_only_token') return 'Этот токен только читает. Войдите заново (npx @airlok/cli login) или задайте токен с правом выкатывать.'
     return err.message
   }
   return `Ошибка: ${err.message}`
@@ -177,7 +177,7 @@ async function login(io, env) {
     io.err(`Готово: вы вошли как ${done.login}. Токен сохранён в ${path}`)
     return
   }
-  throw new UserError('Код входа истёк: запустите npx airlok-cli login ещё раз.')
+  throw new UserError('Код входа истёк: запустите npx @airlok/cli login ещё раз.')
 }
 
 function openBrowser(url) {
@@ -230,7 +230,7 @@ async function deploy(target, opts, io, env) {
   if (!(await stat(dir).catch(() => null))?.isDirectory()) throw new UserError(`Нет такой папки: ${dir}`)
   let s = await session(env)
   if (!s.token) {
-    if (!io.interactive) throw new UserError('Вы не вошли: npx airlok-cli login (или задайте AIRLOK_TOKEN)')
+    if (!io.interactive) throw new UserError('Вы не вошли: npx @airlok/cli login (или задайте AIRLOK_TOKEN)')
     await login(io, env)
     s = await session(env)
   }
@@ -289,7 +289,7 @@ async function chooseApp(api, dir, opts, io) {
     app = await ask(api, apps, dir, io)
   }
   const path = await saveLink(dir, { app_id: app.id, app: app.name })
-  io.err(`Папка привязана к ${app.name} (${path}): дальше хватит npx airlok-cli deploy.`)
+  io.err(`Папка привязана к ${app.name} (${path}): дальше хватит npx @airlok/cli deploy.`)
   return app
 }
 

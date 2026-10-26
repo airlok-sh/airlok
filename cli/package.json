@@ -1,7 +1,7 @@
 {
-  "name": "airlok-cli",
+  "name": "@airlok/cli",
   "version": "0.1.0",
-  "description": "Выкатка проекта на хостинг airlok из терминала и подключение ИИ-агентов: npx airlok-cli setup",
+  "description": "Выкатка проекта на хостинг airlok из терминала и подключение ИИ-агентов: npx @airlok/cli setup",
   "type": "module",
   "bin": {
     "airlok": "bin/airlok.js"
@@ -28,5 +28,8 @@
     "deploy",
     "hosting",
     "airlok"
-  ]
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
 }

@@ -1,10 +1,10 @@
-# airlok-cli
+# @airlok/cli
 
 Выкатка папки проекта на хостинг airlok из терминала — без GitHub и без своего сервера.
 
 ```bash
-npx airlok-cli login     # вход через браузер
-npx airlok-cli deploy    # собрать и выкатить текущую папку
+npx @airlok/cli login    # вход через браузер
+npx @airlok/cli deploy   # собрать и выкатить текущую папку
 ```
 
 Нужен Node.js 18.17 или новее. Устанавливать ничего не нужно: `npx` скачает CLI сам.
@@ -12,7 +12,7 @@ npx airlok-cli deploy    # собрать и выкатить текущую п�
 ## ИИ-агенты: один раз и навсегда
 
 ```bash
-npx airlok-cli setup
+npx @airlok/cli setup
 ```
 
 Команда входит в airlok (если ещё не вошли) и подключает найденных агентов — Claude Code, Codex, Antigravity, Cursor:
@@ -30,7 +30,7 @@ npx airlok-cli setup
 ## Как это работает
 
 1. `login` печатает ссылку с кодом. Откройте её, сверьте код и нажмите «Разрешить» — CLI получит токен с правом выкатывать. Токен лежит в `~/.config/airlok/config.json`, его видно и можно отозвать в дашборде: Настройки → токены.
-2. `deploy` спрашивает, в какое приложение выкатывать (или создаёт новое), и запоминает выбор в `.airlok/project.json` внутри папки. Дальше хватает `npx airlok-cli deploy`.
+2. `deploy` спрашивает, в какое приложение выкатывать (или создаёт новое), и запоминает выбор в `.airlok/project.json` внутри папки. Дальше хватает `npx @airlok/cli deploy`.
 3. Папка пакуется в архив. В git-репозитории берутся файлы по `.gitignore`; `node_modules`, `.git`, `.env*` (кроме `.env.example`) и сборки не уходят никогда — airlok соберёт проект сам. Предел архива — 50 МБ.
 4. CLI показывает этапы сборки и в конце печатает адрес сайта. Если сборка упала — причину и конец лога; код выхода тогда 1.
 
@@ -49,7 +49,7 @@ npx airlok-cli setup
 Без браузера CLI работает с токеном из переменной окружения:
 
 ```bash
-AIRLOK_TOKEN=airlok_pat_… npx airlok-cli deploy --app shop --json
+AIRLOK_TOKEN=airlok_pat_… npx @airlok/cli deploy --app shop --json
 ```
 
 Токен с правом выкатывать создаётся в дашборде: Настройки → токены. `AIRLOK_URL` задаёт адрес дашборда, если он не `https://app.airlok.ru`.

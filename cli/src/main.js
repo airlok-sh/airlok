@@ -7,7 +7,7 @@ import { parseArgs, promisify } from 'node:util'
 
 import { Api, ApiError } from './api.js'
 import { forgetSession, readLink, saveLink, saveSession, session } from './config.js'
-import { formatReport } from './check.js'
+import { formatReport, normalize } from './check.js'
 import { EnvError, envCommand } from './env.js'
 import { checkFiles, listFiles, pack, PackError } from './pack.js'
 import { agents, detect, homePath, onPath, setupAgents, SKILLS } from './setup.js'
@@ -335,7 +335,7 @@ async function check(target, opts, io, env) {
   const problem = checkFiles(files)
   if (problem) throw new UserError(problem)
   if (!opts.json) io.err(`Проверяю ${files.length} ${plural(files.length, 'файл', 'файла', 'файлов')}: архив проверяется на сервере и сразу удаляется…`)
-  const report = await new Api(s.url, s.token).check(await pack(dir, files))
+  const report = normalize(await new Api(s.url, s.token).check(await pack(dir, files)))
   const ok = report.errors.length === 0
   if (opts.json) io.out(JSON.stringify({ status: ok ? 'ok' : 'error', ...report }))
   else io.out(formatReport(report))

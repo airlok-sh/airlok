@@ -32,6 +32,7 @@ test('formatReport shows what airlok will do', () => {
   assert.match(text, /На своём сервере:\n {2}· cron только на хостинге/)
   assert.match(text, /✓ Можно выкатывать\.$/)
   assert.doesNotMatch(text, /Остановит выкатку/)
+  assert.match(formatReport({ ...report, notes: null, server: null, warnings: null }), /✓ Можно выкатывать\.$/, 'null вместо пустого списка не ломает отчёт')
   const failed = formatReport({ ...report, plan: undefined, errors: ['airlok.yml: ожидается version: 1'], warnings: [], server: [] })
   assert.match(failed, /Остановит выкатку:\n {2}✗ airlok\.yml: ожидается version: 1/)
   assert.match(failed, /✗ Выкатка с такими файлами не пройдёт\.$/)

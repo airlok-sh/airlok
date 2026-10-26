@@ -12,4 +12,4 @@ capabilities:
     enabled: true
 
 env:
-  - GREETING
+  GREETING: Приветствие на главной странице, например «Привет из airlok»

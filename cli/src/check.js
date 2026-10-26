@@ -1,6 +1,12 @@
 // Команда check: что airlok сделает с проектом — стек, команды, возможности и переменные —
 // и что помешает выкатке. Проверяет дашборд тем же кодом, что и сборку, но ничего не собирает.
 
+// normalize — списки отчёта, даже если сервер прислал вместо пустого null.
+export function normalize(r) {
+  const list = (v) => (Array.isArray(v) ? v : [])
+  return { ...r, errors: list(r.errors), warnings: list(r.warnings), notes: list(r.notes), server: list(r.server), env: list(r.env), cron: list(r.cron) }
+}
+
 const stackLabel = { static: 'статический сайт', nextjs: 'Next.js', node: 'Node.js', python: 'Python', go: 'Go', docker: 'Dockerfile' }
 
 function envLine(v, width) {
@@ -11,7 +17,8 @@ function envLine(v, width) {
 }
 
 // formatReport — отчёт для человека; пустые разделы не печатаются.
-export function formatReport(r) {
+export function formatReport(report) {
+  const r = normalize(report)
   const lines = []
   const p = r.plan
   if (p) {

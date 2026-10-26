@@ -1,0 +1,163 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/airlok-sh/airlok/main/schema/airlok.schema.json",
+  "title": "airlok.yml",
+  "description": "Что проекту нужно от airlok: стек и команды, если определились не так, база, загрузки, задачи по расписанию и переменные окружения. Проверка без выкатки: npx @airlok/cli check.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "version": { "const": 1, "description": "Версия формата, сейчас 1." },
+    "app": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,30}$",
+          "description": "Имя приложения при выкатке на своём сервере вручную; из дашборда имя задаёт дашборд."
+        },
+        "domain": {
+          "type": "string",
+          "pattern": "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$",
+          "description": "Только для своего сервера: домен сайта, например shop.example.ru. На хостинге домены задаются в дашборде."
+        },
+        "stack": {
+          "enum": ["static", "nextjs", "node", "python", "go", "docker"],
+          "description": "Стек, если он определился по файлам не так. docker — сборка по Dockerfile, только на хостинге."
+        },
+        "type": {
+          "enum": ["web", "worker"],
+          "default": "web",
+          "description": "web — сайт или API на порту из PORT; worker — бот или воркер без сайта, работает всегда."
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command": { "$ref": "#/definitions/command", "description": "Команда сборки вместо определённой по стеку, например npm run build:prod." },
+        "output": { "type": "string", "pattern": "^/?[A-Za-z0-9_.][A-Za-z0-9_./-]*/?$", "description": "Каталог готового статического сайта внутри проекта, например dist." },
+        "dockerfile": { "type": "string", "pattern": "^(\\./)?[A-Za-z0-9_][A-Za-z0-9_./-]*$", "description": "Только на хостинге: по какому Dockerfile собирать, например docker/Dockerfile.prod." }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command": { "$ref": "#/definitions/command", "description": "Команда запуска, например uvicorn app.main:app --host 0.0.0.0 --port 8080." },
+        "release": { "$ref": "#/definitions/command", "description": "Выполняется один раз перед каждой новой версией: миграции базы, например alembic upgrade head." },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Порт приложения из Dockerfile; у остальных стеков приложение слушает порт из PORT." },
+        "health": {
+          "type": "string",
+          "pattern": "^/(?!/)[A-Za-z0-9._~!$&'()*+,;=:@%/?-]{0,199}$",
+          "description": "Адрес проверки, например /healthz: приложение живо, только если он отвечает 2xx или 3xx. Без него проверяется главная, и годится любой ответ, кроме 5xx."
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node": { "enum": ["20", "22", "24"], "description": "Версия Node.js; без неё — из engines, .nvmrc или .node-version." },
+        "python": { "enum": ["3.10", "3.11", "3.12", "3.13", "3.14"], "description": "Версия Python; без неё — из .python-version, runtime.txt или requires-python." },
+        "go": { "enum": ["1.25", "1.26", "1.27"], "description": "Версия Go; без неё — из директивы go в go.mod." }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "database": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "description": "PostgreSQL для приложения: адрес — в переменной DATABASE_URL." }
+          }
+        },
+        "uploads": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "description": "Файлы пользователей: приложение пишет их в каталог из UPLOAD_DIR." },
+            "allowed": {
+              "type": "array",
+              "items": { "type": "string", "pattern": "^\\.?[A-Za-z0-9]{1,10}$" },
+              "minItems": 1,
+              "maxItems": 30,
+              "description": "Разрешённые расширения, например [jpg, png, pdf]: обязательно, если загрузки включены."
+            },
+            "max_size_mb": { "type": "integer", "minimum": 1, "maximum": 512, "default": 10, "description": "Предел размера одного файла в МБ." },
+            "public": { "type": "boolean", "default": true, "description": "Отдавать ли файлы сайтом по адресу /uploads/имя." }
+          }
+        },
+        "cron": {
+          "type": "array",
+          "maxItems": 10,
+          "description": "Задачи по расписанию, время московское. Только на хостинге.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["schedule", "command"],
+            "properties": {
+              "name": { "type": "string", "maxLength": 64, "description": "Название задачи для логов." },
+              "schedule": { "type": "string", "description": "Расписание cron из пяти полей, например \"0 9 * * *\"." },
+              "command": { "$ref": "#/definitions/command", "description": "Команда, например python report.py." },
+              "timeout_min": { "type": "integer", "minimum": 1, "maximum": 60, "default": 10, "description": "Сколько минут задача может идти." }
+            }
+          }
+        },
+        "outbound_network": {
+          "type": "boolean",
+          "default": true,
+          "description": "Только для своего сервера: доступ приложения в интернет. false пока не поддерживается."
+        }
+      }
+    },
+    "env": {
+      "description": "Переменные окружения, которые ждёт код. Словарь «ИМЯ: описание» или с полями; список имён значит «все обязательные».",
+      "oneOf": [
+        { "type": "array", "items": { "$ref": "#/definitions/envName" }, "maxItems": 100 },
+        {
+          "type": "object",
+          "maxProperties": 100,
+          "propertyNames": { "$ref": "#/definitions/envName" },
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "null" },
+              { "type": "string", "maxLength": 500, "description": "Описание обязательной переменной: что это и где взять." },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "required": { "type": "boolean", "description": "Без неё выкатка остановится. По умолчанию — да, если нет default." },
+                  "secret": { "type": "boolean", "description": "Секрет: дашборд предложит сгенерировать значение." },
+                  "description": { "type": "string", "maxLength": 500, "description": "Что это и где взять — для человека." },
+                  "default": { "type": "string", "maxLength": 1000, "pattern": "^[^\\n\\r]*$", "description": "Значение, с которым код работает без переменной." },
+                  "build": { "type": "boolean", "description": "Нужна сборке. NEXT_PUBLIC_* и VITE_* идут в сборку сами; build: false это отменяет." }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "memory_mb": { "type": "integer", "minimum": 128, "maximum": 8192, "default": 512, "description": "Только для своего сервера: память контейнера приложения в МБ." }
+      }
+    }
+  },
+  "definitions": {
+    "command": { "type": "string", "maxLength": 500, "pattern": "^[^\\n\\r]*$" },
+    "envName": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+      "not": { "enum": ["PORT", "HOST", "HOSTNAME", "HOME", "PATH", "NODE_ENV", "DATABASE_URL", "UPLOAD_DIR", "UPLOAD_MAX_BYTES"] },
+      "description": "Имя переменной: латиница в верхнем регистре, цифры и _. PORT, DATABASE_URL, UPLOAD_DIR и подобные задаёт airlok."
+    }
+  }
+}

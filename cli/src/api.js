@@ -86,6 +86,11 @@ export class Api {
     return this.request('POST', '/api/cli/v1/apps', { target: 'hosted', name }).then((r) => r.data.id)
   }
 
+  // check — что airlok сделает с проектом, без сборки: архив проверяется и сразу удаляется.
+  check(archive) {
+    return this.request('POST', '/api/cli/v1/check', archive, { raw: true }).then((r) => r.data)
+  }
+
   deployArchive(appId, archive, title) {
     const q = new URLSearchParams({ title })
     return this.request('POST', `/api/cli/v1/apps/${encodeURIComponent(appId)}/archive?${q}`, archive, { raw: true }).then((r) => r.data)

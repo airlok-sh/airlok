@@ -1,10 +1,9 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/airlok-sh/airlok/main/schema/airlok.schema.json
 version: 1
 
 app:
   name: uploads-demo
   stack: nextjs
-  repo: github.com/example/nextjs-uploads
-  branch: main
   domain: app.example.ru
 
 capabilities:
@@ -19,7 +18,9 @@ capabilities:
   cron: []
 
 env:
-  - OPENAI_API_KEY
+  OPENAI_API_KEY:
+    secret: true
+    description: Ключ API из кабинета OpenAI → API keys
 
 resources:
   memory_mb: 384

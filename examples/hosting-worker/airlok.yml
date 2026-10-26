@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/airlok-sh/airlok/main/schema/airlok.schema.json
 # Фоновое приложение на хостинге airlok: без сайта, работает всё время, плюс задача по
 # расписанию. Время в расписании — московское.
 version: 1

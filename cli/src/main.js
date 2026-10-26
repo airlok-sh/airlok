@@ -7,6 +7,7 @@ import { parseArgs, promisify } from 'node:util'
 
 import { Api, ApiError } from './api.js'
 import { forgetSession, readLink, saveLink, saveSession, session } from './config.js'
+import { formatReport } from './check.js'
 import { EnvError, envCommand } from './env.js'
 import { checkFiles, listFiles, pack, PackError } from './pack.js'
 import { agents, detect, homePath, onPath, setupAgents, SKILLS } from './setup.js'
@@ -20,6 +21,7 @@ const help = `airlok — выкатка проекта на хостинг airlo
   npx @airlok/cli setup             один раз: вход и подключение ИИ-агентов (Claude Code, Codex, Antigravity, Cursor)
   npx @airlok/cli login             войти через браузер
   npx @airlok/cli deploy [папка]    собрать и выкатить папку (по умолчанию текущую)
+  npx @airlok/cli check [папка]     что airlok сделает с проектом и что помешает выкатке — без сборки
   npx @airlok/cli env list --app <имя>          переменные окружения приложения (без значений)
   npx @airlok/cli env set ИМЯ… --app <имя>      задать: значение спросит без показа на экране или прочитает из stdin
   npx @airlok/cli env set --app <имя> --from .env   задать все переменные из файла
@@ -175,6 +177,8 @@ export async function main(argv, io = makeIO(), env = process.env) {
       }
       case 'deploy':
         return await deploy(positionals[1] ?? '.', opts, io, env)
+      case 'check':
+        return await check(positionals[1] ?? '.', opts, io, env)
       case 'setup':
         return await setup(opts, io, env)
       case 'env': {
@@ -319,6 +323,23 @@ async function deploy(target, opts, io, env) {
   if (tail.length > 1) io.err(`\nКонец лога:\n${tail.map((l) => `  ${l}`).join('\n')}`)
   io.err(`\nПолный лог: ${s.url}/apps/${app.id}?tab=deploys`)
   return 1
+}
+
+// check упаковывает папку так же, как deploy, и печатает отчёт дашборда. Код 1 — выкатка не пройдёт.
+async function check(target, opts, io, env) {
+  const dir = resolve(target)
+  if (!(await stat(dir).catch(() => null))?.isDirectory()) throw new UserError(`Нет такой папки: ${dir}`)
+  const s = await session(env)
+  if (!s.token) throw new UserError('Вы не вошли: npx @airlok/cli login (или задайте AIRLOK_TOKEN)')
+  const { files } = await listFiles(dir)
+  const problem = checkFiles(files)
+  if (problem) throw new UserError(problem)
+  if (!opts.json) io.err(`Проверяю ${files.length} ${plural(files.length, 'файл', 'файла', 'файлов')}: архив проверяется на сервере и сразу удаляется…`)
+  const report = await new Api(s.url, s.token).check(await pack(dir, files))
+  const ok = report.errors.length === 0
+  if (opts.json) io.out(JSON.stringify({ status: ok ? 'ok' : 'error', ...report }))
+  else io.out(formatReport(report))
+  return ok ? 0 : 1
 }
 
 // chooseApp — куда выкатывать: из флагов, из привязки папки или по вопросу человеку.

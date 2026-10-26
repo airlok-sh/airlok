@@ -344,21 +344,32 @@ EOF
 	note "копии лежат на этом же сервере: если пропадёт сервер, пропадут и они"
 }
 
+# crashing — контейнер приложения упал: остановился, перезапускается или уже
+# перезапускался. Так бывает, когда программа завершается при старте, например без
+# нужных переменных окружения.
+crashing() {
+	local running restarting restarts
+	read -r running restarting restarts < <(docker inspect -f '{{.State.Running}} {{.State.Restarting}} {{.RestartCount}}' \
+		"$(compose ps -aq app)" 2>/dev/null)
+	[[ $running != true || $restarting == true || ${restarts:-0} -gt 0 ]]
+}
+
 # wait_running — фоновое приложение запустилось и не упало в первые секунды: порта у
 # него нет, и «работает» значит только, что контейнер жив.
 wait_running() {
-	local state
 	sleep 10
-	state=$(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' "$(compose ps -aq app)" 2>/dev/null)
-	[[ $state == "true false" ]]
+	! crashing
 }
 
+# wait_healthy ждёт ответа приложения до 2 минут. Если контейнер падает раз за разом,
+# ждать дальше незачем: ответа не будет.
 wait_healthy() {
 	[[ $APP_KIND == worker ]] && { wait_running; return; }
 	local i code
 	for ((i = 0; i < 60; i++)); do
 		code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${APP_PORT}/" || true)
 		[[ $code =~ ^[23] ]] && return 0
+		((i >= 10 && i % 5 == 0)) && crashing && return 1
 		sleep 2
 	done
 	return 1
@@ -384,15 +395,20 @@ deploy() {
 
 	if ! wait_healthy; then
 		compose logs --tail 30 app >&2 || true
+		local crashed=0
+		crashing && crashed=1
 		if [[ -n $prev && $prev != "$RELEASE" ]]; then
 			RELEASE=$prev
 			[[ $APP_STACK == static ]] && static_conf
 			write_compose
 			compose up -d --force-recreate --no-deps app >>"$log" 2>&1 || true
 			ROLLED_BACK=$(basename "$prev")
+			((crashed)) && die "новая версия падает при запуске (причина в логе выше), вернули предыдущую (${ROLLED_BACK})"
 			die "новая версия не запустилась, вернули предыдущую (${ROLLED_BACK})"
 		fi
-		[[ $APP_KIND == worker ]] && die "фоновое приложение завершилось сразу после запуска — причина в логе выше"
+		if ((crashed)) || [[ $APP_KIND == worker ]]; then
+			die "приложение падает при запуске — причина в логе выше. Если ему не хватает переменных окружения, впишите их в ${APP_DIR}/shared/user.env и выкатите снова"
+		fi
 		die "приложение не ответило за 2 минуты: оно должно слушать порт из переменной PORT на 0.0.0.0"
 	fi
 	ln -sfn "$RELEASE" "$APP_DIR/current"

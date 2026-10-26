@@ -147,6 +147,8 @@ prepare_release() {
 	[[ $id =~ ^[A-Za-z0-9-]+$ ]] || die "некорректный id релиза: ${id}"
 	RELEASE=$APP_DIR/releases/$id
 	RELEASE_ID=$id
+	# Адрес проверки — у каждого релиза свой: при откате проверяется то, что было в его airlok.yml.
+	printf '%s' "$HEALTH_PATH" >"${RELEASE}.health"
 	# Релиз из GitHub однозначно задан коммитом и переменными сборки (их отпечаток лежит в
 	# .built), поэтому уже собранный можно взять как есть: откат занимает секунды, а не новую сборку.
 	REUSED=0
@@ -406,10 +408,12 @@ wait_running() {
 # ждать дальше незачем: ответа не будет.
 wait_healthy() {
 	[[ $APP_KIND == worker ]] && { wait_running; return; }
-	local i code
+	local i code path
+	path=$(release_health "$RELEASE")
 	for ((i = 0; i < 60; i++)); do
-		code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${APP_PORT}/" || true)
-		[[ $code =~ ^[23] ]] && return 0
+		code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${APP_PORT}${path:-/}" || true)
+		LAST_HEALTH_CODE=$code
+		health_ok "$code" "$path" && return 0
 		((i >= 10 && i % 5 == 0)) && crashing && return 1
 		sleep 2
 	done
@@ -452,6 +456,11 @@ deploy() {
 		if ((crashed)) || [[ $APP_KIND == worker ]]; then
 			die "приложение падает при запуске — причина в логе выше. Если ему не хватает переменных окружения, задайте их на странице приложения в дашборде airlok или впишите в ${APP_DIR}/shared/user.env и выкатите снова"
 		fi
+		local path
+		path=$(release_health "$RELEASE")
+		if [[ -n $path && ${LAST_HEALTH_CODE:-000} != 000 ]]; then
+			die "проверка ${path} из airlok.yml (run.health) ответила ${LAST_HEALTH_CODE}, а нужен 2xx или 3xx: поправьте этот адрес в приложении или в airlok.yml"
+		fi
 		die "приложение не ответило за 2 минуты: оно должно слушать порт из переменной PORT на 0.0.0.0"
 	fi
 	ln -sfn "$RELEASE" "$APP_DIR/current"
@@ -464,7 +473,7 @@ deploy() {
 	local old
 	for old in $(ls -1dt "$APP_DIR"/releases/*/ | tail -n +$((KEEP_RELEASES + 1))); do
 		[[ ${old%/} == "$(readlink -f "$APP_DIR/current")" ]] && continue
-		rm -rf "$old" "${old%/}.build.log" "${old%/}.built"
+		rm -rf "$old" "${old%/}.build.log" "${old%/}.built" "${old%/}.health"
 	done
 }
 

@@ -63,9 +63,11 @@ check_app() {
 	fi
 	exec 7>&-
 
+	local path=""
 	if [[ -n $domain ]]; then
+		path=$(release_health "$(readlink -f "$APPS_ROOT/$name/current")")
 		code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
-			--resolve "${domain}:443:127.0.0.1" "https://${domain}/")
+			--resolve "${domain}:443:127.0.0.1" "https://${domain}${path:-/}")
 	else
 		code=$(worker_code "$name")
 	fi
@@ -79,7 +81,7 @@ check_app() {
 	fi
 	since=${since:-$now}
 
-	if [[ $code =~ ^[234] ]]; then
+	if health_ok "$code" "$path"; then
 		if [[ $status == down ]]; then
 			# Точность — интервал проверок (минута), поэтому округляем и пишем «около».
 			local minutes=$(((now - since + 30) / 60))

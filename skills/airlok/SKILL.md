@@ -105,6 +105,7 @@ build:
 run:
   command: uvicorn app.main:app --host 0.0.0.0 --port 8080
   release: alembic upgrade head   # один раз перед каждой новой версией
+  health: /healthz       # адрес проверки: должен отвечать 2xx; без него годится любой ответ главной, кроме 5xx
 runtime:
   node: "22"             # 20, 22, 24
   python: "3.12"         # 3.10–3.14

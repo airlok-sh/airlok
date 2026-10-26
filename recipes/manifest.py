@@ -33,6 +33,8 @@ OPTIONAL_HINT = re.compile(r"необязательн|по умолчанию|м
 EXAMPLE_RESERVED = {"PORT", "HOST", "HOSTNAME", "HOME", "NODE_ENV"}
 # Каталог готового сайта: путь внутри проекта без выходов наверх и скрытых каталогов
 # (кроме .vitepress/dist — так его кладёт VitePress).
+# Путь проверки: от корня сайта, без пробелов и фрагмента — так же, как на хостинге.
+HEALTH = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/?-]{0,199}$")
 OUTPUT = re.compile(r"^(\.|(\.vitepress/)?[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*)$")
 
 
@@ -183,6 +185,9 @@ def parse(data, root):
     if output and not OUTPUT.match(output):
         raise ManifestError("build.output: каталог внутри проекта, например dist")
     run = section(data, "run")
+    health = command(run, "health", "run.health")
+    if health and (not HEALTH.match(health) or health.startswith("//")):
+        raise ManifestError("run.health: путь на сайте приложения, например /healthz")
     runtime = section(data, "runtime")
     versions = {k: str(runtime.get(k, "")) for k in ("node", "python", "go")}
     try:
@@ -242,6 +247,7 @@ def parse(data, root):
         "BUILD_CMD": plan["build"],
         "BUILD_OUTPUT": plan["output"],
         "RUN_CMD": plan["start"],
+        "HEALTH_PATH": health,
         "DB_ENABLED": int(flag(db, "enabled")),
         "UPLOADS_ENABLED": int(uploads_enabled),
         "UPLOADS_PUBLIC": int(flag(uploads, "public", True)),

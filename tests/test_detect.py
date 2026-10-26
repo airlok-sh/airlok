@@ -168,12 +168,20 @@ class ManifestTest(unittest.TestCase):
             with self.assertRaises(ManifestError, msg=env):
                 parse({"version": 1, "env": env}, root)
 
+    def test_health(self):
+        root = project({"index.html": ""})
+        self.assertEqual(parse({"version": 1}, root)["HEALTH_PATH"], "", "без run.health проверяется главная")
+        self.assertEqual(parse({"version": 1, "run": {"health": "/api/health?full=1"}}, root)["HEALTH_PATH"], "/api/health?full=1")
+
     def test_rejects(self):
         root = project({"index.html": ""})
         for data in ({"version": 2},
                      {"version": 1, "app": {"stack": "php"}},
                      {"version": 1, "run": {"command": "node a.js\nrm -rf /"}},
                      {"version": 1, "build": {"output": "../etc"}},
+                     {"version": 1, "run": {"health": "healthz"}},
+                     {"version": 1, "run": {"health": "//evil.example/x"}},
+                     {"version": 1, "run": {"health": "/a b"}},
                      {"version": 1, "capabilities": {"database": {"enabled": True}}}):
             with self.assertRaises(ManifestError, msg=data):
                 parse(data, root)

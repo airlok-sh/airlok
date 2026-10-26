@@ -134,3 +134,29 @@ class StageMarkTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HealthTest(unittest.TestCase):
+    """Когда приложение считается живым: при выкатке и при проверке сайтов."""
+
+    def ok(self, code, path):
+        r = subprocess.run(["bash", "-c", 'source "$1"; health_ok "$2" "$3"', "bash", LIB, code, path], capture_output=True)
+        return r.returncode == 0
+
+    def test_home_page_needs_any_answer_but_5xx(self):
+        for code, want in (("200", True), ("301", True), ("401", True), ("404", True), ("500", False), ("000", False)):
+            self.assertEqual(self.ok(code, ""), want, code)
+
+    def test_health_path_needs_success(self):
+        for code, want in (("200", True), ("204", True), ("302", True), ("401", False), ("404", False), ("503", False), ("000", False)):
+            self.assertEqual(self.ok(code, "/healthz"), want, code)
+
+    def test_release_health(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rel = os.path.join(tmp, "abc")
+            script = 'source "$1"; printf "[%s]" "$(release_health "$2")"'
+            run = lambda: subprocess.run(["bash", "-c", script, "bash", LIB, rel], capture_output=True, text=True).stdout
+            self.assertEqual(run(), "[]", "релиз без файла — собран до run.health, проверяется главная")
+            with open(rel + ".health", "w") as f:
+                f.write("/healthz")
+            self.assertEqual(run(), "[/healthz]")

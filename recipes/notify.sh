@@ -38,7 +38,9 @@ EOF
 }
 
 # Агент выполняет команды из дашборда. Служба перезапускается только при изменении
-# юнита: перезапуск убил бы идущую выкатку, а новый agent.sh агент подхватит сам.
+# юнита: перезапуск убил бы идущую выкатку, а новый agent.sh агент подхватит сам. При
+# обновлении (AIRLOK_DEFER_AGENT_RESTART) её запускает сам агент: перезапуск отсюда оборвал
+# бы его до отчёта в дашборд.
 install_agent() {
 	local changed=no
 	write_if_changed /etc/systemd/system/airlok-agent.service 0644 <<EOF && changed=yes
@@ -59,7 +61,9 @@ WantedBy=multi-user.target
 EOF
 	[[ $changed == yes ]] && systemctl daemon-reload
 	systemctl enable airlok-agent.service >/dev/null 2>&1
-	if [[ $changed == yes ]]; then
+	if [[ $changed == yes && -n ${AIRLOK_DEFER_AGENT_RESTART:-} ]]; then
+		touch "$AGENT_RESTART_FLAG"
+	elif [[ $changed == yes ]]; then
 		systemctl restart airlok-agent.service
 	else
 		systemctl start airlok-agent.service

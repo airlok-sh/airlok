@@ -23,6 +23,9 @@ die() {
 
 TELEGRAM_CONF=/etc/airlok/telegram.env
 DASHBOARD_CONF=/etc/airlok/dashboard.env
+# Флаг «служба агента изменилась»: при обновлении её перезапускает сам агент, уже
+# отправив итог в дашборд.
+AGENT_RESTART_FLAG=/run/airlok-agent/restart
 # Настройки сервера, выбранные при установке: Let's Encrypt и т. п.
 SERVER_CONF=/etc/airlok/server.env
 

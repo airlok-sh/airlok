@@ -2,8 +2,9 @@
 # Агент: забирает команды из дашборда долгим опросом и выполняет их по одной.
 #
 # Работает службой airlok-agent от root, потому что деплою нужны его права. Умеет только
-# выкатить коммит из GitHub: произвольную команду дашборд прислать не может, а каждое
-# поле команды проверяется здесь заново — значения доходят до команд от root.
+# выкатить коммит из GitHub и обновиться сам, когда это подтвердил человек в дашборде:
+# произвольную команду дашборд прислать не может, а каждое поле команды проверяется здесь
+# заново — значения доходят до команд от root.
 # Сервер сам ходит в дашборд, входящих соединений агент не принимает.
 
 source "$(dirname "$0")/lib.sh"
@@ -14,12 +15,14 @@ WAIT=25
 RUN_DIR=/run/airlok-agent
 STATE_DIR=/var/lib/airlok/agent
 DEPLOY_TIMEOUT=3600
+UPDATE_TIMEOUT=1800
 
 SELF=$(readlink -f "$0")
 SELF_INODE=$(stat -c %i "$SELF" 2>/dev/null)
 
 # Разбор команды. Поля выводятся через NUL в фиксированном порядке и в shell не
-# исполняются; первое поле — ok или bad, второе — id команды (если его удалось понять).
+# исполняются; первое поле — ok или bad, второе — id команды (если его удалось понять),
+# третье у ok — вид команды.
 PARSE_PY='
 import json, re, sys
 
@@ -50,6 +53,8 @@ cid = cmd.get("id")
 if not isinstance(cid, str) or not UUID.match(cid):
     emit("bad", "", "у команды нет корректного id")
 kind = cmd.get("kind")
+if kind == "update":
+    emit("ok", cid, "update")
 if kind != "deploy":
     emit("bad", cid, "агент не умеет выполнять команду %r: обновите рецепты на сервере" % str(kind)[:40])
 d = cmd.get("deploy")
@@ -81,7 +86,7 @@ if root and not all(SEGMENT.match(s) for s in root.split("/")):
     emit("bad", cid, "некорректный каталог в репозитории")
 if token and not TOKEN.match(token):
     emit("bad", cid, "некорректный токен GitHub")
-emit("ok", cid, app, repo, sha, ref, root, " ".join(title.split())[:200], token)
+emit("ok", cid, "deploy", app, repo, sha, ref, root, " ".join(title.split())[:200], token)
 '
 
 # Итог команды в JSON: сообщение — строка «Ошибка: …» или «Готово: …» из вывода,
@@ -105,7 +110,7 @@ if not message:
             message = line[len("Ошибка:"):].strip() if status == "failed" else line.strip()
             break
 if not message and status == "failed":
-    message = "выкатка завершилась с ошибкой, подробности в журнале"
+    message = "команда завершилась с ошибкой, подробности в журнале"
 tail = log.encode()[-32768:].decode("utf-8", "ignore")
 print(json.dumps({"status": status, "message": message[:2000], "log": tail}, ensure_ascii=False))
 '
@@ -154,6 +159,34 @@ run_deploy() {
 	fi
 }
 
+# run_update — обновление агента, которое человек подтвердил в дашборде. После отчёта агент
+# перезапускается: так он продолжит на новом коде, даже если сам agent.sh не менялся.
+run_update() {
+	local id=$1 log=$STATE_DIR/command.log rc message=""
+	echo "команда ${id}: обновление агента"
+	install -m 600 /dev/null "$log"
+	timeout --kill-after=60 "$UPDATE_TIMEOUT" "$RECIPES_DIR/update.sh" </dev/null >"$log" 2>&1
+	rc=$?
+	if ((rc == 124 || rc == 137)); then
+		message="обновление не уложилось в $((UPDATE_TIMEOUT / 60)) минут и было остановлено"
+	fi
+	if ((rc != 0)); then
+		send_result "$id" failed "$message" "$log"
+		return
+	fi
+	send_result "$id" success "$message" "$log"
+	if [[ -e $AGENT_RESTART_FLAG ]]; then
+		rm -f "$AGENT_RESTART_FLAG"
+		echo "служба агента изменилась, перезапуск"
+		systemctl restart --no-block airlok-agent.service
+		# Ждём, пока systemd остановит этот процесс: старый код не должен взять новую команду.
+		sleep 60
+		return
+	fi
+	echo "агент обновлён, перезапуск на новом коде"
+	exec "$SELF"
+}
+
 handle() {
 	local f=()
 	mapfile -d '' -t f < <(python3 -c "$PARSE_PY" <"$1")
@@ -163,7 +196,10 @@ handle() {
 		[[ -n ${f[1]:-} ]] && send_result "${f[1]}" failed "${f[2]:-}"
 		return
 	fi
-	run_deploy "${f[@]:1}"
+	case ${f[2]:-} in
+	update) run_update "${f[1]}" ;;
+	*) run_deploy "${f[1]}" "${f[@]:3}" ;;
+	esac
 }
 
 main() {

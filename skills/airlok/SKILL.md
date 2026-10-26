@@ -164,7 +164,8 @@ env:
   SENTRY_AUTH_TOKEN: { secret: true, build: true, required: false }   # нужна и сборке
 ```
 
-Только на хостинге: `app.stack: docker` и `build.dockerfile`, `capabilities.cron`. Только на своём сервере: `app.domain`
+Только на хостинге: `app.stack: docker`, `build.dockerfile` и `capabilities.cron`. Свой сервер Dockerfile не читает и
+собирает проект по его файлам (`go.mod`, `package.json`…) — это не ошибка; не пройдёт только явный `app.stack: docker`. Только на своём сервере: `app.domain`
 (домен сайта) и `resources.memory_mb` (память контейнера, 128–8192, по умолчанию 512).
 
 Веб-приложение слушает `0.0.0.0` и порт из переменной `PORT` (8080). Файловая система, кроме `UPLOAD_DIR`, после

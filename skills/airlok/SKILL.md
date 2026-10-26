@@ -85,13 +85,13 @@ CLI сам пропускает `node_modules`, `.git`, `.env*` и сборки,
 
 ## airlok.yml — когда определения по файлам не хватает
 
-Файл необязателен: стек (Next.js, Node, Python, статика, Dockerfile, боты) определяется сам. Нужен для базы, загрузок,
+Файл необязателен: стек (Next.js, Node, Python, Go, статика, Dockerfile, боты) определяется сам. Нужен для базы, загрузок,
 задач по расписанию и обязательных переменных. Кладётся в корень проекта.
 
 ```yaml
 version: 1
 app:
-  stack: python          # static, nextjs, node, python — если определилось не то
+  stack: python          # static, nextjs, node, python, go, docker — если определилось не то
   type: worker           # бот или воркер без сайта; по умолчанию web
 build:
   command: npm run build:prod
@@ -102,6 +102,7 @@ run:
 runtime:
   node: "22"             # 20, 22, 24
   python: "3.12"         # 3.10–3.14
+  go: "1.27"             # 1.25–1.27, по умолчанию из директивы go в go.mod
 capabilities:
   database:
     enabled: true        # PostgreSQL, адрес — в DATABASE_URL

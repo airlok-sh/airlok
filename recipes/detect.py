@@ -13,9 +13,13 @@ import sys
 
 DEFAULT_NODE = "22"
 DEFAULT_PYTHON = "3.12"
+DEFAULT_GO = "1.27"
 NODE_VERSIONS = ["20", "22", "24"]
 PYTHON_VERSIONS = ["3.10", "3.11", "3.12", "3.13", "3.14"]
-STACKS = ("static", "nextjs", "node", "python")
+GO_VERSIONS = ["1.25", "1.26", "1.27"]
+STACKS = ("static", "nextjs", "node", "python", "go")
+# Куда сборка кладёт программу Go-приложения.
+GO_BINARY = ".airlok/app"
 
 # Статические сайты: зависимость сборщика → куда он кладёт готовый сайт.
 STATIC_BUILDERS = [
@@ -31,6 +35,13 @@ STATIC_BUILDERS = [
 # Боты на long polling: без веб-фреймворка такое приложение — фоновое.
 NODE_BOTS = ["telegraf", "grammy", "node-telegram-bot-api", "discord.js", "vk-io"]
 PYTHON_BOTS = ["aiogram", "python-telegram-bot", "pytelegrambotapi", "telethon", "pyrogram", "discord.py", "vkbottle"]
+GO_BOTS = ["github.com/go-telegram-bot-api/telegram-bot-api", "gopkg.in/telebot", "gopkg.in/tucnak/telebot", "github.com/go-telegram/bot",
+           "github.com/mymmrac/telego", "github.com/PaulSonOfLars/gotgbot", "github.com/NicoNex/echotron", "github.com/bwmarrin/discordgo",
+           "github.com/SevereCloud/vksdk"]
+GO_SERVERS = [
+    ("github.com/gin-gonic/gin", "Gin"), ("github.com/labstack/echo", "Echo"), ("github.com/gofiber/fiber", "Fiber"),
+    ("github.com/go-chi/chi", "chi"), ("github.com/gorilla/mux", "Gorilla"), ("github.com/valyala/fasthttp", "fasthttp"),
+]
 NODE_SERVERS = [
     ("@nestjs/core", "NestJS"), ("express", "Express"), ("fastify", "Fastify"), ("koa", "Koa"),
     ("hono", "Hono"), ("@hapi/hapi", "Hapi"), ("@adonisjs/core", "AdonisJS"), ("@remix-run/serve", "Remix"),
@@ -42,6 +53,8 @@ MAJOR = re.compile(r"\d+(\.\d+)?")
 # Ограничение версии Python из [project] в pyproject.toml.
 REQUIRES_PYTHON = re.compile(r"""^\s*requires-python\s*=\s*["']([^"']+)["']""", re.M)
 SPEC_CLAUSE = re.compile(r"^(>=|<=|==|!=|~=|>|<)\s*(\d+)(?:\.(\d+))?")
+GO_DIRECTIVE = re.compile(r"^go\s+(\d+\.\d+)", re.M)
+GO_PACKAGE_MAIN = re.compile(r"^package\s+main\s*$", re.M)
 
 NPM_INSTALL = ("if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; "
                "elif [ -f pnpm-lock.yaml ]; then npx --yes pnpm@9 install --frozen-lockfile; "
@@ -89,28 +102,30 @@ def load_package(root):
     return Package(data)
 
 
-def detect(root, stack="", kind="", build_command="", build_output="", run_command="", node="", python=""):
+def detect(root, stack="", kind="", build_command="", build_output="", run_command="", node="", python="", go=""):
     """План сборки: то, что задано в airlok.yml, плюс найденное по файлам проекта."""
     pkg = load_package(root)
     py_deps = "\n".join(read_text(root, f) for f in ("requirements.txt", "pyproject.toml", "Pipfile")).lower()
     is_python = any(exists(root, f) for f in ("requirements.txt", "pyproject.toml", "Pipfile"))
 
-    plan = {"stack": stack, "framework": "", "kind": kind, "node": "", "python": "",
+    plan = {"stack": stack, "framework": "", "kind": kind, "node": "", "python": "", "go": "",
             "install": "", "build": "", "output": "", "start": ""}
     if not plan["stack"]:
         plan["stack"], plan["framework"] = guess_stack(root, pkg, is_python)
         if not plan["stack"]:
-            raise DetectError("не удалось понять, что это за проект: нет package.json, requirements.txt, pyproject.toml "
-                              "или index.html. Укажите стек в airlok.yml (app.stack: static, nextjs, node или python) "
+            raise DetectError("не удалось понять, что это за проект: нет package.json, requirements.txt, pyproject.toml, "
+                              "go.mod или index.html. Укажите стек в airlok.yml (app.stack: static, nextjs, node, python или go) "
                               "или каталог проекта внутри репозитория")
 
     if plan["stack"] in ("static", "nextjs", "node"):
         plan["node"] = node_version(root, node, pkg)
     elif plan["stack"] == "python":
         plan["python"] = python_version(root, python)
+    elif plan["stack"] == "go":
+        plan["go"] = go_version(root, go)
 
     if plan["kind"] == "worker" and plan["stack"] in ("static", "nextjs"):
-        raise DetectError("фоновым (app.type: worker) может быть только Node- или Python-приложение")
+        raise DetectError("фоновым (app.type: worker) может быть только Node-, Python- или Go-приложение")
     if plan["stack"] == "static":
         plan["kind"] = "web"
         return plan_static(pkg, build_command, build_output, plan)
@@ -124,10 +139,15 @@ def detect(root, stack="", kind="", build_command="", build_output="", run_comma
         return plan_node(root, pkg, build_command, run_command, plan)
     if plan["stack"] == "python":
         return plan_python(root, py_deps, run_command, plan)
+    if plan["stack"] == "go":
+        return plan_go(root, build_command, run_command, plan)
     raise DetectError(f"неизвестный стек {plan['stack']!r}")
 
 
 def guess_stack(root, pkg, is_python):
+    # go.mod в корне — Go-приложение, даже если рядом package.json для сборки стилей или фронтенда.
+    if exists(root, "go.mod"):
+        return "go", ""
     if pkg is not None:
         if pkg.has("next"):
             return "nextjs", "Next.js"
@@ -287,6 +307,81 @@ def plan_python(root, deps, run_command, plan):
     return plan
 
 
+def plan_go(root, build_command, run_command, plan):
+    mod = read_text(root, "go.mod")
+    if not mod:
+        raise DetectError("для Go-приложения нужен go.mod")
+    # С vendor/ зависимости уже в репозитории, без go.sum их нет вовсе.
+    if not exists(root, "vendor/modules.txt") and exists(root, "go.sum"):
+        plan["install"] = "go mod download"
+    plan["build"], start = build_command, run_command
+    if not plan["build"]:
+        plan["build"] = f"mkdir -p .airlok && go build -trimpath -ldflags='-s -w' -o {GO_BINARY} {go_main_package(root)}"
+        start = start or "/app/" + GO_BINARY
+    if not start:
+        raise DetectError("со своей build.command укажите и run.command в airlok.yml: рецепт не знает, куда она кладёт программу")
+    plan["start"] = start
+    server = next((name for dep, name in GO_SERVERS if go_dep(mod, dep)), "")
+    plan["framework"] = server
+    if not plan["kind"]:
+        plan["kind"] = "web"
+        # net/http из стандартной библиотеки по go.mod не видно, поэтому бот с вебхуком без
+        # фреймворка задаёт app.type: web сам.
+        bot = next((b for b in GO_BOTS if go_dep(mod, b)), "")
+        if bot and not server:
+            plan["kind"], plan["framework"] = "worker", f"бот ({bot})"
+    plan["framework"] = plan["framework"] or "Go"
+    return plan
+
+
+def go_dep(mod, dep):
+    """Есть ли модуль в require go.mod. Сравнивается префикс пути: у модулей бывают суффиксы
+    мажорной версии (/v5) и разные пути одной библиотеки (gopkg.in/telebot.v3)."""
+    return re.search(r"^(?:require)?\s+" + re.escape(dep) + r"[./\s]", mod, re.M) is not None
+
+
+def go_main_package(root):
+    """Какой пакет собирать: корень проекта или единственный cmd/*."""
+    if is_go_main(root, "."):
+        return "."
+    try:
+        names = sorted(os.listdir(os.path.join(root, "cmd")))
+    except OSError:
+        names = []
+    mains = ["./cmd/" + n for n in names if SEGMENT.match(n) and is_go_main(root, "cmd/" + n)]
+    if not mains:
+        raise DetectError("не нашли package main ни в корне, ни в cmd/*: укажите build.command и run.command в airlok.yml")
+    if len(mains) > 1:
+        raise DetectError(f"в проекте несколько программ ({', '.join(mains)}): укажите нужную в build.command и run.command "
+                          f"в airlok.yml, например go build -o .airlok/app {mains[0]} и /app/.airlok/app")
+    return mains[0]
+
+
+def is_go_main(root, pkg):
+    path = os.path.join(root, pkg)
+    if not os.path.isdir(path):
+        return False
+    return any(n.endswith(".go") and not n.endswith("_test.go") and os.path.isfile(os.path.join(path, n))
+               and GO_PACKAGE_MAIN.search(read_text(path, n)) for n in os.listdir(path))
+
+
+def go_version(root, wanted):
+    """Версия из директивы go в go.mod: это наименьшая подходящая версия, а новые сборщики
+    собирают и старый код, поэтому слишком старая директива получает последнюю версию."""
+    if wanted:
+        if wanted not in GO_VERSIONS:
+            raise DetectError(f"runtime.go — одна из версий {', '.join(GO_VERSIONS)}")
+        return wanted
+    m = GO_DIRECTIVE.search(read_text(root, "go.mod"))
+    if m is None:
+        return DEFAULT_GO
+    if m.group(1) in GO_VERSIONS:
+        return m.group(1)
+    if tuple(map(int, m.group(1).split("."))) > tuple(map(int, GO_VERSIONS[-1].split("."))):
+        raise DetectError(f"go.mod требует Go {m.group(1)}, а поддерживаются {GO_VERSIONS[0]}–{GO_VERSIONS[-1]}")
+    return DEFAULT_GO
+
+
 def node_version(root, wanted, pkg):
     if wanted:
         if wanted not in NODE_VERSIONS:
@@ -339,7 +434,7 @@ def fits_python(version, spec):
 
 def subprojects(root):
     """Подкаталоги, похожие на отдельные проекты: в монорепозитории приложение не в корне."""
-    markers = ("package.json", "requirements.txt", "pyproject.toml", "index.html")
+    markers = ("package.json", "requirements.txt", "pyproject.toml", "go.mod", "index.html")
     try:
         names = sorted(os.listdir(root))
     except OSError:

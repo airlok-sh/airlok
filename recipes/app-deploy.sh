@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Песочница и деплой приложения: по airlok.yml из корня проекта, а без него — по файлам
-# проекта (Next.js, Node, Python, статика), как на хостинге airlok.
+# проекта (Next.js, Node, Python, Go, статика), как на хостинге airlok.
 #
 #   app-deploy.sh /путь/к/проекту
 #
@@ -154,6 +154,9 @@ prepare_release() {
 images() {
 	case $APP_STACK in
 	python) BUILD_IMAGE=python:${PYTHON_VERSION}-slim-bookworm RUN_IMAGE=$BUILD_IMAGE ;;
+	# Программа запускается в том же образе: он уже скачан для сборки, в нём корневые
+	# сертификаты для HTTPS и та же glibc, с которой собиралась программа с cgo.
+	go) BUILD_IMAGE=golang:${GO_VERSION}-bookworm RUN_IMAGE=$BUILD_IMAGE ;;
 	static) BUILD_IMAGE=node:${NODE_VERSION}-bookworm-slim RUN_IMAGE=$STATIC_IMAGE ;;
 	*) BUILD_IMAGE=node:${NODE_VERSION}-bookworm-slim RUN_IMAGE=$BUILD_IMAGE ;;
 	esac

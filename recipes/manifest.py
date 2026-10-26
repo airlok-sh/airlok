@@ -90,7 +90,7 @@ def parse(data, root):
         raise ManifestError("build.output: каталог внутри проекта, например dist")
     run = section(data, "run")
     runtime = section(data, "runtime")
-    versions = {k: str(runtime.get(k, "")) for k in ("node", "python")}
+    versions = {k: str(runtime.get(k, "")) for k in ("node", "python", "go")}
     try:
         plan = detect(root, stack=stack, kind=kind, build_command=command(build, "command", "build.command"),
                       build_output=output, run_command=command(run, "command", "run.command"), **versions)
@@ -138,6 +138,7 @@ def parse(data, root):
         "APP_DOMAIN": domain,
         "NODE_VERSION": plan["node"],
         "PYTHON_VERSION": plan["python"],
+        "GO_VERSION": plan["go"],
         "BUILD_INSTALL": plan["install"],
         "BUILD_CMD": plan["build"],
         "BUILD_OUTPUT": plan["output"],

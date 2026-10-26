@@ -25,7 +25,7 @@ version: 1
 app:
   name: shop
   domain: shop.example.ru
-  stack: python          # static, nextjs, node или python — если определилось не то
+  stack: python          # static, nextjs, node, python или go — если определилось не то
   type: web              # worker — бот или воркер без сайта
 build:
   command: npm run build:prod

@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "recipes"))
 
-from detect import DEFAULT_NODE, DEFAULT_PYTHON, NPM_INSTALL, DetectError, detect, static_output  # noqa: E402
+from detect import DEFAULT_GO, DEFAULT_NODE, DEFAULT_PYTHON, NPM_INSTALL, DetectError, detect, static_output  # noqa: E402
 from manifest import ManifestError, parse  # noqa: E402
 
 
@@ -60,6 +60,41 @@ class DetectTest(unittest.TestCase):
         self.check({"requirements.txt": "aiogram==3\n", "bot.py": ""},
                    kind="worker", framework="бот (aiogram)", start="python bot.py", python=DEFAULT_PYTHON)
 
+    def test_go(self):
+        build = "mkdir -p .airlok && go build -trimpath -ldflags='-s -w' -o .airlok/app "
+        # Как PonchesDev/favicon-uploader: программа в cmd/, рядом Dockerfile и тесты.
+        self.check({"go.mod": "module favicon-uploader\n\ngo 1.27.0\n\nrequire (\n\tgo.uber.org/zap v1.28.0\n)\n", "go.sum": "",
+                    "Dockerfile": "FROM golang:1.27-alpine\n", "cmd/uploader/main.go": "package main\n",
+                    "internal/config/config.go": "package config\n", "internal/config/config_test.go": "package config\n"},
+                   stack="go", framework="Go", kind="web", go="1.27", install="go mod download",
+                   build=build + "./cmd/uploader", start="/app/.airlok/app")
+        self.check({"go.mod": "module shop\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.10.0\n", "main.go": "package main\n",
+                    "package.json": '{"devDependencies":{"vite":"6"}}'},
+                   stack="go", framework="Gin", go=DEFAULT_GO, install="", build=build + ".")
+        self.check({"go.mod": "module bot\n\ngo 1.26\n\nrequire gopkg.in/telebot.v4 v4.0.0\n", "go.sum": "", "vendor/modules.txt": "",
+                    "bot.go": "package main\n"},
+                   kind="worker", framework="бот (gopkg.in/telebot)", go="1.26", install="")
+        self.check({"go.mod": "module bot\n\ngo 1.27\n\nrequire (\n\tgithub.com/go-telegram-bot-api/telegram-bot-api/v5 v5.5.1\n"
+                              "\tgithub.com/labstack/echo/v4 v4.12.0\n)\n", "main.go": "package main\n"},
+                   kind="web", framework="Echo")
+        plan = detect(project({"go.mod": "module x\n\ngo 1.27\n"}), build_command="go build -o bin/srv ./srv",
+                      run_command="./bin/srv", go="1.25")
+        self.assertEqual((plan["build"], plan["start"], plan["go"]), ("go build -o bin/srv ./srv", "./bin/srv", "1.25"))
+
+    def test_go_errors(self):
+        for files, want in (({"go.mod": "module x\n\ngo 1.30\n", "main.go": "package main\n"}, "требует Go 1.30"),
+                            ({"go.mod": "module x\n", "x.go": "package x\n", "x_test.go": "package main\n"}, "package main"),
+                            ({"go.mod": "module x\n", "cmd/api/main.go": "package main\n", "cmd/worker/main.go": "package main\n"},
+                             "./cmd/api, ./cmd/worker")):
+            with self.assertRaisesRegex(DetectError, want.replace(".", "\\.")):
+                detect(project(files))
+        with self.assertRaisesRegex(DetectError, "run.command"):
+            detect(project({"go.mod": "module x\n"}), build_command="go build ./...")
+        with self.assertRaisesRegex(DetectError, "runtime.go"):
+            detect(project({"go.mod": "module x\n", "main.go": "package main\n"}), go="1.20")
+        with self.assertRaisesRegex(DetectError, "go.mod"):
+            detect(project({"main.go": "package main\n"}), stack="go")
+
     def test_errors(self):
         for files in ({"README.md": "# hi"}, {"requirements.txt": "requests\n", "main.py": ""},
                       {"package.json": '{"dependencies":{"lodash":"4"}}'}):
@@ -93,6 +128,8 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(values["APP_NAME"], "", "имя даст дашборд или папка проекта")
         self.assertEqual(values["APP_DOMAIN"], "", "адрес выдаст рецепт")
         self.assertEqual((values["DB_ENABLED"], values["UPLOADS_ENABLED"]), (0, 0))
+        values = parse({"version": 1, "runtime": {"go": "1.26"}}, project({"go.mod": "module x\n", "main.go": "package main\n"}))
+        self.assertEqual((values["APP_STACK"], values["GO_VERSION"]), ("go", "1.26"))
 
     def test_manifest_overrides_detection(self):
         values = parse({"version": 1, "app": {"name": "shop", "stack": "node", "domain": "Shop.Example.ru"},

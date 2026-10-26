@@ -160,6 +160,7 @@ deploy() {
 		[[ $root =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$ ]] ||
 			die "некорректный каталог в репозитории: ${root}"
 	fi
+	stage source "${REPO} · ${ref:0:7}"
 	fetch "$branch"
 	# Коммит мог уйти из ветки (force push) или быть в другой — GitHub отдаёт его и по хешу.
 	if https_mode && [[ $ref =~ ^[0-9a-f]{40}$ ]] &&

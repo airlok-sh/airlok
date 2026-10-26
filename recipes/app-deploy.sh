@@ -164,23 +164,38 @@ images() {
 	esac
 }
 
+# build_container СКРИПТ ЛОГ — установка зависимостей и сборка в контейнере. Агенту вывод
+# нужен и в общем логе: дашборд показывает его по ходу выкатки. sh -x печатает каждую команду
+# перед запуском: go build и go mod download молчат минутами, а так видно, какой шаг идёт.
+build_container() {
+	# Установка зависимостей выполняет скрипты чужих пакетов, поэтому у сборки нет ни
+	# секретов, ни базы, ни прав: только папка релиза и доступ к реестрам пакетов.
+	local run=(docker run --rm --name "airlok-build-${APP_NAME}"
+		--user "${BUILD_UID}:${BUILD_GID}" --cap-drop ALL --security-opt no-new-privileges
+		--memory 1g --pids-limit 512
+		-e HOME=/tmp -e NEXT_TELEMETRY_DISABLED=1 -e npm_config_cache=/tmp/npm -e PIP_CACHE_DIR=/tmp/pip
+		-e PYTHONDONTWRITEBYTECODE=1
+		-v "${RELEASE}:/app" -w /app "$BUILD_IMAGE" sh -xc "$1")
+	if [[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]]; then
+		"${run[@]}" 2>&1 | tee "$2"
+	else
+		"${run[@]}" >"$2" 2>&1
+	fi
+}
+
 build() {
-	((REUSED)) && return 0
+	if ((REUSED)); then
+		stage_skip build "версия уже собрана"
+		return 0
+	fi
 	step "Сборка: ${APP_FRAMEWORK}"
+	stage build "$APP_FRAMEWORK"
 	local log=${RELEASE}.build.log script
 	script=$BUILD_INSTALL
 	[[ -n $script && -n $BUILD_CMD ]] && script+=" && "
 	script+=$BUILD_CMD
-	# Установка зависимостей выполняет скрипты чужих пакетов, поэтому у сборки нет ни
-	# секретов, ни базы, ни прав: только папка релиза и доступ к реестрам пакетов.
-	if [[ -n $script ]] && ! docker run --rm --name "airlok-build-${APP_NAME}" \
-		--user "${BUILD_UID}:${BUILD_GID}" --cap-drop ALL --security-opt no-new-privileges \
-		--memory 1g --pids-limit 512 \
-		-e HOME=/tmp -e NEXT_TELEMETRY_DISABLED=1 -e npm_config_cache=/tmp/npm -e PIP_CACHE_DIR=/tmp/pip \
-		-e PYTHONDONTWRITEBYTECODE=1 \
-		-v "${RELEASE}:/app" -w /app "$BUILD_IMAGE" sh -c "$script" \
-		>"$log" 2>&1; then
-		tail -30 "$log" >&2
+	if [[ -n $script ]] && ! build_container "$script" "$log"; then
+		[[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]] || tail -30 "$log" >&2
 		local outside
 		outside=$(grep -oE "EACCES: permission denied, [a-z]+ '/[^']*'" "$log" | grep -vE "'/(app|tmp)(/|')" | head -1)
 		if [[ -n $outside ]]; then
@@ -379,6 +394,7 @@ wait_healthy() {
 
 deploy() {
 	step "Запуск"
+	stage start
 	local prev="" log=$APP_DIR/shared/deploy.log
 	[[ -L $APP_DIR/current ]] && prev=$(readlink -f "$APP_DIR/current")
 
@@ -395,6 +411,7 @@ deploy() {
 	# Пересоздаём всегда: папка релиза могла быть пересобрана под тем же коммитом.
 	compose up -d --force-recreate --no-deps app >>"$log" 2>&1 || die "приложение не запустилось, лог: ${log}"
 
+	stage start "ждём, что приложение заработает"
 	if ! wait_healthy; then
 		compose logs --tail 30 app >&2 || true
 		local crashed=0
@@ -431,6 +448,7 @@ le_enabled() { [[ $(conf_value "$SERVER_CONF" LETSENCRYPT) == 1 ]]; }
 
 nginx_site() {
 	step "nginx и HTTPS"
+	stage site "nginx и HTTPS"
 	local ssl=/etc/ssl/airlok cert key le=/etc/letsencrypt/live/${APP_DOMAIN}
 	cert=$ssl/${APP_NAME}.crt
 	key=$ssl/${APP_NAME}.key
@@ -559,6 +577,7 @@ issue_certificate() {
 	le_enabled || return 0
 	[[ -s /etc/letsencrypt/live/${APP_DOMAIN}/fullchain.pem ]] && return 0
 	step "Let's Encrypt"
+	stage site "сертификат Let's Encrypt"
 	if ! command -v certbot >/dev/null; then
 		note "certbot не установлен, сертификат остался самоподписанным: sudo ${RECIPES_DIR}/server-base.sh letsencrypt"
 		return 0

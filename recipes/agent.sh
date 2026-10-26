@@ -16,6 +16,7 @@ RUN_DIR=/run/airlok-agent
 STATE_DIR=/var/lib/airlok/agent
 DEPLOY_TIMEOUT=3600
 UPDATE_TIMEOUT=1800
+PROGRESS_EVERY=3
 
 SELF=$(readlink -f "$0")
 SELF_INODE=$(stat -c %i "$SELF" 2>/dev/null)
@@ -89,20 +90,71 @@ if token and not TOKEN.match(token):
 emit("ok", cid, "deploy", app, repo, sha, ref, root, " ".join(title.split())[:200], token)
 '
 
-# Итог команды в JSON: сообщение — строка «Ошибка: …» или «Готово: …» из вывода,
-# лог — хвост вывода, потому что причина неудачи обычно в последних строках.
-RESULT_PY='
-import json, re, sys
+# Тело запроса к дашборду в JSON: режим progress — хвост лога и этапы идущей выкатки,
+# result — итог. Сообщение итога — строка «Ошибка: …» или «Готово: …» из вывода, лог —
+# хвост вывода, потому что причина неудачи обычно в последних строках. Этапы собираются из
+# отметок рецептов (stage в lib.sh): без отметок их нет, и дашборд оставляет прежние.
+PAYLOAD_PY='
+import datetime, json, re, sys, time
 
-status, message, path = sys.argv[1:4]
-log = ""
-if path:
+KEYS = ("source", "build", "start", "site")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def read(path):
+    if not path:
+        return ""
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            log = f.read()
+            return f.read()
     except OSError:
-        pass
-log = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", log)
+        return ""
+
+
+def stamp(ts):
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def stages(path, status, now):
+    out = [{"key": k, "status": "pending"} for k in KEYS]
+    by_key = {s["key"]: s for s in out}
+    seen = False
+    for line in read(path).splitlines():
+        parts = line.split(" ", 3)
+        if len(parts) < 3 or not parts[0].isdigit() or parts[1] not in by_key or parts[2] not in ("running", "skipped"):
+            continue
+        seen = True
+        ts, cur = stamp(int(parts[0])), by_key[parts[1]]
+        note = " ".join(ANSI.sub("", parts[3] if len(parts) > 3 else "").split())[:200]
+        # Начало этапа закрывает предыдущий: рецепты отмечают только начала.
+        for s in out:
+            if s is not cur and s["status"] == "running":
+                s["status"], s["finished_at"] = "done", ts
+        if parts[2] == "skipped":
+            cur.update(status="skipped", note=note)
+            continue
+        if cur["status"] != "running":
+            cur.update(status="running", started_at=ts)
+        if note:
+            cur["note"] = note
+    if not seen:
+        return None
+    if status != "running":
+        for s in out:
+            if s["status"] == "running":
+                s["status"], s["finished_at"] = ("done" if status == "success" else "failed"), stamp(now)
+            elif s["status"] == "pending" and status == "success":
+                s["status"] = "skipped"
+    return out
+
+
+mode, status, message, log_path, stages_path = sys.argv[1:6]
+log = ANSI.sub("", read(log_path))
+tail = log.encode()[-32768:].decode("utf-8", "ignore")
+st = stages(stages_path, status if mode == "result" else "running", time.time())
+if mode == "progress":
+    print(json.dumps({"log": tail, "stages": st or []}, ensure_ascii=False))
+    sys.exit(0)
 if not message:
     prefix = "Ошибка:" if status == "failed" else "Готово:"
     for line in reversed(log.splitlines()):
@@ -111,15 +163,17 @@ if not message:
             break
 if not message and status == "failed":
     message = "команда завершилась с ошибкой, подробности в журнале"
-tail = log.encode()[-32768:].decode("utf-8", "ignore")
-print(json.dumps({"status": status, "message": message[:2000], "log": tail}, ensure_ascii=False))
+body = {"status": status, "message": message[:2000], "log": tail}
+if st is not None:
+    body["stages"] = st
+print(json.dumps(body, ensure_ascii=False))
 '
 
-# send_result ID STATUS СООБЩЕНИЕ [ЛОГ] — итог важнее скорости: при сбое связи
+# send_result ID STATUS СООБЩЕНИЕ [ЛОГ] [ЭТАПЫ] — итог важнее скорости: при сбое связи
 # повторяем несколько раз, иначе дашборд будет час считать команду выполняющейся.
 send_result() {
-	local id=$1 status=$2 message=$3 log=${4:-} body=$RUN_DIR/result.json code i
-	python3 -c "$RESULT_PY" "$status" "$message" "$log" >"$body" || return
+	local id=$1 status=$2 message=$3 log=${4:-} stages=${5:-} body=$RUN_DIR/result.json code i
+	python3 -c "$PAYLOAD_PY" result "$status" "$message" "$log" "$stages" >"$body" || return
 	for i in 1 2 3 4 5 6; do
 		code=$(dashboard_fetch POST "/agent/v1/commands/${id}/result" /dev/null "@${body}") || code=000
 		case $code in
@@ -137,25 +191,48 @@ send_result() {
 	rm -f "$body"
 }
 
+# stream_progress ID ЛОГ ЭТАПЫ — пока идёт выкатка, шлёт дашборду хвост лога и этапы, когда
+# они меняются: иначе человек минутами смотрит на «Выкатывается» без единой строки.
+# 404 — старый дашборд без этого запроса или выкатка уже закрыта: дальше слать незачем.
+stream_progress() {
+	local id=$1 log=$2 stages=$3 body=$RUN_DIR/progress.json sent="" sum code
+	while sleep "$PROGRESS_EVERY"; do
+		python3 -c "$PAYLOAD_PY" progress running "" "$log" "$stages" >"$body" || continue
+		sum=$(cksum <"$body")
+		[[ $sum == "$sent" ]] && continue
+		code=$(dashboard_fetch POST "/agent/v1/commands/${id}/log" /dev/null "@${body}") || code=000
+		case $code in
+		2??) sent=$sum ;;
+		400 | 404 | 413) break ;;
+		esac
+	done
+}
+
 run_deploy() {
 	local id=$1 app=$2 repo=$3 sha=$4 ref=$5 root=$6 title=$7 token=$8
-	local log=$STATE_DIR/command.log public=0 rc message=""
+	local log=$STATE_DIR/command.log stages=$STATE_DIR/command.stages public=0 rc message="" streamer
 	[[ -z $token ]] && public=1
 	echo "команда ${id}: выкатка ${repo}${root:+/${root}} ${sha:0:12} «${title}» как ${app}"
 	install -m 600 /dev/null "$log"
+	install -m 600 /dev/null "$stages"
+	stream_progress "$id" "$log" "$stages" &
+	streamer=$!
 	# Токен — только в окружении дочернего процесса: в аргументах его было бы видно в ps.
 	AIRLOK_GITHUB_TOKEN=$token AIRLOK_GITHUB_PUBLIC=$public AIRLOK_FETCH_REF=$ref \
-		AIRLOK_ROOT_DIR=$root AIRLOK_APP_NAME=$app \
+		AIRLOK_ROOT_DIR=$root AIRLOK_APP_NAME=$app AIRLOK_STAGE_FILE=$stages AIRLOK_BUILD_OUTPUT=1 \
 		timeout --kill-after=60 "$DEPLOY_TIMEOUT" "$RECIPES_DIR/github-deploy.sh" deploy "$repo" "$sha" \
 		</dev/null >"$log" 2>&1
 	rc=$?
+	kill "$streamer" 2>/dev/null
+	wait "$streamer" 2>/dev/null
+	rm -f "$RUN_DIR/progress.json"
 	if ((rc == 124 || rc == 137)); then
 		message="выкатка не уложилась в $((DEPLOY_TIMEOUT / 60)) минут и была остановлена"
 	fi
 	if ((rc == 0)); then
-		send_result "$id" success "$message" "$log"
+		send_result "$id" success "$message" "$log" "$stages"
 	else
-		send_result "$id" failed "$message" "$log"
+		send_result "$id" failed "$message" "$log" "$stages"
 	fi
 }
 

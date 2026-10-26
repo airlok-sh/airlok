@@ -7,11 +7,15 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 AGENT = os.path.join(os.path.dirname(__file__), "..", "recipes", "agent.sh")
+LIB = os.path.join(os.path.dirname(__file__), "..", "recipes", "lib.sh")
 with open(AGENT, encoding="utf-8") as f:
-    PARSE_PY = re.search(r"PARSE_PY='\n(.*?)\n'\n", f.read(), re.S).group(1)
+    SOURCE = f.read()
+PARSE_PY = re.search(r"PARSE_PY='\n(.*?)\n'\n", SOURCE, re.S).group(1)
+PAYLOAD_PY = re.search(r"PAYLOAD_PY='\n(.*?)\n'\n", SOURCE, re.S).group(1)
 CID = "0192e000-0000-7000-8000-000000000001"
 
 
@@ -37,6 +41,80 @@ class ParseTest(unittest.TestCase):
                     {"id": "not-a-uuid", "kind": "update"},
                     {"id": CID, "kind": "deploy", "deploy": {"app": "shop", "repo": "acme/shop", "sha": "a" * 40, "root_dir": "../etc"}}):
             self.assertEqual(parse(cmd)[0], "bad", cmd)
+
+
+class PayloadTest(unittest.TestCase):
+    """Тело запросов о ходе и итоге выкатки: этапы собираются из отметок рецептов."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = os.path.join(self.tmp.name, "command.log")
+        self.stages = os.path.join(self.tmp.name, "command.stages")
+        with open(self.log, "w", encoding="utf-8") as f:
+            f.write("→ Сборка: Go\n\x1b[31mОшибка:\x1b[0m сборка не удалась\n")
+        open(self.stages, "w").close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def mark(self, *lines):
+        with open(self.stages, "a", encoding="utf-8") as f:
+            f.write("".join(line + "\n" for line in lines))
+
+    def payload(self, mode, status="running", message=""):
+        out = subprocess.run([sys.executable, "-c", PAYLOAD_PY, mode, status, message, self.log, self.stages],
+                             capture_output=True, check=True)
+        return json.loads(out.stdout)
+
+    def test_progress(self):
+        self.assertEqual(self.payload("progress")["stages"], [], "до первой отметки этапов нет")
+        self.mark("1793000000 source running acme/shop · abc1234", "1793000005 build running Go", "1793000009 build running")
+        got = self.payload("progress")
+        self.assertNotIn("\x1b", got["log"])
+        self.assertEqual([s["status"] for s in got["stages"]], ["done", "running", "pending", "pending"])
+        self.assertEqual(got["stages"][0], {"key": "source", "status": "done", "note": "acme/shop · abc1234",
+                                            "started_at": "2026-10-26T07:33:20Z", "finished_at": "2026-10-26T07:33:25Z"})
+        self.assertEqual(got["stages"][1]["note"], "Go", "повторная отметка без пометки её не стирает")
+        self.assertEqual(got["stages"][1]["started_at"], "2026-10-26T07:33:25Z", "и не сдвигает начало")
+
+    def test_failed_result(self):
+        self.mark("1793000000 source running", "1793000005 build running Go")
+        got = self.payload("result", "failed")
+        self.assertEqual(got["message"], "сборка не удалась")
+        self.assertEqual([s["status"] for s in got["stages"]], ["done", "failed", "pending", "pending"])
+        self.assertIn("finished_at", got["stages"][1])
+
+    def test_success_skips_the_rest(self):
+        self.mark("1793000000 source running", "1793000001 build skipped версия уже собрана", "1793000002 start running",
+                  "garbage", "1793000003 deploy running", "x start running")
+        got = self.payload("result", "success")
+        self.assertEqual([s["status"] for s in got["stages"]], ["done", "skipped", "done", "skipped"],
+                         "у фонового приложения нет сайта, а мусорные строки не считаются")
+        self.assertEqual(got["stages"][1]["note"], "версия уже собрана")
+
+    def test_result_without_marks_keeps_dashboard_stages(self):
+        self.assertNotIn("stages", self.payload("result", "failed", "в команде нет параметров выкатки"))
+        out = subprocess.run([sys.executable, "-c", PAYLOAD_PY, "result", "failed", "отклонена", "", ""],
+                             capture_output=True, check=True)
+        self.assertEqual(json.loads(out.stdout), {"status": "failed", "message": "отклонена", "log": ""})
+
+
+class StageMarkTest(unittest.TestCase):
+    def run_stage(self, env):
+        script = 'source "$1"; stage build "Next.js"; stage_skip site; echo ok'
+        return subprocess.run(["bash", "-c", script, "bash", LIB], env={**os.environ, **env}, capture_output=True, text=True)
+
+    def test_writes_only_for_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "stages")
+            self.assertEqual(self.run_stage({"AIRLOK_STAGE_FILE": path}).stdout, "ok\n")
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            self.assertEqual([line.split(" ", 1)[1] for line in lines], ["build running Next.js", "site skipped "])
+            self.assertTrue(lines[0].split(" ")[0].isdigit())
+        env = {k: v for k, v in os.environ.items() if k != "AIRLOK_STAGE_FILE"}
+        out = subprocess.run(["bash", "-c", 'source "$1"; stage build x; echo ok', "bash", LIB], env=env, capture_output=True, text=True)
+        self.assertEqual(out.stdout, "ok\n", "без агента отметки никуда не пишутся и не роняют рецепт")
 
 
 if __name__ == "__main__":

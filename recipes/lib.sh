@@ -13,6 +13,15 @@ else
 fi
 
 step() { printf '%s→ %s%s\n' "$C_B" "$*" "$C_0"; }
+# stage КЛЮЧ [ПОМЕТКА] и stage_skip КЛЮЧ [ПОМЕТКА] — отметки этапов выкатки для дашборда.
+# Агент передаёт файл в AIRLOK_STAGE_FILE и по нему показывает ход выкатки; без агента
+# отметки никуда не пишутся.
+stage() { stage_mark running "$@"; }
+stage_skip() { stage_mark skipped "$@"; }
+stage_mark() {
+	[[ -n ${AIRLOK_STAGE_FILE:-} ]] || return 0
+	printf '%s %s %s %s\n' "$(date +%s)" "$2" "$1" "${*:3}" >>"$AIRLOK_STAGE_FILE" || true
+}
 ok() { printf '  %s✓%s %s\n' "$C_GRN" "$C_0" "$*"; }
 note() { printf '  %s%s%s\n' "$C_DIM" "$*" "$C_0"; }
 die() {

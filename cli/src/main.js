@@ -204,6 +204,8 @@ function errorText(err) {
   if (err instanceof ApiError) {
     if (err.status === 401) return 'Вход устарел или токен отозван: npx @airlok/cli login'
     if (err.code === 'read_only_token') return 'Этот токен только читает. Войдите заново (npx @airlok/cli login) или задайте токен с правом выкатывать.'
+    if (err.code === 'check_too_large') return 'Проект после распаковки слишком большой для проверки: уберите из папки данные и результаты сборки или добавьте их в .gitignore.'
+    if (err.code === 'archive_too_large') return 'Архив больше 50 МБ: уберите из папки данные и результаты сборки или добавьте их в .gitignore.'
     return err.message
   }
   return `Ошибка: ${err.message}`

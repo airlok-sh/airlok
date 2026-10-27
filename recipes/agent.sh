@@ -2,7 +2,8 @@
 # Агент: забирает команды из дашборда долгим опросом и выполняет их по одной.
 #
 # Работает службой airlok-agent от root, потому что деплою нужны его права. Умеет только
-# выкатить коммит из GitHub и обновиться сам, когда это подтвердил человек в дашборде:
+# выкатить коммит из GitHub, перезапустить выкаченное приложение и обновиться сам, когда это
+# подтвердил человек в дашборде:
 # произвольную команду дашборд прислать не может, а каждое поле команды проверяется здесь
 # заново — значения доходят до команд от root.
 # Сервер сам ходит в дашборд, входящих соединений агент не принимает.
@@ -16,6 +17,7 @@ RUN_DIR=/run/airlok-agent
 STATE_DIR=/var/lib/airlok/agent
 DEPLOY_TIMEOUT=3600
 UPDATE_TIMEOUT=1800
+RESTART_TIMEOUT=600
 PROGRESS_EVERY=3
 # Шифротексты из команды и расшифрованные значения — только на tmpfs и только на время выкатки.
 ENV_JSON=$RUN_DIR/env.json
@@ -27,7 +29,7 @@ SELF_INODE=$(stat -c %i "$SELF" 2>/dev/null)
 # Разбор команды. Поля выводятся через NUL в фиксированном порядке и в shell не
 # исполняются; первое поле — ok или bad, второе — id команды (если его удалось понять),
 # третье у ok — вид команды. Зашифрованные переменные из дашборда пишутся в файл из
-# аргумента, последнее поле выкатки — 1, если они пришли.
+# аргумента, последнее поле выкатки и перезапуска — 1, если они пришли.
 PARSE_PY='
 import json, re, sys
 
@@ -59,9 +61,32 @@ if not isinstance(cmd, dict):
 cid = cmd.get("id")
 if not isinstance(cid, str) or not UUID.match(cid):
     emit("bad", "", "у команды нет корректного id")
+
+
+# save_env — переменные из команды в файл; None — их нет в команде, файл приложения не трогаем.
+def save_env(env):
+    if env is None:
+        return "0"
+    if not isinstance(env, list) or len(env) > 100 or not all(
+            isinstance(v, dict) and isinstance(v.get("name"), str) and ENV_NAME.match(v["name"])
+            and isinstance(v.get("value"), str) and SEALED.match(v["value"]) for v in env):
+        emit("bad", cid, "некорректные переменные окружения в команде")
+    with open(sys.argv[1], "w", encoding="utf-8") as f:
+        json.dump([{"name": v["name"], "value": v["value"]} for v in env], f)
+    return "1"
+
+
 kind = cmd.get("kind")
 if kind == "update":
     emit("ok", cid, "update")
+if kind == "restart":
+    r = cmd.get("restart")
+    if not isinstance(r, dict):
+        emit("bad", cid, "в команде нет параметров перезапуска")
+    app = r.get("app")
+    if not isinstance(app, str) or not NAME.match(app):
+        emit("bad", cid, "некорректное имя приложения")
+    emit("ok", cid, "restart", app, save_env(r.get("env")))
 if kind != "deploy":
     emit("bad", cid, "агент не умеет выполнять команду %r: обновите рецепты на сервере" % str(kind)[:40])
 d = cmd.get("deploy")
@@ -94,15 +119,8 @@ if root and not all(SEGMENT.match(s) for s in root.split("/")):
 if token and not TOKEN.match(token):
     emit("bad", cid, "некорректный токен GitHub")
 # Нет поля — у дашборда нет ключа сервера или он старый: файл переменных не трогаем.
-env = d.get("env")
-if env is not None:
-    if not isinstance(env, list) or len(env) > 100 or not all(
-            isinstance(v, dict) and isinstance(v.get("name"), str) and ENV_NAME.match(v["name"])
-            and isinstance(v.get("value"), str) and SEALED.match(v["value"]) for v in env):
-        emit("bad", cid, "некорректные переменные окружения в команде")
-    with open(sys.argv[1], "w", encoding="utf-8") as f:
-        json.dump([{"name": v["name"], "value": v["value"]} for v in env], f)
-emit("ok", cid, "deploy", app, repo, sha, ref, root, " ".join(title.split())[:200], token, "0" if env is None else "1")
+has_env = save_env(d.get("env"))
+emit("ok", cid, "deploy", app, repo, sha, ref, root, " ".join(title.split())[:200], token, has_env)
 '
 
 # Тело запроса к дашборду в JSON: режим progress — хвост лога и этапы идущей выкатки,
@@ -273,6 +291,35 @@ run_deploy() {
 	fi
 }
 
+# run_restart — перезапуск выкаченного приложения без сборки: с переменными из дашборда, если
+# они пришли.
+run_restart() {
+	local id=$1 app=$2 has_env=$3 log=$STATE_DIR/command.log rc message="" panel=""
+	echo "команда ${id}: перезапуск ${app}"
+	if [[ $has_env == 1 ]]; then
+		if ! open_env "$app"; then
+			send_result "$id" failed "переменные окружения из дашборда: $(head -c 1000 "$RUN_DIR/env.err")"
+			rm -f "$ENV_JSON" "$PANEL_ENV" "$RUN_DIR/env.err"
+			return
+		fi
+		panel=$PANEL_ENV
+	fi
+	rm -f "$ENV_JSON" "$RUN_DIR/env.err"
+	install -m 600 /dev/null "$log"
+	AIRLOK_PANEL_ENV=$panel timeout --kill-after=30 "$RESTART_TIMEOUT" "$RECIPES_DIR/app-restart.sh" "$app" \
+		</dev/null >"$log" 2>&1
+	rc=$?
+	rm -f "$PANEL_ENV"
+	if ((rc == 124 || rc == 137)); then
+		message="перезапуск не уложился в $((RESTART_TIMEOUT / 60)) минут и был остановлен"
+	fi
+	if ((rc == 0)); then
+		send_result "$id" success "$message" "$log"
+	else
+		send_result "$id" failed "$message" "$log"
+	fi
+}
+
 # run_update — обновление агента, которое человек подтвердил в дашборде. После отчёта агент
 # перезапускается: так он продолжит на новом коде, даже если сам agent.sh не менялся.
 run_update() {
@@ -313,6 +360,7 @@ handle() {
 	fi
 	case ${f[2]:-} in
 	update) run_update "${f[1]}" ;;
+	restart) run_restart "${f[1]}" "${f[3]}" "${f[4]}" ;;
 	*) run_deploy "${f[1]}" "${f[@]:3}" ;;
 	esac
 }

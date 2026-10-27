@@ -51,6 +51,18 @@ class ParseTest(unittest.TestCase):
                         [{"name": "A", "value": "v1:QUJD\nB=1"}], [{"name": "A"}]):
                 self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "env": env}}, path)[0], "bad", env)
 
+    def test_restart(self):
+        self.assertEqual(parse({"id": CID, "kind": "restart", "restart": {"app": "shop"}}), ["ok", CID, "restart", "shop", "0"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "env.json")
+            env = [{"name": "API_KEY", "value": "v1:QUJD"}]
+            self.assertEqual(parse({"id": CID, "kind": "restart", "restart": {"app": "shop", "env": env}}, path),
+                             ["ok", CID, "restart", "shop", "1"])
+            with open(path) as f:
+                self.assertEqual(json.load(f), env)
+        for r in (None, {"app": "../shop"}, {"app": "shop; reboot"}, {"app": "shop", "env": [{"name": "A", "value": "plain"}]}):
+            self.assertEqual(parse({"id": CID, "kind": "restart", "restart": r})[0], "bad", r)
+
     def test_rejects(self):
         for cmd in ({"id": CID, "kind": "reboot"},
                     {"id": "not-a-uuid", "kind": "update"},

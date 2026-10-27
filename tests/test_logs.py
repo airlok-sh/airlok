@@ -195,9 +195,16 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(sorted(s[1] for s in started), ["c2", "c3", "c4"])
 
         started.clear()
+        followers["c3"].after = 900
         logs.reconcile(set(), {"c3": ("shop", "app")}, followers, positions, start)
         self.assertEqual(followers, {}, "логи выключили — читать перестаём")
         self.assertEqual(started, [])
+        self.assertEqual(positions["c3"], 900, "пока дашборд не ответил, место не трогаем")
+
+        logs.reconcile(set(), {"c3": ("shop", "app")}, followers, positions, start, off_since=5000)
+        self.assertEqual(positions["c3"], 5000, "выключено — место сдвигается на сейчас")
+        logs.reconcile({"shop"}, {"c3": ("shop", "app")}, followers, positions, start, off_since=6000)
+        self.assertEqual(started, [("shop", "c3", "app", 5000)], "после включения вывод за выключенное время не досылается")
 
     def test_prune_positions(self):
         now = 10 * logs.KEEP_POSITION_NS

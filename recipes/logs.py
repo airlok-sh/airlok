@@ -130,10 +130,10 @@ class Buffer:
             ts = now_rfc3339()
             for app, n in self.skipped.items():
                 self._push({"app": app, "ts": ts, "stream": "system",
-                            "line": "airlok: пропущено строк вывода: %d — приложение пишет больше %d строк в секунду" % (n, RATE)})
+                            "line": "пропущено строк вывода: %d — приложение пишет больше %d строк в секунду" % (n, RATE)})
             for app, n in self.lost.items():
                 self._push({"app": app, "ts": ts, "stream": "system",
-                            "line": "airlok: дашборд был недоступен, не сохранилось строк вывода: %d" % n})
+                            "line": "дашборд был недоступен, не сохранилось строк вывода: %d" % n})
             self.skipped.clear()
             self.lost.clear()
             batch, size = [], 0
@@ -227,9 +227,14 @@ def running_containers():
     return found
 
 
-def reconcile(apps, running, followers, positions, start):
+def reconcile(apps, running, followers, positions, start, off_since=None):
     """Следит ровно за работающими контейнерами приложений из apps: лишних останавливает,
-    новых и упавших (контейнер перезапустился) запускает с места, где остановились."""
+    новых и упавших (контейнер перезапустился) запускает с места, где остановились.
+
+    off_since — текущее время, когда дашборд уже ответил, какие приложения собирать: у
+    контейнеров с выключенными логами место сдвигается на него, чтобы после включения не
+    досылать вывод за время, когда сбор был выключен. До первого ответа место не трогаем:
+    иначе перезапуск службы терял бы вывод за время перезапуска."""
     for cid in list(followers):
         f = followers[cid]
         if cid not in running or running[cid][0] not in apps or not f.alive():
@@ -237,7 +242,10 @@ def reconcile(apps, running, followers, positions, start):
             positions[cid] = f.position() or positions.get(cid, 0)
             del followers[cid]
     for cid, (app, service) in running.items():
-        if app in apps and cid not in followers:
+        if app not in apps:
+            if off_since is not None:
+                positions[cid] = off_since
+        elif cid not in followers:
             followers[cid] = start(app, cid, service, positions.get(cid, 0))
 
 
@@ -294,6 +302,8 @@ def main():
     buf = Buffer()
     followers = {}
     apps, live = set(), set()
+    # Дашборд ещё не ответил, какие приложения собирать: пустой apps значит «не знаем».
+    apps_known = False
     dash = None
     next_scan = next_send = next_save = 0.0
     backoff = 0.0
@@ -312,7 +322,7 @@ def main():
         if now >= next_scan:
             running = running_containers()
             if running is not None:
-                reconcile(apps, running, followers, positions, start)
+                reconcile(apps, running, followers, positions, start, time.time_ns() if apps_known else None)
             next_scan = now + SCAN_EVERY
         if now >= next_save:
             for cid, f in followers.items():
@@ -328,12 +338,14 @@ def main():
                 if parsed[0] != apps:
                     next_scan = 0.0
                 apps, live = parsed
+                apps_known = True
                 backoff = 0.0
                 every = LIVE_EVERY if live else IDLE_EVERY
                 # Накопилось больше пачки — досылаем сразу, не ждём следующего тика.
                 next_send = now + (0 if len(buf) >= MAX_BATCH else every)
             elif code == 404:
                 apps, live = set(), set()
+                apps_known = True
                 next_scan = 0.0
                 next_send = now + OLD_DASHBOARD_WAIT
             elif code in (400, 413):

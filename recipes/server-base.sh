@@ -214,6 +214,11 @@ EOF
 		/bin/sh -c "rm -f '$SSH_DROPIN' && systemctl reload ssh"
 	systemctl reload ssh
 	ok "вход по паролю выключен, root входит только по ключу"
+	# airlok CLI проверяет вход по ключу сам, новым SSH-соединением, и сам подтверждает.
+	if [[ ${AIRLOK_SSH_CONFIRM:-} == cli ]]; then
+		printf '  вход по ключу проверит и подтвердит airlok CLI; без подтверждения за %d секунд настройки SSH вернутся сами\n' "$SSH_ROLLBACK_SECONDS"
+		return
+	fi
 	printf '\n  %sПроверьте вход по ключу в НОВОМ окне терминала, не закрывая это.%s\n' "$C_B" "$C_0"
 	printf '  Если вход работает, выполните: %s confirm-ssh\n' "$0"
 	printf '  Если не подтвердить за %d секунд, настройки SSH вернутся сами.\n' "$SSH_ROLLBACK_SECONDS"

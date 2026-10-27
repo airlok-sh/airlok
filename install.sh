@@ -12,6 +12,9 @@
 # Токен приходит через stdin, а не аргументом: аргументы видны в ps и остаются в истории.
 # Сам скрипт поэтому передаётся через bash -c, а не через конвейер в bash.
 # AIRLOK_REPO — откуда брать рецепты (зеркало или локальный путь) вместо GitHub.
+# AIRLOK_SSH_CONFIRM=cli — установку запустил airlok CLI: вход по ключу он подтвердит сам,
+# просить человека открыть второе окно не нужно. Переменная, а не опция: старый install.sh её
+# просто не заметит, а неизвестную опцию отверг бы.
 
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
@@ -110,7 +113,8 @@ fi
 echo
 "$DIR/recipes/server-base.sh" ssh
 if systemctl is-active --quiet airlok-ssh-rollback.timer; then
-	cat <<EOF
+	# Для CLI server-base.sh уже сказал, что вход подтвердит CLI.
+	[[ ${AIRLOK_SSH_CONFIRM:-} == cli ]] || cat <<EOF
 
   ══════════════════════════════════════════════════════════════════════
    ВАЖНО: вход по паролю выключен. Не закрывайте это окно.

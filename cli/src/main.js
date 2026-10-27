@@ -10,13 +10,14 @@ import { forgetSession, readLink, saveLink, saveSession, session } from './confi
 import { formatReport, normalize } from './check.js'
 import { EnvError, envCommand } from './env.js'
 import { checkFiles, listFiles, pack, PackError } from './pack.js'
+import { serverCommand, ServerError, system } from './server.js'
 import { agents, detect, homePath, onPath, setupAgents, SKILLS } from './setup.js'
 
 const run = promisify(execFile)
 const POLL_MS = 2000
 const FOLLOW_LIMIT_MS = 30 * 60_000
 
-const help = `airlok — выкатка проекта на хостинг airlok из терминала
+const help = `airlok — выкатка проекта на хостинг airlok или свой сервер из терминала
 
   npx @airlok/cli setup             один раз: вход и подключение ИИ-агентов (Claude Code, Codex, Antigravity, Cursor)
   npx @airlok/cli login             войти через браузер
@@ -26,6 +27,7 @@ const help = `airlok — выкатка проекта на хостинг airlo
   npx @airlok/cli env set ИМЯ… --app <имя>      задать: значение спросит без показа на экране или прочитает из stdin
   npx @airlok/cli env set --app <имя> --from .env   задать все переменные из файла
   npx @airlok/cli env rm ИМЯ --app <имя>        удалить
+  npx @airlok/cli server connect root@IP        подключить свой сервер: поставить на него airlok по SSH
   npx @airlok/cli whoami            под кем выполнен вход
   npx @airlok/cli logout            забыть вход на этом компьютере
 
@@ -40,6 +42,16 @@ const help = `airlok — выкатка проекта на хостинг airlo
   --app <имя>       приложение; если имя есть на нескольких серверах — <сервер>/<имя>
   --from <файл>     взять значения из .env-файла (с именами — только эти)
   У приложения на своём сервере значения шифруются здесь, под ключ агента сервера: дашборд их не видит.
+
+Для server connect:
+  --name <имя>      имя сервера в дашборде (по умолчанию — его адрес)
+  --port <порт>     порт SSH, если не 22
+  --letsencrypt     выпускать для сайтов сертификаты Let's Encrypt
+  --email <адрес>   email для писем о сертификатах (включает --letsencrypt)
+  --ssh-keys-only   закрыть вход по паролю: CLI сам проверит вход по ключу и подтвердит
+  --json            итог одной строкой JSON
+  Если сервер ещё не пускает по ключу, CLI создаст ~/.ssh/airlok_ed25519 и положит его на сервер:
+  пароль от сервера спросит ssh, один раз и только в терминале человека.
 
 Для setup:
   --agents <список> каких агентов настроить: claude,codex,antigravity,cursor (по умолчанию — найденных)
@@ -133,7 +145,7 @@ function makeIO(stdin = process.stdin, stdout = process.stdout, stderr = process
   }
 }
 
-export async function main(argv, io = makeIO(), env = process.env) {
+export async function main(argv, io = makeIO(), env = process.env, sys = system) {
   let parsed
   try {
     parsed = parseArgs({
@@ -141,7 +153,8 @@ export async function main(argv, io = makeIO(), env = process.env) {
       allowPositionals: true,
       options: {
         app: { type: 'string' }, new: { type: 'string' }, title: { type: 'string' }, agents: { type: 'string' }, yes: { type: 'boolean', short: 'y' },
-        from: { type: 'string' },
+        from: { type: 'string' }, name: { type: 'string' }, port: { type: 'string' }, email: { type: 'string' },
+        letsencrypt: { type: 'boolean' }, 'ssh-keys-only': { type: 'boolean' },
         'no-wait': { type: 'boolean' }, json: { type: 'boolean' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       },
     })
@@ -186,6 +199,16 @@ export async function main(argv, io = makeIO(), env = process.env) {
         if (!s.token) throw new UserError('Вы не вошли: npx @airlok/cli login (или задайте AIRLOK_TOKEN)')
         return await envCommand(new Api(s.url, s.token), positionals[1], positionals.slice(2), opts, io)
       }
+      case 'server': {
+        let s = await session(env)
+        if (!s.token) {
+          if (!io.interactive) throw new UserError('Вы не вошли: npx @airlok/cli login (или задайте AIRLOK_TOKEN)')
+          await login(io, env)
+          s = await session(env)
+        }
+        const home = env.HOME || env.USERPROFILE || homedir()
+        return await serverCommand(new Api(s.url, s.token), s.url, positionals[1], positionals.slice(2), opts, io, home, sys)
+      }
       default:
         io.err(`Нет такой команды: ${command}\n\n${help}`)
         return 2
@@ -200,7 +223,7 @@ export async function main(argv, io = makeIO(), env = process.env) {
 class UserError extends Error {}
 
 function errorText(err) {
-  if (err instanceof UserError || err instanceof PackError || err instanceof EnvError) return err.message
+  if (err instanceof UserError || err instanceof PackError || err instanceof EnvError || err instanceof ServerError) return err.message
   if (err instanceof ApiError) {
     if (err.status === 401) return 'Вход устарел или токен отозван: npx @airlok/cli login'
     if (err.code === 'read_only_token') return 'Этот токен только читает. Войдите заново (npx @airlok/cli login) или задайте токен с правом выкатывать.'

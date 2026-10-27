@@ -82,6 +82,19 @@ export class Api {
     return this.request('DELETE', `/api/cli/v1/apps/${encodeURIComponent(appId)}/server-env/${encodeURIComponent(name)}`)
   }
 
+  servers() {
+    return this.request('GET', '/api/cli/v1/servers').then((r) => r.data.servers)
+  }
+
+  // createServer и rotateServerToken отдают токен агента: он нужен только установщику на сервере.
+  createServer(name) {
+    return this.request('POST', '/api/cli/v1/servers', { name }).then((r) => r.data)
+  }
+
+  rotateServerToken(id) {
+    return this.request('POST', `/api/cli/v1/servers/${encodeURIComponent(id)}/token`).then((r) => r.data)
+  }
+
   createApp(name) {
     return this.request('POST', '/api/cli/v1/apps', { target: 'hosted', name }).then((r) => r.data.id)
   }

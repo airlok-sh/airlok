@@ -163,6 +163,11 @@ heartbeat() {
 
 install -d -m 755 "$STATE_DIR"
 [[ -r $DASHBOARD_CONF ]] && heartbeat
+# Служба логов появилась позже агента. update.sh старой версии дорабатывает из памяти и о ней
+# не знает, поэтому после такого обновления её ставит проверка: она уже из новых рецептов.
+if [[ -r $DASHBOARD_CONF && ! -e /etc/systemd/system/airlok-logs.service ]]; then
+	"$RECIPES_DIR/notify.sh" install-logs >/dev/null
+fi
 # Заодно досылаем в дашборд события, которые не ушли раньше: таймер и есть повтор.
 flush_events
 for dir in "$APPS_ROOT"/*/; do

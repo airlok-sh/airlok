@@ -232,13 +232,14 @@ write_if_changed() {
 	return 0
 }
 
-# Формат логов nginx для метрик: только время, код, длительность и размер ответа.
-# Ни IP, ни адресов страниц — персональные данные посетителей серверу airlok не нужны.
-# Нужен и server-base.sh, и app-deploy.sh: сайт с access_log … airlok без формата
-# nginx не примет.
+# Формат логов nginx для метрик: время, код, длительность, размер ответа, метод и путь.
+# Без IP и query-строки, а путь metrics.py отправляет в дашборд только шаблоном
+# (/orders/:id) — персональные данные посетителей серверу airlok не нужны. Путь последний:
+# в нём бывают пробелы. Нужен и server-base.sh, и app-deploy.sh: сайт с access_log … airlok
+# без формата nginx не примет.
 ensure_log_format() {
 	write_if_changed /etc/nginx/conf.d/airlok-log.conf 0644 <<'EOF'
-log_format airlok '$msec $status $request_time $body_bytes_sent';
+log_format airlok '$msec $status $request_time $body_bytes_sent $request_method $uri';
 EOF
 }
 

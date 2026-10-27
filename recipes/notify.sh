@@ -71,6 +71,32 @@ EOF
 	ok "агент ждёт команды из дашборда: выкатить коммит из GitHub"
 }
 
+# Вывод приложений в дашборд. В отличие от агента, службу можно перезапускать в любой момент:
+# прочитанное она досылает при остановке, а место в каждом контейнере помнит на диске.
+# Перезапуск всегда — так обновлённый logs.py начинает работать сразу.
+install_logs() {
+	write_if_changed /etc/systemd/system/airlok-logs.service 0644 <<EOF && systemctl daemon-reload
+[Unit]
+Description=airlok: вывод приложений в дашборд
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+ExecStart=/usr/bin/python3 ${RECIPES_DIR}/logs.py
+Restart=always
+RestartSec=10
+# Строки, ждущие отправки, копятся в памяти до 5 МБ; остальное — запас.
+MemoryMax=200M
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+	systemctl enable airlok-logs.service >/dev/null 2>&1
+	systemctl restart airlok-logs.service
+	ok "вывод приложений уходит в дашборд, если у приложения включены логи"
+}
+
 # chat_id берём из последнего сообщения боту, чтобы человеку не искать его вручную.
 find_chat_id() {
 	local token=$1
@@ -136,6 +162,7 @@ dashboard() {
 	rm -f "$tmp"
 	install_healthcheck
 	install_agent
+	install_logs
 	ok "сервер подключён к ${url}: выкатки и доступность сайтов будут видны в дашборде"
 }
 
@@ -155,6 +182,10 @@ install-healthcheck)
 install-agent)
 	need_root
 	install_agent
+	;;
+install-logs)
+	need_root
+	install_logs
 	;;
 *) die "использование: $0 setup|test|dashboard АДРЕС" ;;
 esac

@@ -26,6 +26,7 @@ fi
 if [[ -r $DASHBOARD_CONF ]]; then
 	"$RECIPES_DIR/notify.sh" install-healthcheck || exit 1
 	AIRLOK_DEFER_AGENT_RESTART=1 "$RECIPES_DIR/notify.sh" install-agent || exit 1
+	"$RECIPES_DIR/notify.sh" install-logs || exit 1
 	# Проверка сайтов заодно отправляет heartbeat: новая версия появится в дашборде сразу.
 	systemctl start --no-block airlok-healthcheck.service
 fi

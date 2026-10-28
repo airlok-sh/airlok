@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/airlok-sh/airlok/main/schema/airlok.schema.json
+# Laravel с PostgreSQL на хостинге airlok. Стек php определяется по composer.json, фронтенд на Vite
+# собирается в образе Node.js. Базу airlok создаёт сам и передаёт DATABASE_URL (и DB_URL для
+# Laravel). APP_KEY задаётся на странице приложения — кнопкой «Сгенерировать».
+version: 1
+
+app:
+  name: hosting-laravel
+
+run:
+  release: php artisan migrate --force
+  health: /up
+
+capabilities:
+  database:
+    enabled: true
+  cron:
+    - name: планировщик Laravel
+      schedule: "* * * * *"
+      command: php artisan schedule:run
+
+env:
+  APP_KEY: { secret: true, description: "Ключ шифрования Laravel: «Сгенерировать» или php artisan key:generate --show" }

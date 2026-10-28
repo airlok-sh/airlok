@@ -23,8 +23,8 @@
           "description": "Только для своего сервера: домен сайта, например shop.example.ru. На хостинге домены задаются в дашборде."
         },
         "stack": {
-          "enum": ["static", "nextjs", "node", "python", "go", "docker"],
-          "description": "Стек, если он определился по файлам не так. docker — сборка по Dockerfile, только на хостинге."
+          "enum": ["static", "nextjs", "node", "python", "go", "php", "docker"],
+          "description": "Стек, если он определился по файлам не так. php (Laravel, Symfony, обычный PHP) и docker — сборка по Dockerfile — только на хостинге."
         },
         "type": {
           "enum": ["web", "worker"],
@@ -62,7 +62,8 @@
       "properties": {
         "node": { "enum": ["20", "22", "24"], "description": "Версия Node.js; без неё — из engines, .nvmrc или .node-version." },
         "python": { "enum": ["3.10", "3.11", "3.12", "3.13", "3.14"], "description": "Версия Python; без неё — из .python-version, runtime.txt или requires-python." },
-        "go": { "enum": ["1.25", "1.26", "1.27"], "description": "Версия Go; без неё — из директивы go в go.mod." }
+        "go": { "enum": ["1.25", "1.26", "1.27"], "description": "Версия Go; без неё — из директивы go в go.mod." },
+        "php": { "enum": ["8.3", "8.4", "8.5"], "description": "Версия PHP, только на хостинге; без неё — по require.php из composer.json, по умолчанию 8.4." }
       }
     },
     "capabilities": {

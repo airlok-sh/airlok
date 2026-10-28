@@ -7,7 +7,7 @@ export function normalize(r) {
   return { ...r, errors: list(r.errors), warnings: list(r.warnings), notes: list(r.notes), server: list(r.server), env: list(r.env), cron: list(r.cron) }
 }
 
-const stackLabel = { static: 'статический сайт', nextjs: 'Next.js', node: 'Node.js', python: 'Python', go: 'Go', docker: 'Dockerfile' }
+const stackLabel = { static: 'статический сайт', nextjs: 'Next.js', node: 'Node.js', python: 'Python', go: 'Go', php: 'PHP', docker: 'Dockerfile' }
 
 function envLine(v, width) {
   const tags = [v.required ? 'обязательная' : v.default ? `по умолчанию ${v.default}` : 'необязательная']
@@ -22,8 +22,9 @@ export function formatReport(report) {
   const lines = []
   const p = r.plan
   if (p) {
-    const runtime = p.node ? `Node.js ${p.node}` : p.python ? `Python ${p.python}` : p.go ? `Go ${p.go}` : ''
-    const what = [stackLabel[p.stack] ?? p.stack, p.framework && p.framework !== stackLabel[p.stack] ? p.framework : '', p.kind === 'worker' ? 'фоновое, без сайта' : 'сайт', runtime]
+    // У PHP-проекта с фронтендом две среды: PHP для запуска и Node.js для сборки.
+    const runtimes = [p.php && `PHP ${p.php}`, p.node && `Node.js ${p.node}`, p.python && `Python ${p.python}`, p.go && `Go ${p.go}`]
+    const what = [stackLabel[p.stack] ?? p.stack, p.framework && p.framework !== stackLabel[p.stack] ? p.framework : '', p.kind === 'worker' ? 'фоновое, без сайта' : 'сайт', ...runtimes]
     lines.push(`Стек: ${what.filter(Boolean).join(' · ')}`)
     for (const [label, value] of [['установка', p.install], ['сборка', p.build], ['каталог сайта', p.output], ['запуск', p.start], ['перед запуском', p.release], ['порт', p.port]]) {
       if (value) lines.push(`  ${(label + ':').padEnd(16)}${value}`)

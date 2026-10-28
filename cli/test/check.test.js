@@ -36,6 +36,8 @@ test('formatReport shows what airlok will do', () => {
   const failed = formatReport({ ...report, plan: undefined, errors: ['airlok.yml: ожидается version: 1'], warnings: [], server: [] })
   assert.match(failed, /Остановит выкатку:\n {2}✗ airlok\.yml: ожидается version: 1/)
   assert.match(failed, /✗ Выкатка с такими файлами не пройдёт\.$/)
+  const laravel = formatReport({ ...report, plan: { stack: 'php', framework: 'Laravel', kind: 'web', php: '8.4', node: '22', install: 'composer install' } })
+  assert.match(laravel, /^Стек: PHP · Laravel · сайт · PHP 8\.4 · Node\.js 22$/m, 'PHP для запуска и Node.js для сборки фронтенда')
 })
 
 test('check packs the folder and exits 1 when the deploy would stop', async (t) => {

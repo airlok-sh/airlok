@@ -126,7 +126,7 @@ CLI сам пропускает `node_modules`, `.git`, `.env*` и сборки,
 
 ## airlok.yml — когда определения по файлам не хватает
 
-Файл необязателен: стек (Next.js, Node, Python, Go, статика, Dockerfile, боты) определяется сам. Нужен для базы, загрузок,
+Файл необязателен: стек (Next.js, Node, Python, Go, PHP, статика, Dockerfile, боты) определяется сам. Нужен для базы, загрузок,
 задач по расписанию и переменных. Кладётся в корень проекта (в монорепозитории — в папку приложения). Первая строка —
 схема: редактор и ты сразу увидите опечатки и неверные значения. Как собрать файл целиком — навык `airlok-yml`; после
 правки — `npx @airlok/cli check`.
@@ -135,7 +135,7 @@ CLI сам пропускает `node_modules`, `.git`, `.env*` и сборки,
 # yaml-language-server: $schema=https://raw.githubusercontent.com/airlok-sh/airlok/main/schema/airlok.schema.json
 version: 1
 app:
-  stack: python          # static, nextjs, node, python, go, docker — если определилось не то
+  stack: python          # static, nextjs, node, python, go, php, docker — если определилось не то
   type: worker           # бот или воркер без сайта; по умолчанию web
 build:
   command: npm run build:prod
@@ -148,6 +148,7 @@ runtime:
   node: "22"             # 20, 22, 24
   python: "3.12"         # 3.10–3.14
   go: "1.27"             # 1.25–1.27, по умолчанию из директивы go в go.mod
+  php: "8.4"             # 8.3–8.5, по умолчанию из require.php в composer.json; только на хостинге
 capabilities:
   database:
     enabled: true        # PostgreSQL, адрес — в DATABASE_URL

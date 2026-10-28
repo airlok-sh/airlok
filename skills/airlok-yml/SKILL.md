@@ -39,14 +39,16 @@ description: >-
 4. **Не вписывай то, что задаёт airlok**: `PORT`, `HOST`, `HOSTNAME`, `HOME`, `PATH`, `NODE_ENV`, `DATABASE_URL`,
    `UPLOAD_DIR`, `UPLOAD_MAX_BYTES`, `AIRLOK_*`, `DOCKER_*`. Базу просят через `capabilities.database`, а не переменной.
 5. **Возможности — по коду:**
-   - Postgres (pg, prisma, drizzle, psycopg, asyncpg, SQLAlchemy, Django, pgx, gorm) → `capabilities.database.enabled:
-     true`, код берёт адрес из `DATABASE_URL`. SQLite или файлы рядом с кодом не переживут перезапуск — предложи
+   - Postgres (pg, prisma, drizzle, psycopg, asyncpg, SQLAlchemy, Django, pgx, gorm, Laravel, Doctrine) →
+     `capabilities.database.enabled: true`, код берёт адрес из `DATABASE_URL` (Laravel — из `DB_URL`, airlok задаёт
+     обе). MySQL на хостинге нет: Laravel с MySQL переводи на `pgsql`. SQLite или файлы рядом с кодом не переживут перезапуск — предложи
      перейти на базу;
    - пользователи загружают файлы → `capabilities.uploads` с явным списком расширений, код пишет в `UPLOAD_DIR`;
-   - задачи по расписанию (node-cron, APScheduler, celery beat) → `capabilities.cron` (только на хостинге airlok; на
-     своём сервере пока нет);
-   - миграции (`prisma migrate deploy`, `alembic upgrade head`, `python manage.py migrate`, `goose up`) →
-     `run.release`: выполняется один раз перед каждой новой версией.
+   - задачи по расписанию (node-cron, APScheduler, celery beat, планировщик Laravel) → `capabilities.cron` (только на
+     хостинге airlok; на своём сервере пока нет). Для Laravel — задача `* * * * *` с `php artisan schedule:run`;
+   - миграции (`prisma migrate deploy`, `alembic upgrade head`, `python manage.py migrate`, `goose up`,
+     `php artisan migrate --force`) → `run.release`: выполняется один раз перед каждой новой версией.
+   - Laravel: `APP_KEY` впиши с `secret: true` — в дашборде есть кнопка «Сгенерировать» с ключом нужного формата.
 6. **Проверь запуск**: веб-приложение слушает `0.0.0.0` и порт из `PORT`. Захардкоженный порт или `localhost` —
    исправь в коде, это частая причина «сайт не отвечает».
 7. **Адрес проверки `run.health`**: если в приложении есть `/health`, `/healthz`, `/api/health` или подобный —
@@ -69,7 +71,7 @@ description: >-
 version: 1
 app:
   type: web                  # worker — бот или воркер без сайта
-  stack: node                # static, nextjs, node, python, go (docker — только на хостинге) — если определилось не то
+  stack: node                # static, nextjs, node, python, go (php и docker — только на хостинге) — если определилось не то
 build:
   command: npm run build     # одна строка до 500 символов
   output: dist               # только для статики: каталог готового сайта
@@ -78,7 +80,7 @@ run:
   release: npx prisma migrate deploy
   health: /healthz           # адрес проверки: отвечает 2xx, когда приложение готово
 runtime:
-  node: "22"                 # 20, 22, 24; python: 3.10–3.14; go: 1.25–1.27
+  node: "22"                 # 20, 22, 24; python: 3.10–3.14; go: 1.25–1.27; php: 8.3–8.5
 capabilities:
   database:
     enabled: true

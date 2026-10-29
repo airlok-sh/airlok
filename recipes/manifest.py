@@ -8,6 +8,7 @@ airlok.yml необязателен: без него стек определяе
 формата и экранируются: манифест пишет пользователь или его ИИ, а результат исполняется
 через eval от root.
 """
+import json
 import os
 import re
 import shlex
@@ -15,6 +16,7 @@ import sys
 
 import yaml
 
+from cron import CronError, parse_jobs
 from detect import STACKS, DetectError, detect, subprojects
 
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
@@ -185,6 +187,7 @@ def parse(data, root):
     if output and not OUTPUT.match(output):
         raise ManifestError("build.output: каталог внутри проекта, например dist")
     run = section(data, "run")
+    release = command(run, "release", "run.release")
     health = command(run, "health", "run.health")
     if health and (not HEALTH.match(health) or health.startswith("//")):
         raise ManifestError("run.health: путь на сайте приложения, например /healthz")
@@ -213,13 +216,17 @@ def parse(data, root):
         raise ManifestError("у статического сайта нет своего кода на сервере: база и загрузки ему недоступны")
     if plan["kind"] == "worker" and uploads_enabled and flag(uploads, "public", True):
         raise ManifestError("у фонового приложения нет сайта: загрузки только с public: false")
+    try:
+        cron = parse_jobs(caps.get("cron"))
+    except CronError as e:
+        raise ManifestError(str(e)) from None
+    if plan["stack"] == "static" and (cron or release):
+        raise ManifestError("у статического сайта нет своего кода на сервере: run.release и задачам по расписанию нечего запускать")
 
-    # Эти возможности описаны в формате, но рецепт v1 их ещё не умеет. Лучше честно
+    # Эта возможность описана в формате, но рецепт её ещё не умеет. Лучше честно
     # остановиться, чем молча развернуть приложение не так, как просили.
     if not flag(caps, "outbound_network", True):
         raise ManifestError("outbound_network: false пока не поддерживается, приложение получит доступ в интернет")
-    if caps.get("cron"):
-        raise ManifestError("cron пока не поддерживается, уберите задачи или оставьте cron: []")
 
     declared = env_spec(data.get("env"))
     names = [v["name"] for v in declared]
@@ -247,6 +254,8 @@ def parse(data, root):
         "BUILD_CMD": plan["build"],
         "BUILD_OUTPUT": plan["output"],
         "RUN_CMD": plan["start"],
+        "RELEASE_CMD": release,
+        "CRON_JOBS": json.dumps(cron, ensure_ascii=False),
         "HEALTH_PATH": health,
         "DB_ENABLED": int(flag(db, "enabled")),
         "UPLOADS_ENABLED": int(uploads_enabled),

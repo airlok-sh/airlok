@@ -44,8 +44,8 @@ description: >-
      обе). MySQL на хостинге нет: Laravel с MySQL переводи на `pgsql`. SQLite или файлы рядом с кодом не переживут перезапуск — предложи
      перейти на базу;
    - пользователи загружают файлы → `capabilities.uploads` с явным списком расширений, код пишет в `UPLOAD_DIR`;
-   - задачи по расписанию (node-cron, APScheduler, celery beat, планировщик Laravel) → `capabilities.cron` (только на
-     хостинге airlok; на своём сервере пока нет). Для Laravel — задача `* * * * *` с `php artisan schedule:run`;
+   - задачи по расписанию (node-cron, APScheduler, celery beat, планировщик Laravel) → `capabilities.cron`: и на
+     хостинге, и на своём сервере (у статического сайта на своём сервере задач нет). Для Laravel — задача `* * * * *` с `php artisan schedule:run`;
    - миграции (`prisma migrate deploy`, `alembic upgrade head`, `python manage.py migrate`, `goose up`,
      `php artisan migrate --force`) → `run.release`: выполняется один раз перед каждой новой версией.
    - Laravel: `APP_KEY` впиши с `secret: true` — в дашборде есть кнопка «Сгенерировать» с ключом нужного формата.
@@ -110,7 +110,7 @@ env:
     description: Отправка ошибок в Sentry; без неё ошибки только в логах
 ```
 
-Только на хостинге: `app.stack: docker`, `build.dockerfile` и `capabilities.cron`. Свой сервер Dockerfile не читает и
+Только на хостинге: `app.stack: docker` и `build.dockerfile`. Свой сервер Dockerfile не читает и
 собирает проект по его файлам — это не ошибка, не пройдёт только явный `app.stack: docker`. Только на своём сервере:
 `app.domain` (домен сайта, например `shop.example.ru`) и `resources.memory_mb` (память контейнера, 128–8192 МБ, по
 умолчанию 512 — подними для тяжёлых ботов и Puppeteer). Схема знает все поля и значения: если редактор подчёркивает

@@ -2,6 +2,7 @@
 
 Случаи те же, что у сборщика хостинга airlok: проект должен выкатываться одинаково.
 """
+import json
 import os
 import sys
 import tempfile
@@ -172,6 +173,25 @@ class ManifestTest(unittest.TestCase):
         root = project({"index.html": ""})
         self.assertEqual(parse({"version": 1}, root)["HEALTH_PATH"], "", "без run.health проверяется главная")
         self.assertEqual(parse({"version": 1, "run": {"health": "/api/health?full=1"}}, root)["HEALTH_PATH"], "/api/health?full=1")
+
+    def test_release_and_cron(self):
+        root = project({"requirements.txt": "fastapi\n", "main.py": "app = FastAPI()\n"})
+        values = parse({"version": 1}, root)
+        self.assertEqual((values["RELEASE_CMD"], values["CRON_JOBS"]), ("", "[]"))
+        values = parse({"version": 1, "run": {"release": " alembic upgrade head "},
+                        "capabilities": {"cron": [{"name": "дайджест", "schedule": "0 9 * * 1-5", "command": "python digest.py"}]}},
+                       root)
+        self.assertEqual(values["RELEASE_CMD"], "alembic upgrade head")
+        self.assertEqual(json.loads(values["CRON_JOBS"]),
+                         [{"name": "дайджест", "schedule": "0 9 * * 1-5", "command": "python digest.py", "timeout_min": 10}])
+        with self.assertRaisesRegex(ManifestError, "дайджест"):
+            parse({"version": 1, "capabilities": {"cron": [{"name": "дайджест", "schedule": "0 9", "command": "x"}]}}, root)
+        static = project({"index.html": ""})
+        for data in ({"version": 1, "run": {"release": "npm run migrate"}},
+                     {"version": 1, "capabilities": {"cron": [{"schedule": "@daily", "command": "node a.js"}]}}):
+            with self.assertRaisesRegex(ManifestError, "статического сайта", msg=data):
+                parse(data, static)
+        self.assertEqual(parse({"version": 1, "capabilities": {"cron": []}}, static)["CRON_JOBS"], "[]")
 
     def test_rejects(self):
         root = project({"index.html": ""})

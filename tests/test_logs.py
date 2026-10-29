@@ -4,8 +4,10 @@ import importlib.util
 import io
 import json
 import os
+import tempfile
 import threading
 import unittest
+from unittest import mock
 
 RECIPES = os.path.join(os.path.dirname(__file__), "..", "recipes")
 spec = importlib.util.spec_from_file_location("logs", os.path.join(RECIPES, "logs.py"))
@@ -205,6 +207,31 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(positions["c3"], 5000, "выключено — место сдвигается на сейчас")
         logs.reconcile({"shop"}, {"c3": ("shop", "app")}, followers, positions, start, off_since=6000)
         self.assertEqual(started, [("shop", "c3", "app", 5000)], "после включения вывод за выключенное время не досылается")
+
+    def test_oneoff_containers_are_skipped(self):
+        out = ("a" * 12 + "\tshop\tapp\tFalse\n" + "b" * 12 + "\tshop\tapp\tTrue\n" + "c" * 12 + "\tshop\tdb\t\n"
+               + "d" * 12 + "\t../x\tapp\tFalse\n")
+        self.assertEqual(logs.parse_ps(out), {"a" * 12: ("shop", "app"), "c" * 12: ("shop", "db")},
+                         "вывод задач и команды перед запуском приходит через очередь файлов")
+
+    def test_spool(self):
+        spool_dir = os.path.join(tempfile.mkdtemp(), "spool")
+        ts = "2026-10-29T09:00:01.000000000Z"
+        logs.spool("shop", [{"ts": ts, "stream": "stdout", "line": "[дайджест] готово"},
+                            {"ts": ts, "stream": "evil", "line": "x"}, {"ts": "вчера", "stream": "stdout", "line": "x"},
+                            {"ts": ts, "stream": "system", "line": 5}, "строка"], spool_dir)
+        logs.spool("blog", [{"ts": ts, "stream": "stdout", "line": "логи выключены"}], spool_dir)
+        with open(os.path.join(spool_dir, "broken.json"), "w") as f:
+            f.write("{")
+        buf = logs.Buffer()
+        logs.drain_spool({"shop"}, buf, spool_dir)
+        self.assertEqual([(e["app"], e["stream"], e["line"]) for e in buf.take_batch()], [("shop", "stdout", "[дайджест] готово")])
+        self.assertEqual(os.listdir(spool_dir), [], "разобранные файлы удаляются, и у приложения с выключенными логами тоже")
+
+        with mock.patch.object(logs, "MAX_SPOOL_FILES", 1):
+            logs.spool("shop", [], spool_dir)
+            logs.spool("shop", [], spool_dir)
+        self.assertEqual(len(os.listdir(spool_dir)), 1, "служба логов не разбирает очередь — она не растёт")
 
     def test_prune_positions(self):
         now = 10 * logs.KEEP_POSITION_NS

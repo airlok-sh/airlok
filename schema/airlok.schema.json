@@ -96,7 +96,7 @@
         "cron": {
           "type": "array",
           "maxItems": 10,
-          "description": "Задачи по расписанию, время московское. Только на хостинге.",
+          "description": "Задачи по расписанию, время московское. Статическому сайту на своём сервере недоступны.",
           "items": {
             "type": "object",
             "additionalProperties": false,

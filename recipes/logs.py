@@ -4,7 +4,8 @@
 Работает службой airlok-logs. Какие приложения собирать, дашборд отвечает на каждую
 отправку: у приложения в настройках есть выключатель, а без него ничего не читается.
 Вывод берётся через docker logs каждого контейнера приложения — stdout и stderr
-по отдельности, как на хостинге. Пока логи приложения открыты в дашборде, пачки уходят
+по отдельности, как на хостинге. Вывод задач по расписанию и команды перед запуском
+приходит от cron.py файлами из очереди. Пока логи приложения открыты в дашборде, пачки уходят
 каждые 200 мс, иначе — раз в 5 секунд.
 
 Приложение, которое пишет больше 200 строк в секунду, прореживается: лишние строки
@@ -51,6 +52,12 @@ FIRST_TAIL = 200
 KEEP_POSITION_NS = 7 * 86400 * 10**9
 # Старый дашборд ручки логов не знает: спрашивать его чаще незачем.
 OLD_DASHBOARD_WAIT = 600
+# Вывод задач по расписанию и команды перед запуском (cron.py) приходит файлами: разовый
+# контейнер живёт секунды и исчезает раньше, чем его заметит обход контейнеров.
+SPOOL_DIR = os.path.join(STATE_DIR, "spool")
+# Служба логов не работает и очередь не разбирает — дальше строки остаются только в журнале.
+MAX_SPOOL_FILES = 500
+STREAMS = ("stdout", "stderr", "system")
 
 
 def now_rfc3339():
@@ -214,17 +221,59 @@ def running_containers():
     try:
         out = subprocess.run(
             ["docker", "ps", "--no-trunc", "--filter", "label=com.docker.compose.project",
-             "--format", '{{.ID}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}'],
+             "--format", ('{{.ID}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}'
+                          '\t{{.Label "com.docker.compose.oneoff"}}')],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20, check=True,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
+    return parse_ps(out)
+
+
+def parse_ps(out):
+    """Разовые контейнеры (docker compose run) пропускаются: их вывод приходит через очередь файлов."""
     found = {}
     for row in out.splitlines():
         parts = row.split("\t")
-        if len(parts) == 3 and CONTAINER.match(parts[0]) and NAME.match(parts[1]):
+        if len(parts) == 4 and parts[3] != "True" and CONTAINER.match(parts[0]) and NAME.match(parts[1]):
             found[parts[0]] = (parts[1], parts[2] or "app")
     return found
+
+
+def spool(app, entries, spool_dir=SPOOL_DIR):
+    """Положить строки приложения в очередь: их отправит служба логов."""
+    try:
+        os.makedirs(spool_dir, mode=0o700, exist_ok=True)
+        if len(os.listdir(spool_dir)) >= MAX_SPOOL_FILES:
+            return
+        name = "%d-%d" % (time.time_ns(), os.getpid())
+        tmp = os.path.join(spool_dir, "." + name)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"app": app, "entries": entries}, f, ensure_ascii=False)
+        os.replace(tmp, os.path.join(spool_dir, name + ".json"))
+    except OSError:
+        pass
+
+
+def drain_spool(apps, buf, spool_dir=SPOOL_DIR):
+    """Строки из очереди — в буфер, если у приложения включены логи; иначе выбрасываются, как
+    вывод контейнера за время выключенного сбора."""
+    try:
+        names = sorted(n for n in os.listdir(spool_dir) if n.endswith(".json"))
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(spool_dir, name)
+        data = load_json(path, {})
+        if isinstance(data, dict) and data.get("app") in apps and isinstance(data.get("entries"), list):
+            for e in data["entries"]:
+                if (isinstance(e, dict) and e.get("stream") in STREAMS and isinstance(e.get("ts"), str)
+                        and parse_ts(e["ts"]) is not None and isinstance(e.get("line"), str)):
+                    buf.add(data["app"], e["ts"], e["stream"], e["line"])
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def reconcile(apps, running, followers, positions, start, off_since=None):
@@ -323,6 +372,8 @@ def main():
             running = running_containers()
             if running is not None:
                 reconcile(apps, running, followers, positions, start, time.time_ns() if apps_known else None)
+            if apps_known:
+                drain_spool(apps, buf)
             next_scan = now + SCAN_EVERY
         if now >= next_save:
             for cid, f in followers.items():

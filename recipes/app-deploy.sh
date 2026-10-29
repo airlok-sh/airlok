@@ -422,6 +422,43 @@ wait_healthy() {
 	return 1
 }
 
+# release_command ПРЕДЫДУЩИЙ_РЕЛИЗ — run.release из airlok.yml (миграции базы): после бэкапа базы
+# и до запуска новой версии, один раз на сборку, как на хостинге. Повторная выкатка того же
+# собранного релиза её не повторяет. Если команда не прошла, прежняя версия продолжает работать.
+release_command() {
+	local prev=$1 done=$APP_DIR/shared/released
+	[[ -n $RELEASE_CMD ]] || return 0
+	if ((REUSED)) && [[ $(cat "$done" 2>/dev/null) == "$RELEASE_ID" ]]; then
+		note "команда перед запуском для ${RELEASE_ID} уже выполнялась"
+		return 0
+	fi
+	step "Перед запуском: ${RELEASE_CMD}"
+	stage start "команда перед запуском"
+	if ! python3 "$RECIPES_DIR/cron.py" release "$APP_NAME" "$RELEASE_CMD"; then
+		# compose.yml уже указывает на новую версию: перезапуск из дашборда поднял бы именно её.
+		if [[ -n $prev ]]; then
+			RELEASE=$prev
+			write_compose
+		fi
+		die "команда перед запуском (run.release) не прошла — новая версия не запущена${prev:+, работает прежняя}. Причина в выводе выше"
+	fi
+	printf '%s\n' "$RELEASE_ID" >"$done"
+}
+
+# cron_setup — таймеры задач по расписанию из airlok.yml выкаченной версии; убранные из него
+# задачи выключаются. Версия уже работает, поэтому неудача здесь выкатку не роняет.
+cron_setup() {
+	local n
+	printf '%s\n' "$CRON_JOBS" | write_if_changed "$APP_DIR/shared/cron.json" 0600 || true
+	if ! n=$(python3 "$RECIPES_DIR/cron.py" sync "$APP_NAME"); then
+		note "задачи по расписанию не настроены — причина выше, выкатите приложение снова"
+		return 0
+	fi
+	((n)) || return 0
+	step "Задачи по расписанию"
+	ok "задач: ${n}, время московское, вывод — в логах приложения и в journalctl -u 'airlok-cron@${APP_NAME}_*'"
+}
+
 deploy() {
 	step "Запуск"
 	stage start
@@ -438,6 +475,7 @@ deploy() {
 	if ((DB_ENABLED)); then
 		compose up -d --wait db >"$log" 2>&1 || die "база не запустилась, лог: ${log}"
 	fi
+	release_command "$prev"
 	# Пересоздаём всегда: папка релиза могла быть пересобрана под тем же коммитом.
 	compose up -d --force-recreate --no-deps app >>"$log" 2>&1 || die "приложение не запустилось, лог: ${log}"
 
@@ -761,6 +799,7 @@ main() {
 	build
 	backup_setup
 	deploy
+	cron_setup
 	if [[ $APP_KIND == worker ]]; then
 		printf '\n%sГотово:%s фоновое приложение %s работает, логи: docker compose -f %s/compose.yml logs app\n' "$C_B" "$C_0" "$APP_NAME" "$APP_DIR"
 		return

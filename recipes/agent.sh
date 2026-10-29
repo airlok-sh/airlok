@@ -2,8 +2,9 @@
 # Агент: забирает команды из дашборда долгим опросом и выполняет их по одной.
 #
 # Работает службой airlok-agent от root, потому что деплою нужны его права. Умеет только
-# выкатить коммит из GitHub, перезапустить выкаченное приложение, прочитать данные его базы
-# (только чтение, через dbquery.py) и обновиться сам, когда это подтвердил человек в дашборде:
+# выкатить коммит из GitHub, перезапустить выкаченное приложение, убрать его с сервера,
+# прочитать данные его базы (только чтение, через dbquery.py) и обновиться сам, когда это
+# подтвердил человек в дашборде:
 # произвольную команду дашборд прислать не может, а каждое поле команды проверяется здесь
 # заново — значения доходят до команд от root.
 # Сервер сам ходит в дашборд, входящих соединений агент не принимает.
@@ -18,6 +19,7 @@ STATE_DIR=/var/lib/airlok/agent
 DEPLOY_TIMEOUT=3600
 UPDATE_TIMEOUT=1800
 RESTART_TIMEOUT=600
+REMOVE_TIMEOUT=600
 DBQUERY_TIMEOUT=30
 PROGRESS_EVERY=3
 # Шифротексты из команды и расшифрованные значения — только на tmpfs и только на время выкатки.
@@ -104,6 +106,17 @@ if kind == "restart":
     if not isinstance(app, str) or not NAME.match(app):
         emit("bad", cid, "некорректное имя приложения")
     emit("ok", cid, "restart", app, save_env(r.get("env")))
+if kind == "remove":
+    r = cmd.get("remove")
+    if not isinstance(r, dict):
+        emit("bad", cid, "в команде нет параметров удаления")
+    app, with_data = r.get("app"), r.get("with_data", False)
+    if not isinstance(app, str) or not NAME.match(app):
+        emit("bad", cid, "некорректное имя приложения")
+    # Только настоящий bool: строка "false" не должна удалить данные.
+    if not isinstance(with_data, bool):
+        emit("bad", cid, "поле with_data должно быть true или false")
+    emit("ok", cid, "remove", app, "1" if with_data else "0")
 if kind != "deploy":
     emit("bad", cid, "агент не умеет выполнять команду %r: обновите рецепты на сервере" % str(kind)[:40])
 d = cmd.get("deploy")
@@ -353,6 +366,24 @@ run_restart() {
 	fi
 }
 
+# run_remove — убрать приложение с сервера: после успеха дашборд удаляет его и у себя.
+run_remove() {
+	local id=$1 app=$2 with_data=$3 log=$STATE_DIR/command.log rc message="" args=()
+	[[ $with_data == 1 ]] && args=(--with-data)
+	echo "команда ${id}: удаление ${app}${args:+ вместе с данными}"
+	install -m 600 /dev/null "$log"
+	timeout --kill-after=30 "$REMOVE_TIMEOUT" "$RECIPES_DIR/app-remove.sh" "$app" "${args[@]}" </dev/null >"$log" 2>&1
+	rc=$?
+	if ((rc == 124 || rc == 137)); then
+		message="удаление не уложилось в $((REMOVE_TIMEOUT / 60)) минут и было остановлено"
+	fi
+	if ((rc == 0)); then
+		send_result "$id" success "$message" "$log"
+	else
+		send_result "$id" failed "$message" "$log"
+	fi
+}
+
 # run_db_query — запрос только на чтение к базе приложения для дашборда. Ответ — строки или
 # ошибка — уходит отдельной ручкой: человек ждёт его на открытой странице.
 run_db_query() {
@@ -410,6 +441,7 @@ handle() {
 	case ${f[2]:-} in
 	update) run_update "${f[1]}" ;;
 	restart) run_restart "${f[1]}" "${f[3]}" "${f[4]}" ;;
+	remove) run_remove "${f[1]}" "${f[3]}" "${f[4]}" ;;
 	db_query) run_db_query "${f[1]}" ;;
 	*) run_deploy "${f[1]}" "${f[@]:3}" ;;
 	esac

@@ -92,6 +92,13 @@ class ParseTest(unittest.TestCase):
         for r in (None, {"app": "../shop"}, {"app": "shop; reboot"}, {"app": "shop", "env": [{"name": "A", "value": "plain"}]}):
             self.assertEqual(parse({"id": CID, "kind": "restart", "restart": r})[0], "bad", r)
 
+    def test_remove(self):
+        self.assertEqual(parse({"id": CID, "kind": "remove", "remove": {"app": "shop"}}), ["ok", CID, "remove", "shop", "0"])
+        self.assertEqual(parse({"id": CID, "kind": "remove", "remove": {"app": "shop", "with_data": False}})[-1], "0")
+        self.assertEqual(parse({"id": CID, "kind": "remove", "remove": {"app": "shop", "with_data": True}}), ["ok", CID, "remove", "shop", "1"])
+        for r in (None, {"app": "../shop"}, {"app": "shop; reboot"}, {"app": "shop", "with_data": "false"}, {"app": "shop", "with_data": 1}):
+            self.assertEqual(parse({"id": CID, "kind": "remove", "remove": r})[0], "bad", r)
+
     def test_rejects(self):
         for cmd in ({"id": CID, "kind": "reboot"},
                     {"id": "not-a-uuid", "kind": "update"},
@@ -205,6 +212,77 @@ class PanelDomainTest(unittest.TestCase):
         with open(self.saved, "w") as f:
             f.write("../../etc\n")
         self.assertNotEqual(self.deploy().returncode, 0, "испорченный файл на сервере не доходит до nginx")
+
+
+def server_shell():
+    """bash 4+ и GNU rm, как на сервере: рецепты на них и рассчитаны."""
+    bash = subprocess.run(["bash", "-c", "((BASH_VERSINFO[0] >= 4)) && rm --one-file-system -f /nonexistent"], capture_output=True)
+    return bash.returncode == 0
+
+
+@unittest.skipUnless(server_shell(), "нужны bash 4+ и GNU coreutils, как на сервере")
+class RemoveTest(unittest.TestCase):
+    """app-remove.sh: без --with-data данные приложения не трогаются."""
+
+    STUBS = {
+        "docker": 'echo "docker $*" >>"$CALLS"\ncase "$1 $2" in "ps -aq") echo c0ffee ;; "volume ls") echo shop_pgdata ;; esac',
+        "systemd-escape": "echo srv-apps-shop-shared-uploads.mount",
+        "systemctl": 'echo "systemctl $*" >>"$CALLS"',
+        "userdel": 'echo "userdel $*" >>"$CALLS"',
+        "id": "exit 0",
+        "findmnt": "exit 1",
+    }
+
+    def setUp(self):
+        with open(os.path.join(os.path.dirname(AGENT), "app-remove.sh"), encoding="utf-8") as f:
+            src = f.read()
+        self.funcs = "\n".join([re.search(r"^compose\(\) \{.*\}$", src, re.M).group(0)] + [
+            re.search(r"^%s\(\) \{\n.*?\n\}\n" % name, src, re.M | re.S).group(0) for name in ("stop_containers", "remove_files")])
+        self.tmp = tempfile.TemporaryDirectory()
+        self.bin = os.path.join(self.tmp.name, "bin")
+        os.makedirs(self.bin)
+        for name, body in self.STUBS.items():
+            path = os.path.join(self.bin, name)
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(path, 0o755)
+        self.app = os.path.join(self.tmp.name, "shop")
+        for d in ("releases/abc", "shared/backups", "shared/uploads"):
+            os.makedirs(os.path.join(self.app, d))
+        for name in ("compose.yml", "shared/db.env", "shared/cron.json", "shared/backups/1.sql.gz", "shared/uploads/a.png"):
+            open(os.path.join(self.app, name), "w").close()
+        os.symlink(os.path.join(self.app, "releases/abc"), os.path.join(self.app, "current"))
+        self.calls = os.path.join(self.tmp.name, "calls")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def remove(self, with_data):
+        script = 'source "$1"; eval "$2"; APP_DIR=$3 NAME=shop WITH_DATA=$4; stop_containers; remove_files'
+        env = {**os.environ, "PATH": self.bin + ":" + os.environ["PATH"], "CALLS": self.calls}
+        out = subprocess.run(["bash", "-c", script, "bash", LIB, self.funcs, self.app, with_data], env=env, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        with open(self.calls) as f:
+            return f.read().splitlines()
+
+    def test_keeps_data(self):
+        calls = self.remove("0")
+        self.assertIn("down --remove-orphans", calls[0])
+        self.assertNotIn("--volumes", calls[0])
+        self.assertIn("docker rm -f c0ffee", calls, "разовые контейнеры задач тоже убираются")
+        self.assertFalse([c for c in calls if c.startswith("docker volume")], "том базы не трогается")
+        self.assertFalse([c for c in calls if c.startswith("userdel")], "uid владельца загрузок остаётся занятым")
+        for gone in ("compose.yml", "current", "releases"):
+            self.assertFalse(os.path.lexists(os.path.join(self.app, gone)), gone)
+        for kept in ("shared/db.env", "shared/backups/1.sql.gz", "shared/uploads/a.png"):
+            self.assertTrue(os.path.exists(os.path.join(self.app, kept)), kept)
+
+    def test_with_data(self):
+        calls = self.remove("1")
+        self.assertIn("--volumes", calls[0])
+        self.assertIn("docker volume rm shop_pgdata", calls)
+        self.assertIn("userdel app-shop", calls)
+        self.assertFalse(os.path.exists(self.app))
 
 
 class StageMarkTest(unittest.TestCase):

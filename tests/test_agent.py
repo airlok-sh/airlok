@@ -19,8 +19,8 @@ PAYLOAD_PY = re.search(r"PAYLOAD_PY='\n(.*?)\n'\n", SOURCE, re.S).group(1)
 CID = "0192e000-0000-7000-8000-000000000001"
 
 
-def parse(cmd, env_path=os.devnull):
-    out = subprocess.run([sys.executable, "-c", PARSE_PY, env_path], input=json.dumps(cmd).encode(), capture_output=True, check=True)
+def parse(cmd, env_path=os.devnull, query_path=os.devnull):
+    out = subprocess.run([sys.executable, "-c", PARSE_PY, env_path, query_path], input=json.dumps(cmd).encode(), capture_output=True, check=True)
     return out.stdout.decode().split("\0")[:-1]
 
 
@@ -29,6 +29,16 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(parse({"id": CID, "kind": "update"}), ["ok", CID, "update"])
         self.assertEqual(parse({"id": CID, "kind": "update", "deploy": {"app": "x; rm -rf /"}}), ["ok", CID, "update"],
                          "поля у обновления не используются, что бы ни прислал дашборд")
+
+    def test_db_query_goes_to_file(self):
+        q = {"app": "shop", "statements": [{"sql": "SELECT 'a\x00'; DROP", "params": []}], "max_rows": 50, "max_cell": 300}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "q.json")
+            self.assertEqual(parse({"id": CID, "kind": "db_query", "db_query": q}, query_path=path), ["ok", CID, "db_query"],
+                             "текст запроса в shell не попадает: его проверяет и выполняет dbquery.py")
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), q)
+        self.assertEqual(parse({"id": CID, "kind": "db_query", "db_query": "SELECT 1"})[0], "bad")
 
     def test_deploy(self):
         sha = "a" * 40

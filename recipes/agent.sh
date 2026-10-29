@@ -2,8 +2,8 @@
 # Агент: забирает команды из дашборда долгим опросом и выполняет их по одной.
 #
 # Работает службой airlok-agent от root, потому что деплою нужны его права. Умеет только
-# выкатить коммит из GitHub, перезапустить выкаченное приложение и обновиться сам, когда это
-# подтвердил человек в дашборде:
+# выкатить коммит из GitHub, перезапустить выкаченное приложение, прочитать данные его базы
+# (только чтение, через dbquery.py) и обновиться сам, когда это подтвердил человек в дашборде:
 # произвольную команду дашборд прислать не может, а каждое поле команды проверяется здесь
 # заново — значения доходят до команд от root.
 # Сервер сам ходит в дашборд, входящих соединений агент не принимает.
@@ -18,10 +18,13 @@ STATE_DIR=/var/lib/airlok/agent
 DEPLOY_TIMEOUT=3600
 UPDATE_TIMEOUT=1800
 RESTART_TIMEOUT=600
+DBQUERY_TIMEOUT=30
 PROGRESS_EVERY=3
 # Шифротексты из команды и расшифрованные значения — только на tmpfs и только на время выкатки.
 ENV_JSON=$RUN_DIR/env.json
 PANEL_ENV=$RUN_DIR/panel.env
+# Запрос к базе из команды: в нём бывают данные из базы, поэтому тоже только tmpfs.
+DBQ_JSON=$RUN_DIR/dbquery.json
 
 SELF=$(readlink -f "$0")
 SELF_INODE=$(stat -c %i "$SELF" 2>/dev/null)
@@ -29,7 +32,8 @@ SELF_INODE=$(stat -c %i "$SELF" 2>/dev/null)
 # Разбор команды. Поля выводятся через NUL в фиксированном порядке и в shell не
 # исполняются; первое поле — ok или bad, второе — id команды (если его удалось понять),
 # третье у ok — вид команды. Зашифрованные переменные из дашборда пишутся в файл из
-# аргумента, последнее поле выкатки и перезапуска — 1, если они пришли.
+# первого аргумента, последнее поле выкатки и перезапуска — 1, если они пришли. Запрос к базе
+# пишется во второй: его поля целиком проверяет dbquery.py.
 PARSE_PY='
 import json, re, sys
 
@@ -81,6 +85,13 @@ def save_env(env):
 kind = cmd.get("kind")
 if kind == "update":
     emit("ok", cid, "update")
+if kind == "db_query":
+    q = cmd.get("db_query")
+    if not isinstance(q, dict):
+        emit("bad", cid, "в команде нет запроса к базе")
+    with open(sys.argv[2], "w", encoding="utf-8") as f:
+        json.dump(q, f)
+    emit("ok", cid, "db_query")
 if kind == "restart":
     r = cmd.get("restart")
     if not isinstance(r, dict):
@@ -325,6 +336,22 @@ run_restart() {
 	fi
 }
 
+# run_db_query — запрос только на чтение к базе приложения для дашборда. Ответ — строки или
+# ошибка — уходит отдельной ручкой: человек ждёт его на открытой странице.
+run_db_query() {
+	local id=$1 out=$RUN_DIR/dbquery.out err=$RUN_DIR/dbquery.err code
+	echo "команда ${id}: запрос к базе"
+	timeout --kill-after=5 "$DBQUERY_TIMEOUT" python3 "$RECIPES_DIR/dbquery.py" <"$DBQ_JSON" >"$out" 2>"$err"
+	if [[ ! -s $out ]]; then
+		python3 -c 'import json, sys; json.dump({"error": {"kind": "failed", "message": "запрос не выполнился: " + sys.stdin.read()[-1000:]}}, sys.stdout)' \
+			<"$err" >"$out"
+	fi
+	# Ответ бывает в несколько мегабайт: ждём дольше обычных 10 секунд.
+	code=$(dashboard_fetch POST "/agent/v1/db-queries/${id}/result" /dev/null "@${out}" 60) || code=000
+	rm -f "$DBQ_JSON" "$out" "$err"
+	[[ $code == 2?? ]] || echo "ответ на запрос к базе не принят (код ${code})"
+}
+
 # run_update — обновление агента, которое человек подтвердил в дашборде. После отчёта агент
 # перезапускается: так он продолжит на новом коде, даже если сам agent.sh не менялся.
 run_update() {
@@ -355,8 +382,8 @@ run_update() {
 
 handle() {
 	local f=()
-	rm -f "$ENV_JSON"
-	mapfile -d '' -t f < <(python3 -c "$PARSE_PY" "$ENV_JSON" <"$1")
+	rm -f "$ENV_JSON" "$DBQ_JSON"
+	mapfile -d '' -t f < <(python3 -c "$PARSE_PY" "$ENV_JSON" "$DBQ_JSON" <"$1")
 	rm -f "$1"
 	if [[ ${f[0]:-} != ok ]]; then
 		echo "команда ${f[1]:-без id} отклонена: ${f[2]:-ответ дашборда не разобрать}"
@@ -366,6 +393,7 @@ handle() {
 	case ${f[2]:-} in
 	update) run_update "${f[1]}" ;;
 	restart) run_restart "${f[1]}" "${f[3]}" "${f[4]}" ;;
+	db_query) run_db_query "${f[1]}" ;;
 	*) run_deploy "${f[1]}" "${f[@]:3}" ;;
 	esac
 }

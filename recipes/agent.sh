@@ -44,6 +44,8 @@ SEGMENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
 # Токены установки GitHub App бывают и короткими ghs_…, и длинными, с точками (около 400 символов).
 TOKEN = re.compile(r"^[A-Za-z0-9_.-]{1,2048}$")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+# Домен из дашборда — ASCII, кириллица уже в punycode (xn--p1ai для .рф).
+DOMAIN = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})$")
 SEALED = re.compile(r"^v1:[A-Za-z0-9+/=]{1,65536}$")
 
 
@@ -103,8 +105,8 @@ def text(key):
     return v
 
 
-app, repo, sha, ref, root, title, token = (
-    text(k) for k in ("app", "repo", "sha", "ref", "root_dir", "title", "github_token"))
+app, repo, sha, ref, root, title, token, domain = (
+    text(k) for k in ("app", "repo", "sha", "ref", "root_dir", "title", "github_token", "domain"))
 if not NAME.match(app):
     emit("bad", cid, "некорректное имя приложения")
 parts = repo.split("/")
@@ -118,9 +120,12 @@ if root and not all(SEGMENT.match(s) for s in root.split("/")):
     emit("bad", cid, "некорректный каталог в репозитории")
 if token and not TOKEN.match(token):
     emit("bad", cid, "некорректный токен GitHub")
+# fullmatch: у match знак $ пропускает перевод строки в конце.
+if domain and not DOMAIN.fullmatch(domain):
+    emit("bad", cid, "некорректный домен")
 # Нет поля — у дашборда нет ключа сервера или он старый: файл переменных не трогаем.
 has_env = save_env(d.get("env"))
-emit("ok", cid, "deploy", app, repo, sha, ref, root, " ".join(title.split())[:200], token, has_env)
+emit("ok", cid, "deploy", app, repo, sha, ref, root, " ".join(title.split())[:200], token, domain, has_env)
 '
 
 # Тело запроса к дашборду в JSON: режим progress — хвост лога и этапы идущей выкатки,
@@ -254,10 +259,10 @@ open_env() {
 }
 
 run_deploy() {
-	local id=$1 app=$2 repo=$3 sha=$4 ref=$5 root=$6 title=$7 token=$8 has_env=$9
+	local id=$1 app=$2 repo=$3 sha=$4 ref=$5 root=$6 title=$7 token=$8 domain=$9 has_env=${10}
 	local log=$STATE_DIR/command.log stages=$STATE_DIR/command.stages public=0 rc message="" streamer panel=""
 	[[ -z $token ]] && public=1
-	echo "команда ${id}: выкатка ${repo}${root:+/${root}} ${sha:0:12} «${title}» как ${app}"
+	echo "команда ${id}: выкатка ${repo}${root:+/${root}} ${sha:0:12} «${title}» как ${app}${domain:+ на ${domain}}"
 	if [[ $has_env == 1 ]]; then
 		if ! open_env "$app"; then
 			send_result "$id" failed "переменные окружения из дашборда: $(head -c 1000 "$RUN_DIR/env.err")"
@@ -274,7 +279,7 @@ run_deploy() {
 	# Токен — только в окружении дочернего процесса: в аргументах его было бы видно в ps.
 	AIRLOK_GITHUB_TOKEN=$token AIRLOK_GITHUB_PUBLIC=$public AIRLOK_FETCH_REF=$ref \
 		AIRLOK_ROOT_DIR=$root AIRLOK_APP_NAME=$app AIRLOK_STAGE_FILE=$stages AIRLOK_BUILD_OUTPUT=1 \
-		AIRLOK_PANEL_ENV=$panel \
+		AIRLOK_PANEL_ENV=$panel AIRLOK_APP_DOMAIN=$domain \
 		timeout --kill-after=60 "$DEPLOY_TIMEOUT" "$RECIPES_DIR/github-deploy.sh" deploy "$repo" "$sha" \
 		</dev/null >"$log" 2>&1
 	rc=$?

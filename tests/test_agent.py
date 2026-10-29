@@ -34,8 +34,15 @@ class ParseTest(unittest.TestCase):
         sha = "a" * 40
         got = parse({"id": CID, "kind": "deploy", "deploy": {"app": "shop", "repo": "acme/shop", "sha": sha, "ref": "main",
                                                              "root_dir": "web", "title": "Новая  корзина\n", "github_token": ""}})
-        self.assertEqual(got, ["ok", CID, "deploy", "shop", "acme/shop", sha, "main", "web", "Новая корзина", "", "0"],
+        self.assertEqual(got, ["ok", CID, "deploy", "shop", "acme/shop", sha, "main", "web", "Новая корзина", "", "", "0"],
                          "без env в команде агент не трогает файл переменных")
+
+    def test_deploy_domain(self):
+        deploy = {"app": "shop", "repo": "acme/shop", "sha": "a" * 40}
+        for domain in ("shop.example.ru", "xn--80aairftm.xn--p1ai", "a1.b-c.io"):
+            self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "domain": domain}})[-2], domain)
+        for domain in ("Shop.Example.ru", "shop..ru", "-shop.ru", "shop.ru; reboot", "shop.ru\n", "shop", "x" * 250 + ".ru", 42):
+            self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "domain": domain}})[0], "bad", domain)
 
     def test_deploy_env(self):
         deploy = {"app": "shop", "repo": "acme/shop", "sha": "a" * 40}
@@ -124,6 +131,51 @@ class PayloadTest(unittest.TestCase):
         out = subprocess.run([sys.executable, "-c", PAYLOAD_PY, "result", "failed", "отклонена", "", ""],
                              capture_output=True, check=True)
         self.assertEqual(json.loads(out.stdout), {"status": "failed", "message": "отклонена", "log": ""})
+
+
+class PanelDomainTest(unittest.TestCase):
+    """Свой домен из дашборда в app-deploy.sh: главнее airlok.yml и помнится для выкаток без агента."""
+
+    def setUp(self):
+        with open(os.path.join(os.path.dirname(AGENT), "app-deploy.sh"), encoding="utf-8") as f:
+            src = f.read()
+        self.funcs = "\n".join([re.search(r"^DOMAIN_RE=.*$", src, re.M).group(0)] + [
+            re.search(r"^%s\(\) \{\n.*?\n\}\n" % name, src, re.M | re.S).group(0) for name in ("panel_domain", "save_panel_domain")])
+        self.tmp = tempfile.TemporaryDirectory()
+        os.makedirs(os.path.join(self.tmp.name, "shared"))
+        self.saved = os.path.join(self.tmp.name, "shared", "panel.domain")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def deploy(self, kind="web", **env):
+        script = 'source "$1"; eval "$2"; APP_DIR=$3 APP_KIND=$4 APP_DOMAIN=yml.example.ru; panel_domain; save_panel_domain; echo "$APP_DOMAIN"'
+        base = {k: v for k, v in os.environ.items() if k != "AIRLOK_APP_DOMAIN"}
+        return subprocess.run(["bash", "-c", script, "bash", LIB, self.funcs, self.tmp.name, kind],
+                              env={**base, **env}, capture_output=True, text=True)
+
+    def test_dashboard_wins_and_is_remembered(self):
+        self.assertEqual(self.deploy(AIRLOK_APP_DOMAIN="shop.example.ru").stdout, "shop.example.ru\n")
+        with open(self.saved) as f:
+            self.assertEqual(f.read(), "shop.example.ru\n")
+        self.assertEqual(self.deploy().stdout, "shop.example.ru\n", "выкатка руками остаётся на домене из дашборда")
+
+    def test_removed_in_dashboard(self):
+        self.deploy(AIRLOK_APP_DOMAIN="shop.example.ru")
+        self.assertEqual(self.deploy(AIRLOK_APP_DOMAIN="").stdout, "yml.example.ru\n")
+        self.assertFalse(os.path.exists(self.saved))
+        self.assertEqual(self.deploy().stdout, "yml.example.ru\n")
+
+    def test_worker_has_no_site(self):
+        out = self.deploy("worker", AIRLOK_APP_DOMAIN="shop.example.ru")
+        self.assertTrue(out.stdout.endswith("yml.example.ru\n"), out.stdout)
+        self.assertIn("фонового", out.stdout)
+
+    def test_rejects_bad_domain(self):
+        self.assertNotEqual(self.deploy(AIRLOK_APP_DOMAIN="shop.ru; reboot").returncode, 0)
+        with open(self.saved, "w") as f:
+            f.write("../../etc\n")
+        self.assertNotEqual(self.deploy().returncode, 0, "испорченный файл на сервере не доходит до nginx")
 
 
 class StageMarkTest(unittest.TestCase):

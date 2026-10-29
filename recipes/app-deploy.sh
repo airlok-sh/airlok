@@ -17,6 +17,8 @@ STATIC_IMAGE=nginxinc/nginx-unprivileged:1.27-alpine
 CONTAINER_PORT=8080
 KEEP_RELEASES=3
 IMAGE_EXTS="jpg jpeg png webp gif avif"
+# Свой домен из дашборда: ASCII, кириллица уже в punycode (xn--p1ai для .рф).
+DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})$'
 
 ensure_users() {
 	step "Пользователи"
@@ -640,18 +642,19 @@ ensure_domain_free() {
 		} END { exit !found }' "$conf" || continue
 		owner=$(basename "$conf" .conf)
 		if [[ $owner == airlok-* ]]; then
-			die "домен ${APP_DOMAIN} уже занят приложением ${owner#airlok-} на этом сервере. Укажите в airlok.yml другой app.domain или отключите сайт старого приложения: rm /etc/nginx/sites-enabled/${owner}.conf && systemctl reload nginx"
+			die "домен ${APP_DOMAIN} уже занят приложением ${owner#airlok-} на этом сервере. Укажите другой домен (в дашборде или app.domain в airlok.yml) или отключите сайт старого приложения: rm /etc/nginx/sites-enabled/${owner}.conf && systemctl reload nginx"
 		fi
-		die "домен ${APP_DOMAIN} уже обслуживает сайт nginx ${conf}. Укажите в airlok.yml другой app.domain или отключите этот сайт"
+		die "домен ${APP_DOMAIN} уже обслуживает сайт nginx ${conf}. Укажите другой домен (в дашборде или app.domain в airlok.yml) или отключите этот сайт"
 	done
 }
 
 deploy_finished() {
 	# RELEASE_ID, а не RELEASE: при откате RELEASE указывает уже на предыдущую версию.
 	local code=$1 version=${RELEASE_ID:-} took=$((SECONDS - STARTED))
-	local what="версия ${version}${AIRLOK_RELEASE_TITLE:+ «${AIRLOK_RELEASE_TITLE}»}" status
+	local what="версия ${version}${AIRLOK_RELEASE_TITLE:+ «${AIRLOK_RELEASE_TITLE}»}" status domain=""
 	if ((code == 0)); then
 		status=success
+		domain=$APP_DOMAIN
 		notify "✅ ${APP_NAME}: выкачена ${what} за ${took} с.${APP_DOMAIN:+ https://${APP_DOMAIN}}"
 	elif [[ -n ${ROLLED_BACK:-} ]]; then
 		status=rolled_back
@@ -663,8 +666,9 @@ deploy_finished() {
 		status=failed
 		notify "❌ ${APP_NAME}: первая выкатка не удалась: ${DIE_MSG:-неизвестная ошибка}."
 	fi
-	# Выкатка, упавшая до создания релиза (например, уже идёт другая), id ещё не имеет.
-	report_deploy "$APP_NAME" "$APP_DOMAIN" "${version:-unknown}" "${AIRLOK_RELEASE_TITLE:-}" "$status" "$took" "${DIE_MSG:-}"
+	# Выкатка, упавшая до создания релиза (например, уже идёт другая), id ещё не имеет. Домен —
+	# только у успешной: после неудачи nginx остался на прежнем адресе.
+	report_deploy "$APP_NAME" "$domain" "${version:-unknown}" "${AIRLOK_RELEASE_TITLE:-}" "$status" "$took" "${DIE_MSG:-}"
 }
 
 # default_name — имя приложения по папке проекта: для выкатки руками без airlok.yml.
@@ -680,11 +684,40 @@ default_name() {
 default_domain() {
 	local ip
 	ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}')
-	[[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "не нашли IP сервера: укажите app.domain в airlok.yml"
+	[[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "не нашли IP сервера: подключите свой домен в дашборде или укажите app.domain в airlok.yml"
 	if [[ $ip =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]]; then
-		die "у сервера внутренний адрес ${ip}, снаружи по нему не открыть: укажите app.domain в airlok.yml"
+		die "у сервера внутренний адрес ${ip}, снаружи по нему не открыть: подключите свой домен в дашборде или укажите app.domain в airlok.yml"
 	fi
 	echo "${APP_NAME}.${ip//./-}.sslip.io"
+}
+
+# panel_domain — свой домен из дашборда главнее app.domain из airlok.yml. Агент присылает его,
+# когда A-запись уже указывает на сервер, а пустым — когда домена в дашборде нет. Выкатка без
+# агента (руками или по webhook на сервере) берёт запомненный, иначе сайт ушёл бы с домена.
+panel_domain() {
+	if [[ -n ${AIRLOK_APP_DOMAIN+set} ]]; then
+		PANEL_DOMAIN=$AIRLOK_APP_DOMAIN
+	else
+		PANEL_DOMAIN=$(cat "$APP_DIR/shared/panel.domain" 2>/dev/null || true)
+	fi
+	[[ -z $PANEL_DOMAIN || ($PANEL_DOMAIN =~ $DOMAIN_RE && ${#PANEL_DOMAIN} -le 253) ]] ||
+		die "некорректный домен из дашборда: ${PANEL_DOMAIN}"
+	[[ -n $PANEL_DOMAIN ]] || return 0
+	if [[ $APP_KIND != web ]]; then
+		note "у фонового приложения нет сайта: домен ${PANEL_DOMAIN} из дашборда не используется"
+		return 0
+	fi
+	APP_DOMAIN=$PANEL_DOMAIN
+}
+
+# save_panel_domain — запомнить домен, который прислал агент; выкатка руками его не меняет.
+save_panel_domain() {
+	[[ -n ${AIRLOK_APP_DOMAIN+set} ]] || return 0
+	if [[ -n $PANEL_DOMAIN ]]; then
+		printf '%s\n' "$PANEL_DOMAIN" >"$APP_DIR/shared/panel.domain"
+	else
+		rm -f "$APP_DIR/shared/panel.domain"
+	fi
 }
 
 main() {
@@ -700,13 +733,14 @@ main() {
 		APP_NAME=$AIRLOK_APP_NAME
 	fi
 	[[ -n $APP_NAME ]] || APP_NAME=$(default_name "$src")
+	APP_DIR=$APPS_ROOT/$APP_NAME
+	panel_domain
 	if [[ $APP_KIND == web && -z $APP_DOMAIN ]]; then
 		APP_DOMAIN=$(default_domain)
 		[[ -f $src/airlok.yml ]] || note "airlok.yml нет: ${APP_FRAMEWORK}, адрес ${APP_DOMAIN}, без базы и загрузок"
 	fi
 	images
 	APP_USER=app-$APP_NAME
-	APP_DIR=$APPS_ROOT/$APP_NAME
 
 	# Блокировка: две выкатки одного приложения не идут одновременно, а проверка
 	# доступности не принимает перезапуск во время выкатки за простой.
@@ -720,6 +754,7 @@ main() {
 	[[ $APP_KIND == web ]] && ensure_domain_free
 	ensure_users
 	layout
+	save_panel_domain
 	[[ $APP_KIND == web ]] && allocate_port
 	secrets
 	prepare_release "$src"

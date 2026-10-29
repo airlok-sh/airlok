@@ -82,6 +82,23 @@ export class Api {
     return this.request('DELETE', `/api/cli/v1/apps/${encodeURIComponent(appId)}/server-env/${encodeURIComponent(name)}`)
   }
 
+  // Свой домен приложения на своём сервере; на хостинге домены подключаются в дашборде.
+  serverDomains() {
+    return this.request('GET', '/api/cli/v1/server-domains').then((r) => r.data.domains)
+  }
+
+  setServerDomain(appId, hostname) {
+    return this.request('PUT', `/api/cli/v1/apps/${encodeURIComponent(appId)}/server-domain`, { hostname }).then((r) => r.data)
+  }
+
+  checkServerDomain(appId) {
+    return this.request('POST', `/api/cli/v1/apps/${encodeURIComponent(appId)}/server-domain/check`).then((r) => r.data)
+  }
+
+  removeServerDomain(appId) {
+    return this.request('DELETE', `/api/cli/v1/apps/${encodeURIComponent(appId)}/server-domain`)
+  }
+
   servers() {
     return this.request('GET', '/api/cli/v1/servers').then((r) => r.data.servers)
   }

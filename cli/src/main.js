@@ -8,6 +8,7 @@ import { parseArgs, promisify } from 'node:util'
 import { Api, ApiError } from './api.js'
 import { forgetSession, readLink, saveLink, saveSession, session } from './config.js'
 import { formatReport, normalize } from './check.js'
+import { DomainError, domainCommand } from './domain.js'
 import { EnvError, envCommand } from './env.js'
 import { checkFiles, listFiles, pack, PackError } from './pack.js'
 import { serverCommand, ServerError, system } from './server.js'
@@ -27,6 +28,8 @@ const help = `airlok — выкатка проекта на хостинг airlo
   npx @airlok/cli env set ИМЯ… --app <имя>      задать: значение спросит без показа на экране или прочитает из stdin
   npx @airlok/cli env set --app <имя> --from .env   задать все переменные из файла
   npx @airlok/cli env rm ИМЯ --app <имя>        удалить
+  npx @airlok/cli domain add ДОМЕН --app <имя>  свой домен приложения на своём сервере: подключить или заменить
+  npx @airlok/cli domain show|check|rm --app <имя>   что с доменом, проверить DNS сейчас, отключить
   npx @airlok/cli server connect root@IP        подключить свой сервер: поставить на него airlok по SSH
   npx @airlok/cli whoami            под кем выполнен вход
   npx @airlok/cli logout            забыть вход на этом компьютере
@@ -42,6 +45,11 @@ const help = `airlok — выкатка проекта на хостинг airlo
   --app <имя>       приложение; если имя есть на нескольких серверах — <сервер>/<имя>
   --from <файл>     взять значения из .env-файла (с именами — только эти)
   У приложения на своём сервере значения шифруются здесь, под ключ агента сервера: дашборд их не видит.
+
+Для domain:
+  --app <имя>       приложение на своём сервере; если имя есть на нескольких серверах — <сервер>/<имя>
+  --json            итог одной строкой JSON
+  У регистратора заводится A-запись домена на IP сервера; домен включится следующей выкаткой.
 
 Для server connect:
   --name <имя>      имя сервера в дашборде (по умолчанию — его адрес)
@@ -199,6 +207,11 @@ export async function main(argv, io = makeIO(), env = process.env, sys = system)
         if (!s.token) throw new UserError('Вы не вошли: npx @airlok/cli login (или задайте AIRLOK_TOKEN)')
         return await envCommand(new Api(s.url, s.token), positionals[1], positionals.slice(2), opts, io)
       }
+      case 'domain': {
+        const s = await session(env)
+        if (!s.token) throw new UserError('Вы не вошли: npx @airlok/cli login (или задайте AIRLOK_TOKEN)')
+        return await domainCommand(new Api(s.url, s.token), positionals[1], positionals.slice(2), opts, io)
+      }
       case 'server': {
         let s = await session(env)
         if (!s.token) {
@@ -223,7 +236,7 @@ export async function main(argv, io = makeIO(), env = process.env, sys = system)
 class UserError extends Error {}
 
 function errorText(err) {
-  if (err instanceof UserError || err instanceof PackError || err instanceof EnvError || err instanceof ServerError) return err.message
+  if (err instanceof UserError || err instanceof PackError || err instanceof EnvError || err instanceof DomainError || err instanceof ServerError) return err.message
   if (err instanceof ApiError) {
     if (err.status === 401) return 'Вход устарел или токен отозван: npx @airlok/cli login'
     if (err.code === 'read_only_token') return 'Этот токен только читает. Войдите заново (npx @airlok/cli login) или задайте токен с правом выкатывать.'

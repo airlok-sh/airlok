@@ -96,6 +96,27 @@ export function stageUpdates(seen, stages, now = Date.now()) {
   return lines
 }
 
+// logUpdate — новые целые строки лога сборки с прошлого опроса. Дашборд отдаёт конец лога
+// (до 32 КБ), и окно сдвигается: где остановились, ищем по концу уже напечатанного. shown —
+// уже напечатанная часть текущего лога; недописанная последняя строка ждёт следующего опроса.
+export function logUpdate(shown, log) {
+  let from = 0
+  let gap = false
+  if (log.startsWith(shown)) {
+    from = shown.length
+  } else if (shown) {
+    // Последние три строки: начало напечатанного могло уже уйти из окна.
+    const anchor = shown.split('\n').slice(-4).join('\n').slice(-1000)
+    const i = log.lastIndexOf(anchor)
+    if (i >= 0) from = i + anchor.length
+    else gap = true
+  }
+  const end = log.lastIndexOf('\n')
+  if (end < from) return { lines: [], shown: log.slice(0, from) }
+  const lines = log.slice(from, end).split('\n')
+  return { lines: gap ? ['…', ...lines] : lines, shown: log.slice(0, end + 1) }
+}
+
 // suggestName — имя приложения из имени папки: «My Shop» → my-shop.
 export function suggestName(folder) {
   const name = folder.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^[^a-z]+/, '').replace(/-+$/, '').slice(0, 28).replace(/-+$/, '')
@@ -341,7 +362,8 @@ async function deploy(target, opts, io, env) {
     else io.err(`Выкатка поставлена в очередь. Ход сборки — в дашборде: ${s.url}/apps/${app.id}?tab=deploys`)
     return 0
   }
-  const result = await follow(api, cmd.id, io)
+  // С --json вывод читает ИИ-агент: ему хватает этапов, а лог целиком — при ошибке.
+  const result = await follow(api, cmd.id, io, !opts.json)
   const url = app.domain ? `https://${app.domain}` : ''
   if (opts.json) {
     io.out(JSON.stringify({ status: result.status, command_id: cmd.id, app: app.name, url, message: result.message }))
@@ -358,7 +380,7 @@ async function deploy(target, opts, io, env) {
   }
   io.err(`\n✗ ${result.message || 'Сборка не удалась'}`)
   const tail = (result.log ?? '').trimEnd().split('\n').slice(-25)
-  if (tail.length > 1) io.err(`\nКонец лога:\n${tail.map((l) => `  ${l}`).join('\n')}`)
+  if (opts.json && tail.length > 1) io.err(`\nКонец лога:\n${tail.map((l) => `  ${l}`).join('\n')}`)
   io.err(`\nПолный лог: ${s.url}/apps/${app.id}?tab=deploys`)
   return 1
 }
@@ -434,10 +456,11 @@ async function create(api, name) {
   }
 }
 
-// follow печатает ход сборки, пока она не закончится.
-async function follow(api, id, io) {
+// follow печатает ход сборки, пока она не закончится: этапы и, если withLog, новые строки лога.
+async function follow(api, id, io, withLog) {
   const seen = new Map()
   let queued = false
+  let shown = ''
   const deadline = Date.now() + FOLLOW_LIMIT_MS
   for (;;) {
     const cmd = await api.command(id)
@@ -446,6 +469,11 @@ async function follow(api, id, io) {
       io.err('Ждём сборщика…')
     }
     for (const line of stageUpdates(seen, cmd.stages)) io.err(line)
+    if (withLog) {
+      const update = logUpdate(shown, cmd.log ?? '')
+      shown = update.shown
+      for (const line of update.lines) io.err(`    ${line}`)
+    }
     if (cmd.status !== 'queued' && cmd.status !== 'running') return cmd
     if (Date.now() > deadline) throw new UserError('Сборка идёт дольше 30 минут — следите за ней в дашборде.')
     await sleep(POLL_MS)

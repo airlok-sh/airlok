@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { gunzipSync } from 'node:zlib'
 
-import { duration, main, stageUpdates, suggestName } from '../src/main.js'
+import { duration, logUpdate, main, stageUpdates, suggestName } from '../src/main.js'
 import { untar } from './untar.js'
 
 test('duration reads like the dashboard', () => {
@@ -33,6 +33,17 @@ test('stageUpdates prints each stage state once', () => {
     { key: 'source', status: 'done', note: 'архив · 3f9a2c1', started_at: t(0), finished_at: t(2) },
     { key: 'install', status: 'skipped', note: 'не нужны' },
   ]), ['  ✓ Код           архив · 3f9a2c1  · 2 с', '  – Зависимости   не нужны'])
+})
+
+test('logUpdate prints only new whole lines while the log window slides', () => {
+  let u = logUpdate('', 'a\nb\nпол')
+  assert.deepEqual(u.lines, ['a', 'b'], 'недописанная строка ждёт')
+  u = logUpdate(u.shown, 'a\nb\nполная\nc\n')
+  assert.deepEqual(u.lines, ['полная', 'c'])
+  assert.deepEqual(logUpdate(u.shown, 'a\nb\nполная\nc\n').lines, [], 'без новых строк — ничего')
+  u = logUpdate(u.shown, 'b\nполная\nc\nd\n')
+  assert.deepEqual(u.lines, ['d'], 'начало лога отрезано — продолжаем с того же места')
+  assert.deepEqual(logUpdate(u.shown, 'x\ny\n').lines, ['…', 'x', 'y'], 'за опрос лог ушёл дальше окна — помечаем пропуск')
 })
 
 // fakeDashboard — сервер с API для CLI: вход подтверждается со второго опроса, сборка
@@ -74,9 +85,9 @@ async function fakeDashboard() {
       const n = ++state.commandPolls
       const at = '2026-10-22T10:00:00Z'
       if (n === 1) return send(200, { id: 'c1', status: 'queued', stages: [] })
-      if (n === 2) return send(200, { id: 'c1', status: 'running', stages: [{ key: 'source', status: 'running', started_at: at }] })
+      if (n === 2) return send(200, { id: 'c1', status: 'running', stages: [{ key: 'source', status: 'running', started_at: at }], log: '→ Код\nnpm ci\n' })
       return send(200, {
-        id: 'c1', status: 'success', started_at: at, finished_at: '2026-10-22T10:00:48Z',
+        id: 'c1', status: 'success', started_at: at, finished_at: '2026-10-22T10:00:48Z', log: '→ Код\nnpm ci\nadded 3 packages\n',
         stages: [{ key: 'source', status: 'done', started_at: at, finished_at: '2026-10-22T10:00:02Z' }, { key: 'release', status: 'done', started_at: at, finished_at: at }],
       })
     }
@@ -129,6 +140,7 @@ test('login, then deploy a folder into a new app and follow the build', { timeou
   const log = dep.errLines.join('\n')
   assert.match(log, /Ждём сборщика/)
   assert.match(log, /✓ Код {11}· 2 с/)
+  assert.deepEqual(dep.errLines.filter((l) => l.startsWith('    ')), ['    → Код', '    npm ci', '    added 3 packages'], 'строки лога — по мере появления, без повторов')
   assert.match(log, /✓ Выкачено за 48 с: https:\/\/promo\.apps\.airlok\.ru/)
   assert.deepEqual(dep.outLines, ['https://promo.apps.airlok.ru'])
 
@@ -141,6 +153,7 @@ test('login, then deploy a folder into a new app and follow the build', { timeou
   assert.equal(await main(['deploy', dir, '--json'], again, env), 0)
   assert.equal(dash.state.archiveApp, 'a2')
   assert.deepEqual(JSON.parse(again.outLines.at(-1)), { status: 'success', command_id: 'c1', app: 'promo', url: 'https://promo.apps.airlok.ru' })
+  assert.equal(again.errLines.filter((l) => l.startsWith('    ')).length, 0, 'с --json лог не печатается: его читает ИИ-агент')
 
   assert.equal(await main(['logout'], captureIO(), env), 0)
   const after = captureIO()

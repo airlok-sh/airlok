@@ -4,6 +4,7 @@
 человека без входа на сервер.
 """
 import base64
+import json
 import os
 import shutil
 import stat
@@ -11,7 +12,9 @@ import subprocess
 import struct
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "recipes"))
 
@@ -94,6 +97,7 @@ class LoginTest(unittest.TestCase):
         text = f"{key(9)} hoster\n{key(1)} airlok-device:{ID1}\n"
         fps = sshkeys.device_fingerprints(text)
         self.assertEqual(fps, {sshkeys.fingerprint(blob("ssh-ed25519", 1))}, "ключ хостера — не устройство")
+        fps = {("root", fp) for fp in fps}
         mine, other = sshkeys.fingerprint(blob("ssh-ed25519", 1)), sshkeys.fingerprint(blob("ssh-ed25519", 9))
         journal = (f"Accepted publickey for root from 45.112.192.159 port 44378 ssh2: ED25519 {other}\n"
                    f"Failed publickey for root from 1.2.3.4 port 1 ssh2: ED25519 {mine}\n"
@@ -101,6 +105,132 @@ class LoginTest(unittest.TestCase):
         self.assertIsNone(sshkeys.device_login(journal, fps), "чужой ключ, неудачная попытка и другой пользователь не в счёт")
         journal += f"Accepted publickey for root from 1.2.3.4 port 3 ssh2: ED25519 {mine}\n"
         self.assertEqual(sshkeys.device_login(journal, fps), mine)
+
+
+class ReportTest(unittest.TestCase):
+    """Опись ключей и входы для дашборда."""
+
+    def test_inventory(self):
+        text = (f"# {key(7)} старый\n{key(9)} hoster@panel\x07\n"
+                f"from=\"10.0.0.1\" {key(8)} backup key\n{key(1)} airlok-device:{ID1}\n\n")
+        self.assertEqual(sshkeys.inventory(text), [
+            {"user": "root", "key": key(9), "comment": "hoster@panel", "device": None},
+            {"user": "root", "key": key(8), "comment": "backup key", "device": None},
+            {"user": "root", "key": key(1), "comment": "", "device": ID1},
+        ], "комментарии в файле не ключи, опции не уходят, управляющие символы вырезаны")
+
+    def test_parse_logins(self):
+        fp = sshkeys.fingerprint(blob("ssh-ed25519", 1))
+        e = lambda msg, ts, cur: json.dumps({"MESSAGE": msg, "__REALTIME_TIMESTAMP": ts, "__CURSOR": cur})  # noqa: E731
+        lines = [
+            e(f"Accepted publickey for root from 1.2.3.4 port 5022 ssh2: ED25519 {fp}", "1793390000123456", "c1"),
+            e("Failed password for root from 5.6.7.8 port 1 ssh2", "1793390001000000", "c2"),
+            e("Accepted password for deploy from 2001:db8::1 port 40000 ssh2", "1793390002000000", "c3"),
+            e("Accepted keyboard-interactive/pam for root from 1.2.3.4 port 7 ssh2", "1793390003000000", "c4"),
+            "мусор",
+            json.dumps({"MESSAGE": [1, 2], "__CURSOR": "c5"}),
+        ]
+        logins, cursor = sshkeys.parse_logins(lines)
+        self.assertEqual(cursor, "c5")
+        self.assertEqual(logins, [
+            {"at": "2026-10-30T19:53:20.123456Z", "user": "root", "method": "publickey", "ip": "1.2.3.4", "port": 5022, "fingerprint": fp},
+            {"at": "2026-10-30T19:53:22.000000Z", "user": "deploy", "method": "password", "ip": "2001:db8::1", "port": 40000, "fingerprint": ""},
+            {"at": "2026-10-30T19:53:23.000000Z", "user": "root", "method": "keyboard-interactive", "ip": "1.2.3.4", "port": 7, "fingerprint": ""},
+        ], "неудачные попытки не в счёт")
+
+    def test_report_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            keys = os.path.join(tmp, "authorized_keys")
+            with open(keys, "w") as f:
+                f.write(f"{key(9)} hoster\n")
+            journal = {"cursor": None}
+
+            def read_journal(cursor):
+                journal["asked"] = cursor
+                return ([{"at": "x"}] if cursor else []), "c-new"
+
+            with mock.patch.object(sshkeys, "sshd_conf", return_value=None), \
+                    mock.patch.object(sshkeys, "accounts", return_value=[sshkeys.ROOT]), \
+                    mock.patch.object(sshkeys, "keys_path", return_value=keys), \
+                    mock.patch.object(sshkeys, "read_journal", side_effect=read_journal):
+                first = sshkeys.report(tmp)
+                self.assertEqual(first, {"ssh_keys": sshkeys.inventory(f"{key(9)} hoster\n"), "ssh_users": ["root"]},
+                                 "прошлые входы не досылаются")
+                self.assertIsNone(journal["asked"])
+                again = sshkeys.report(tmp)
+                self.assertIn("ssh_keys", again, "отметка не дошла — опись и место в журнале не запомнены")
+                self.assertIsNone(journal["asked"])
+                sshkeys.report_sent(tmp)
+                after = sshkeys.report(tmp)
+                self.assertEqual(after, {"ssh_logins": [{"at": "x"}]}, "опись не менялась — не уходит")
+                self.assertEqual(journal["asked"], "c-new")
+                self.assertIn("ssh_keys", sshkeys.report(tmp, now=time.time() + 4000), "раз в час опись уходит всё равно")
+
+
+class UserSyncTest(unittest.TestCase):
+    """Ключи устройств — выбранному пользователю, у прежнего они убираются."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        me = (os.getuid(), os.getgid())
+        self.root = sshkeys.Account("root", *me, os.path.join(self.tmp.name, "root"))
+        self.ubuntu = sshkeys.Account("ubuntu", *me, os.path.join(self.tmp.name, "home", "ubuntu"))
+        for a in (self.root, self.ubuntu):
+            os.makedirs(a.home)
+        self.accs = [self.root, self.ubuntu]
+        self.conf = {"passwordauthentication": "no", "permitrootlogin": "prohibit-password"}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def file(self, a):
+        return os.path.join(a.home, ".ssh", "authorized_keys")
+
+    def read(self, a):
+        with open(self.file(a)) as f:
+            return f.read()
+
+    def write(self, a, text):
+        os.makedirs(os.path.dirname(self.file(a)), exist_ok=True)
+        with open(self.file(a), "w") as f:
+            f.write(text)
+
+    def test_moves_keys_to_chosen_user(self):
+        self.write(self.root, f"{key(9)} hoster\n{key(1)} airlok-device:{ID1}\n")
+        msg = sshkeys.sync({"user": "ubuntu", "keys": [{"id": ID1, "key": key(1)}]}, self.conf, self.accs)
+        self.assertTrue(msg.startswith("Готово:"), msg)
+        self.assertEqual(self.read(self.ubuntu), f"{key(1)} airlok-device:{ID1}\n")
+        self.assertEqual(self.read(self.root), f"{key(9)} hoster\n", "у root строка устройства убрана, ключ хостера на месте")
+
+    def test_keeps_last_key_of_previous_user(self):
+        self.write(self.root, f"{key(1)} airlok-device:{ID1}\n")
+        msg = sshkeys.sync({"user": "ubuntu", "keys": [{"id": ID1, "key": key(1)}]}, self.conf, self.accs)
+        self.assertIn("у root прежние ключи устройств оставлены", msg)
+        self.assertEqual(self.read(self.root), f"{key(1)} airlok-device:{ID1}\n", "root не остался без входа")
+        self.assertEqual(self.read(self.ubuntu), f"{key(1)} airlok-device:{ID1}\n")
+
+    def test_unknown_user(self):
+        with self.assertRaises(sshkeys.Failed):
+            sshkeys.sync({"user": "nobody", "keys": []}, self.conf, self.accs)
+        with self.assertRaises(sshkeys.Failed):
+            sshkeys.sync({"user": ["root"], "keys": []}, self.conf, self.accs)
+
+    def test_refuses_ssh_dir_link_outside_home(self):
+        elsewhere = os.path.join(self.tmp.name, "elsewhere")
+        os.makedirs(elsewhere)
+        os.symlink(elsewhere, os.path.join(self.ubuntu.home, ".ssh"))
+        with self.assertRaises(sshkeys.Failed):
+            sshkeys.sync({"user": "ubuntu", "keys": [{"id": ID1, "key": key(1)}]}, self.conf, self.accs)
+        self.assertEqual(os.listdir(elsewhere), [], "через ссылку агент ничего не пишет")
+
+    def test_inventory_and_login_by_user(self):
+        self.write(self.ubuntu, f"{key(1)} airlok-device:{ID1}\n")
+        fp = sshkeys.fingerprint(blob("ssh-ed25519", 1))
+        allowed = {("ubuntu", f) for f in sshkeys.device_fingerprints(self.read(self.ubuntu))}
+        self.assertIsNone(sshkeys.device_login(f"Accepted publickey for root from 1.2.3.4 port 1 ssh2: ED25519 {fp}", allowed),
+                          "ключ устройства у ubuntu, а вошли root'ом")
+        self.assertEqual(sshkeys.device_login(f"Accepted publickey for ubuntu from 1.2.3.4 port 1 ssh2: ED25519 {fp}", allowed), fp)
+        self.assertEqual(sshkeys.inventory(self.read(self.ubuntu), "ubuntu")[0]["user"], "ubuntu")
 
 
 class ConfTest(unittest.TestCase):
@@ -113,12 +243,19 @@ class ConfTest(unittest.TestCase):
             with self.assertRaises(sshkeys.Failed, msg=bad):
                 sshkeys.keys_path({"authorizedkeysfile": bad})
 
-    def test_root_password_login(self):
-        self.assertTrue(sshkeys.root_password_login({"passwordauthentication": "yes", "permitrootlogin": "yes"}))
-        self.assertTrue(sshkeys.root_password_login({"kbdinteractiveauthentication": "yes", "permitrootlogin": "yes"}))
-        self.assertFalse(sshkeys.root_password_login({"passwordauthentication": "yes", "permitrootlogin": "prohibit-password"}))
-        self.assertFalse(sshkeys.root_password_login({"passwordauthentication": "no", "permitrootlogin": "yes"}))
-        self.assertFalse(sshkeys.root_password_login(None), "sshd не ответил — считаем, что пароля нет")
+    def test_password_login(self):
+        self.assertTrue(sshkeys.password_login({"passwordauthentication": "yes", "permitrootlogin": "yes"}))
+        self.assertTrue(sshkeys.password_login({"kbdinteractiveauthentication": "yes", "permitrootlogin": "yes"}))
+        self.assertFalse(sshkeys.password_login({"passwordauthentication": "yes", "permitrootlogin": "prohibit-password"}))
+        self.assertTrue(sshkeys.password_login({"passwordauthentication": "yes", "permitrootlogin": "no"}, "ubuntu"),
+                        "PermitRootLogin касается только root")
+        self.assertFalse(sshkeys.password_login({"passwordauthentication": "no", "permitrootlogin": "yes"}))
+        self.assertFalse(sshkeys.password_login(None), "sshd не ответил — считаем, что пароля нет")
+
+    def test_keys_path_of_user(self):
+        ubuntu = sshkeys.Account("ubuntu", 1000, 1000, "/home/ubuntu")
+        self.assertEqual(sshkeys.keys_path(None, ubuntu), "/home/ubuntu/.ssh/authorized_keys")
+        self.assertEqual(sshkeys.keys_path({"authorizedkeysfile": "/etc/ssh/keys/%u"}, ubuntu), "/etc/ssh/keys/ubuntu")
 
 
 class ApplyTest(unittest.TestCase):

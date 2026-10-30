@@ -53,8 +53,10 @@ class ParseTest(unittest.TestCase):
 
     def test_ssh_password(self):
         for login in ("closed", "open"):
-            self.assertEqual(parse({"id": CID, "kind": "ssh_password", "ssh_password": {"login": login}}), ["ok", CID, "ssh_password", login])
-        for p in (None, "closed", {"login": "close"}, {"login": "closed; reboot"}, {}):
+            self.assertEqual(parse({"id": CID, "kind": "ssh_password", "ssh_password": {"login": login}}), ["ok", CID, "ssh_password", login, "root"])
+        self.assertEqual(parse({"id": CID, "kind": "ssh_password", "ssh_password": {"login": "closed", "user": "ubuntu"}})[-1], "ubuntu")
+        for p in (None, "closed", {"login": "close"}, {"login": "closed; reboot"}, {}, {"login": "closed", "user": "root; reboot"},
+                  {"login": "closed", "user": ["root"]}):
             self.assertEqual(parse({"id": CID, "kind": "ssh_password", "ssh_password": p})[0], "bad", p)
 
     def test_deploy(self):

@@ -46,6 +46,7 @@ import json, re, sys
 
 UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 REPO_PART = re.compile(r"^[A-Za-z0-9_.-]+$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 REF = re.compile(r"^[A-Za-z0-9._/][A-Za-z0-9._/-]*$")
@@ -114,7 +115,11 @@ if kind == "ssh_password":
     p = cmd.get("ssh_password")
     if not isinstance(p, dict) or p.get("login") not in ("closed", "open"):
         emit("bad", cid, "в команде нет нужного входа по паролю: closed или open")
-    emit("ok", cid, "ssh_password", p["login"])
+    # Пользователь, которому лежат ключи устройств: его ключ и проверяется перед закрытием.
+    user = p.get("user", "root")
+    if not isinstance(user, str) or not USER.match(user):
+        emit("bad", cid, "некорректный пользователь сервера")
+    emit("ok", cid, "ssh_password", p["login"], user)
 if kind == "restart":
     r = cmd.get("restart")
     if not isinstance(r, dict):
@@ -435,7 +440,7 @@ run_ssh_keys() {
 # закрепляется, только если на сервер вошли новым соединением по ключу устройства; иначе
 # пароль возвращается сразу, не дожидаясь таймера отката.
 run_ssh_password() {
-	local id=$1 login=$2 log=$STATE_DIR/command.log since rc
+	local id=$1 login=$2 user=${3:-root} log=$STATE_DIR/command.log since rc
 	echo "команда ${id}: вход по паролю — ${login}"
 	install -m 600 /dev/null "$log"
 	if [[ $login == open ]]; then
@@ -448,7 +453,7 @@ run_ssh_password() {
 		return
 	fi
 	since=$(date +%s)
-	if ! AIRLOK_SSH_CONFIRM=agent AIRLOK_SSH_ROLLBACK_SECONDS=$((SSH_LOGIN_WAIT + 60)) \
+	if ! AIRLOK_SSH_CONFIRM=agent AIRLOK_SSH_USER=$user AIRLOK_SSH_ROLLBACK_SECONDS=$((SSH_LOGIN_WAIT + 60)) \
 		timeout 120 "$RECIPES_DIR/server-base.sh" ssh </dev/null >"$log" 2>&1; then
 		send_result "$id" failed "" "$log"
 		return
@@ -458,7 +463,7 @@ run_ssh_password() {
 		if sshd -T 2>/dev/null | grep -qx 'passwordauthentication no'; then
 			send_result "$id" success "вход по паролю уже закрыт" "$log"
 		else
-			send_result "$id" failed "вход по паролю не закрыт: на сервере нет SSH-ключей root" "$log"
+			send_result "$id" failed "вход по паролю не закрыт: на сервере нет SSH-ключей ${user}" "$log"
 		fi
 		heartbeat_now
 		return
@@ -531,7 +536,7 @@ handle() {
 	remove) run_remove "${f[1]}" "${f[3]}" "${f[4]}" ;;
 	db_query) run_db_query "${f[1]}" ;;
 	ssh_keys) run_ssh_keys "${f[1]}" ;;
-	ssh_password) run_ssh_password "${f[1]}" "${f[3]}" ;;
+	ssh_password) run_ssh_password "${f[1]}" "${f[3]}" "${f[4]}" ;;
 	*) run_deploy "${f[1]}" "${f[@]:3}" ;;
 	esac
 }

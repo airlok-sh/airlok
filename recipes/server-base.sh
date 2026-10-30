@@ -170,13 +170,15 @@ install_certbot() {
 	ok "certbot установлен, сертификаты продлеваются сами"
 }
 
-# Ключи root и того, кто вызвал sudo: под Ubuntu часто входят не root'ом, а ubuntu.
+# Ключи root и того, кто вызвал sudo: под Ubuntu часто входят не root'ом, а ubuntu. Агент
+# называет пользователя сам (AIRLOK_SSH_USER) — тот, кому дашборд кладёт ключи устройств.
 authorized_keys_present() {
-	local keys=(/root/.ssh/authorized_keys) home
-	if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
-		home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+	local keys=(/root/.ssh/authorized_keys) home user
+	for user in "${SUDO_USER:-}" "${AIRLOK_SSH_USER:-}"; do
+		[[ -n $user && $user != root ]] || continue
+		home=$(getent passwd "$user" | cut -d: -f6)
 		[[ -n $home ]] && keys+=("$home/.ssh/authorized_keys")
-	fi
+	done
 	local f
 	for f in "${keys[@]}"; do
 		# Перед ключом бывают опции (from=…, command=…), поэтому тип ищем не только в начале строки.
@@ -188,7 +190,7 @@ authorized_keys_present() {
 ssh_hardening() {
 	step "SSH"
 	if ! authorized_keys_present; then
-		note "на сервере нет SSH-ключей (authorized_keys у root${SUDO_USER:+ и ${SUDO_USER}}) — вход по паролю оставлен, иначе доступ к серверу пропадёт"
+		note "на сервере нет SSH-ключей (authorized_keys у root${SUDO_USER:+, ${SUDO_USER}}${AIRLOK_SSH_USER:+, ${AIRLOK_SSH_USER}}) — вход по паролю оставлен, иначе доступ к серверу пропадёт"
 		return
 	fi
 	local conf

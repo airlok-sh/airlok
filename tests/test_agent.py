@@ -19,8 +19,9 @@ PAYLOAD_PY = re.search(r"PAYLOAD_PY='\n(.*?)\n'\n", SOURCE, re.S).group(1)
 CID = "0192e000-0000-7000-8000-000000000001"
 
 
-def parse(cmd, env_path=os.devnull, query_path=os.devnull):
-    out = subprocess.run([sys.executable, "-c", PARSE_PY, env_path, query_path], input=json.dumps(cmd).encode(), capture_output=True, check=True)
+def parse(cmd, env_path=os.devnull, query_path=os.devnull, keys_path=os.devnull):
+    out = subprocess.run([sys.executable, "-c", PARSE_PY, env_path, query_path, keys_path], input=json.dumps(cmd).encode(),
+                         capture_output=True, check=True)
     return out.stdout.decode().split("\0")[:-1]
 
 
@@ -39,6 +40,16 @@ class ParseTest(unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), q)
         self.assertEqual(parse({"id": CID, "kind": "db_query", "db_query": "SELECT 1"})[0], "bad")
+
+    def test_ssh_keys_go_to_file(self):
+        k = {"keys": [{"id": CID, "key": "ssh-ed25519 AAAA; reboot"}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "keys.json")
+            self.assertEqual(parse({"id": CID, "kind": "ssh_keys", "ssh_keys": k}, keys_path=path), ["ok", CID, "ssh_keys"],
+                             "ключи в shell не попадают: их проверяет и записывает sshkeys.py")
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), k)
+        self.assertEqual(parse({"id": CID, "kind": "ssh_keys", "ssh_keys": ["ssh-ed25519 AAAA"]})[0], "bad")
 
     def test_deploy(self):
         sha = "a" * 40

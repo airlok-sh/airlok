@@ -8,6 +8,7 @@ import { parseArgs, promisify } from 'node:util'
 import { Api, ApiError } from './api.js'
 import { forgetSession, readLink, saveLink, saveSession, session } from './config.js'
 import { formatReport, normalize } from './check.js'
+import { DeviceError, deviceCommand } from './device.js'
 import { DomainError, domainCommand } from './domain.js'
 import { EnvError, envCommand } from './env.js'
 import { checkFiles, listFiles, pack, PackError } from './pack.js'
@@ -31,6 +32,8 @@ const help = `airlok — выкатка проекта на хостинг airlo
   npx @airlok/cli domain add ДОМЕН --app <имя>  свой домен приложения на своём сервере: подключить или заменить
   npx @airlok/cli domain show|check|rm --app <имя>   что с доменом, проверить DNS сейчас, отключить
   npx @airlok/cli server connect root@IP        подключить свой сервер: поставить на него airlok по SSH
+  npx @airlok/cli device add [--server <сервер>]   добавить SSH-ключ этого компьютера в «Устройства» и открыть ему серверы
+  npx @airlok/cli device list                   устройства и серверы, к которым у них есть доступ
   npx @airlok/cli whoami            под кем выполнен вход
   npx @airlok/cli logout            забыть вход на этом компьютере
 
@@ -60,6 +63,13 @@ const help = `airlok — выкатка проекта на хостинг airlo
   --json            итог одной строкой JSON
   Если сервер ещё не пускает по ключу, CLI создаст ~/.ssh/airlok_ed25519 и положит его на сервер:
   пароль от сервера спросит ssh, один раз и только в терминале человека.
+
+Для device add:
+  --name <имя>      название устройства (по умолчанию — имя компьютера)
+  --key <файл.pub>  открытый ключ (по умолчанию — ~/.ssh/id_ed25519.pub или другой найденный)
+  --server <имена>  открыть доступ к этим серверам, через запятую
+  --json            итог одной строкой JSON
+  Агент кладёт ключ в authorized_keys root на отмеченных серверах. Закрытый ключ не читается.
 
 Для setup:
   --agents <список> каких агентов настроить: claude,codex,antigravity,cursor (по умолчанию — найденных)
@@ -183,7 +193,7 @@ export async function main(argv, io = makeIO(), env = process.env, sys = system)
       options: {
         app: { type: 'string' }, new: { type: 'string' }, title: { type: 'string' }, agents: { type: 'string' }, yes: { type: 'boolean', short: 'y' },
         from: { type: 'string' }, name: { type: 'string' }, port: { type: 'string' }, email: { type: 'string' },
-        letsencrypt: { type: 'boolean' }, 'ssh-keys-only': { type: 'boolean' },
+        letsencrypt: { type: 'boolean' }, 'ssh-keys-only': { type: 'boolean' }, key: { type: 'string' }, server: { type: 'string' },
         'no-wait': { type: 'boolean' }, json: { type: 'boolean' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       },
     })
@@ -243,6 +253,12 @@ export async function main(argv, io = makeIO(), env = process.env, sys = system)
         const home = env.HOME || env.USERPROFILE || homedir()
         return await serverCommand(new Api(s.url, s.token), s.url, positionals[1], positionals.slice(2), opts, io, home, sys)
       }
+      case 'device': {
+        const s = await session(env)
+        if (!s.token) throw new UserError('Вы не вошли: npx @airlok/cli login (или задайте AIRLOK_TOKEN)')
+        const home = env.HOME || env.USERPROFILE || homedir()
+        return await deviceCommand(new Api(s.url, s.token), s.url, positionals[1], positionals.slice(2), opts, io, home, sys)
+      }
       default:
         io.err(`Нет такой команды: ${command}\n\n${help}`)
         return 2
@@ -257,7 +273,8 @@ export async function main(argv, io = makeIO(), env = process.env, sys = system)
 class UserError extends Error {}
 
 function errorText(err) {
-  if (err instanceof UserError || err instanceof PackError || err instanceof EnvError || err instanceof DomainError || err instanceof ServerError) return err.message
+  if (err instanceof UserError || err instanceof PackError || err instanceof EnvError || err instanceof DomainError || err instanceof ServerError ||
+    err instanceof DeviceError) return err.message
   if (err instanceof ApiError) {
     if (err.status === 401) return 'Вход устарел или токен отозван: npx @airlok/cli login'
     if (err.code === 'read_only_token') return 'Этот токен только читает. Войдите заново (npx @airlok/cli login) или задайте токен с правом выкатывать.'

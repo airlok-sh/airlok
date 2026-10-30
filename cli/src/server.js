@@ -8,6 +8,7 @@ import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { ApiError } from './api.js'
+import { deviceName, ensureDevice, findPublicKey, parsePublicKey } from './device.js'
 
 export class ServerError extends Error {}
 
@@ -116,16 +117,34 @@ export async function serverCommand(api, origin, sub, rest, opts, io, home, sys 
 
   let keysOnly = false
   if (opts['ssh-keys-only']) keysOnly = await confirmKeysOnly(target, usedKey, port, io, sys)
+  const device = await connectDevice(api, server.id, usedKey, home, io, sys)
 
   io.err('\nЖду, когда агент выйдет на связь…')
   const online = await waitOnline(api, server.id, sys)
   const login = `ssh${usedKey ? ` -i ${usedKey}` : ''}${port ? ` -p ${port}` : ''} ${target.dest}`
-  if (opts.json) io.out(JSON.stringify({ status: online ? 'ok' : 'pending', server: name, server_id: server.id, host: target.host, ssh: login, password_login_closed: keysOnly }))
+  if (opts.json) io.out(JSON.stringify({ status: online ? 'ok' : 'pending', server: name, server_id: server.id, host: target.host, ssh: login, password_login_closed: keysOnly, device }))
   if (online) io.err(`\n✓ Сервер ${name} подключён: ${origin}/servers`)
   else io.err(`\nУстановка прошла, но агент пока не на связи. Проверьте на сервере: journalctl -u airlok-agent -n 50`)
   io.err(`Зайти на сервер: ${login}`)
   if (keysOnly) io.err('Вход по паролю закрыт: на сервер пускает только по ключу.')
+  if (device) io.err(`Доступ этого компьютера — устройство «${device}»: открыть другим или закрыть можно в ${origin}/devices`)
   return online ? 0 : 1
+}
+
+// connectDevice заводит ключ этого компьютера устройством с доступом к новому серверу: тогда этот
+// доступ виден в дашборде и закрывается там же. Сбой здесь подключению не мешает; '' — не завелось.
+async function connectDevice(api, serverId, usedKey, home, io, sys) {
+  try {
+    const found = usedKey ? { key: parsePublicKey(await sys.readFile(`${usedKey}.pub`)) } : await findPublicKey(home, sys)
+    if (!found) return ''
+    const { device } = await ensureDevice(api, found.key, deviceName(), [serverId], { autoName: true })
+    return device.name
+  } catch (err) {
+    // Дашборд ещё без устройств.
+    if (err instanceof ApiError && err.status === 404) return ''
+    io.err(`Ключ этого компьютера не добавился в «Устройства»: ${err.message}`)
+    return ''
+  }
 }
 
 // ensureAccess добивается входа по ключу и возвращает, с каким ключом входить ('' — хватает ключей

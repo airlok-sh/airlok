@@ -47,8 +47,8 @@ function captureIO({ tty = false } = {}) {
   return io
 }
 
-async function fakeDashboard(servers = []) {
-  const state = { servers, created: [], rotated: [] }
+async function fakeDashboard(servers = [], { devices = true } = {}) {
+  const state = { servers, created: [], rotated: [], devices: [] }
   const server = createServer(async (req, res) => {
     const chunks = []
     for await (const c of req) chunks.push(c)
@@ -64,6 +64,11 @@ async function fakeDashboard(servers = []) {
       state.servers.push(s)
       state.created.push(body.name)
       return send(201, { server: s, agent_token: 'airlok_srv_secret' })
+    }
+    if (devices && p === '/api/cli/v1/devices' && req.method === 'POST') {
+      const d = { id: `d-${body.name}`, name: body.name, public_key: body.public_key, server_ids: body.server_ids }
+      state.devices.push(d)
+      return send(201, d)
     }
     const rotate = /^\/api\/cli\/v1\/servers\/([^/]+)\/token$/.exec(p)
     if (rotate) {
@@ -120,6 +125,9 @@ test('server connect with a working key installs without asking anything', async
   const res = JSON.parse(io.outLines[0])
   assert.equal(res.status, 'ok')
   assert.equal(res.ssh, 'ssh root@1.2.3.4')
+  assert.equal(res.device, dash.state.devices[0].name)
+  assert.deepEqual(dash.state.devices.map((d) => [d.public_key, d.server_ids]), [['ssh-ed25519 AAAA', ['id-1.2.3.4']]],
+    'ключ этого компьютера — устройство с доступом к новому серверу')
   assert.ok(!io.outLines.concat(io.errLines).join('\n').includes('airlok_srv_secret'))
 })
 
@@ -160,6 +168,17 @@ test('server connect in a terminal makes a key, puts it on the server and confir
   assert.match(sys.calls[5].args.at(-1), /confirm-ssh/)
   assert.deepEqual(dash.state.created, ['prod'])
   assert.match(io.errLines.join('\n'), /Вход по паролю закрыт/)
+  assert.match(io.errLines.join('\n'), /устройство «.+»/)
+})
+
+test('server connect works with a dashboard that has no devices yet', async (t) => {
+  const dash = await fakeDashboard([], { devices: false })
+  t.after(dash.close)
+  const sys = fakeSystem(dash, [{ code: 0 }, { code: 0, online: true }])
+  const io = captureIO()
+  assert.equal(await main(['server', 'connect', '1.2.3.4', '--json'], io, { AIRLOK_URL: dash.url, AIRLOK_TOKEN: 't', HOME: await home() }, sys), 0)
+  assert.equal(JSON.parse(io.outLines[0]).device, '')
+  assert.doesNotMatch(io.errLines.join('\n'), /не добавился/)
 })
 
 test('server connect retries reuse a server that never came online', async (t) => {

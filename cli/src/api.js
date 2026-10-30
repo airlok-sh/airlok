@@ -112,6 +112,19 @@ export class Api {
     return this.request('POST', `/api/cli/v1/servers/${encodeURIComponent(id)}/token`).then((r) => r.data)
   }
 
+  // Устройства — открытые SSH-ключи компьютеров и серверы, на которые агент их кладёт.
+  devices() {
+    return this.request('GET', '/api/cli/v1/devices').then((r) => r.data)
+  }
+
+  createDevice(name, publicKey, serverIds) {
+    return this.request('POST', '/api/cli/v1/devices', { name, public_key: publicKey, server_ids: serverIds }).then((r) => r.data)
+  }
+
+  setDeviceServers(id, serverIds) {
+    return this.request('PUT', `/api/cli/v1/devices/${encodeURIComponent(id)}/servers`, { server_ids: serverIds })
+  }
+
   createApp(name) {
     return this.request('POST', '/api/cli/v1/apps', { target: 'hosted', name }).then((r) => r.data.id)
   }

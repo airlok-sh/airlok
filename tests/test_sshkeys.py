@@ -5,7 +5,9 @@
 """
 import base64
 import os
+import shutil
 import stat
+import subprocess
 import struct
 import sys
 import tempfile
@@ -74,6 +76,31 @@ class RenderTest(unittest.TestCase):
         self.assertFalse(sshkeys.has_keys(f"\n# {key(1)}\n"))
         self.assertTrue(sshkeys.has_keys(f"no-pty {key(1)}\n"))
         self.assertTrue(sshkeys.has_keys(f"ssh-dss {blob('ssh-dss', 1)}\n"))
+
+
+class LoginTest(unittest.TestCase):
+    """Пароль из дашборда закрывается, только если на сервер вошли ключом устройства."""
+
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "нет ssh-keygen")
+    def test_fingerprint_matches_ssh_keygen(self):
+        line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+        with tempfile.NamedTemporaryFile("w", suffix=".pub") as f:
+            f.write(line + "\n")
+            f.flush()
+            out = subprocess.run(["ssh-keygen", "-lf", f.name], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(sshkeys.fingerprint(line.split()[1]), out.split()[1])
+
+    def test_device_login(self):
+        text = f"{key(9)} hoster\n{key(1)} airlok-device:{ID1}\n"
+        fps = sshkeys.device_fingerprints(text)
+        self.assertEqual(fps, {sshkeys.fingerprint(blob("ssh-ed25519", 1))}, "ключ хостера — не устройство")
+        mine, other = sshkeys.fingerprint(blob("ssh-ed25519", 1)), sshkeys.fingerprint(blob("ssh-ed25519", 9))
+        journal = (f"Accepted publickey for root from 45.112.192.159 port 44378 ssh2: ED25519 {other}\n"
+                   f"Failed publickey for root from 1.2.3.4 port 1 ssh2: ED25519 {mine}\n"
+                   f"Accepted publickey for deploy from 1.2.3.4 port 2 ssh2: ED25519 {mine}\n")
+        self.assertIsNone(sshkeys.device_login(journal, fps), "чужой ключ, неудачная попытка и другой пользователь не в счёт")
+        journal += f"Accepted publickey for root from 1.2.3.4 port 3 ssh2: ED25519 {mine}\n"
+        self.assertEqual(sshkeys.device_login(journal, fps), mine)
 
 
 class ConfTest(unittest.TestCase):

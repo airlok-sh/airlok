@@ -51,6 +51,12 @@ class ParseTest(unittest.TestCase):
                 self.assertEqual(json.load(f), k)
         self.assertEqual(parse({"id": CID, "kind": "ssh_keys", "ssh_keys": ["ssh-ed25519 AAAA"]})[0], "bad")
 
+    def test_ssh_password(self):
+        for login in ("closed", "open"):
+            self.assertEqual(parse({"id": CID, "kind": "ssh_password", "ssh_password": {"login": login}}), ["ok", CID, "ssh_password", login])
+        for p in (None, "closed", {"login": "close"}, {"login": "closed; reboot"}, {}):
+            self.assertEqual(parse({"id": CID, "kind": "ssh_password", "ssh_password": p})[0], "bad", p)
+
     def test_deploy(self):
         sha = "a" * 40
         got = parse({"id": CID, "kind": "deploy", "deploy": {"app": "shop", "repo": "acme/shop", "sha": sha, "ref": "main",

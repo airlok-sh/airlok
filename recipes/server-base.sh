@@ -6,13 +6,16 @@
 #   server-base.sh --skip-ssh  — всё, кроме SSH (так запускает install.sh)
 #   server-base.sh ssh         — только закрыть вход по паролю, если есть ключ
 #   server-base.sh confirm-ssh — подтвердить, что вход по ключу работает, и отменить откат
+#   server-base.sh ssh-open    — вернуть вход по паролю, который закрыл airlok
 #   server-base.sh letsencrypt [EMAIL] — выпускать для сайтов сертификаты Let's Encrypt
 
 source "$(dirname "$0")/lib.sh"
 
 SSH_DROPIN=/etc/ssh/sshd_config.d/00-airlok.conf
 SSH_ROLLBACK_UNIT=airlok-ssh-rollback
-SSH_ROLLBACK_SECONDS=180
+# Агенту нужно окно дольше: человек идёт в терминал по подсказке из дашборда.
+SSH_ROLLBACK_SECONDS=${AIRLOK_SSH_ROLLBACK_SECONDS:-180}
+[[ $SSH_ROLLBACK_SECONDS =~ ^[1-9][0-9]{1,3}$ ]] || die "AIRLOK_SSH_ROLLBACK_SECONDS — число секунд от 10 до 9999"
 
 preflight() {
 	step "Предварительная проверка"
@@ -214,9 +217,9 @@ EOF
 		/bin/sh -c "rm -f '$SSH_DROPIN' && systemctl reload ssh"
 	systemctl reload ssh
 	ok "вход по паролю выключен, root входит только по ключу"
-	# airlok CLI проверяет вход по ключу сам, новым SSH-соединением, и сам подтверждает.
-	if [[ ${AIRLOK_SSH_CONFIRM:-} == cli ]]; then
-		printf '  вход по ключу проверит и подтвердит airlok CLI; без подтверждения за %d секунд настройки SSH вернутся сами\n' "$SSH_ROLLBACK_SECONDS"
+	# CLI проверяет вход по ключу сам, новым SSH-соединением, а агент ждёт такой вход в журнале sshd.
+	if [[ ${AIRLOK_SSH_CONFIRM:-} == cli || ${AIRLOK_SSH_CONFIRM:-} == agent ]]; then
+		printf '  вход по ключу проверит и подтвердит airlok; без подтверждения за %d секунд настройки SSH вернутся сами\n' "$SSH_ROLLBACK_SECONDS"
 		return
 	fi
 	printf '\n  %sПроверьте вход по ключу в НОВОМ окне терминала, не закрывая это.%s\n' "$C_B" "$C_0"
@@ -231,6 +234,23 @@ confirm_ssh() {
 	else
 		note "таймер отката не найден: либо уже подтверждено, либо настройки уже откатились"
 	fi
+}
+
+# ssh_open убирает настройки airlok: в силе снова то, что задал хостер. Если и у него вход по
+# паролю выключен, сообщаем об этом — чужие настройки sshd не трогаем.
+ssh_open() {
+	step "SSH"
+	systemctl stop "${SSH_ROLLBACK_UNIT}.timer" 2>/dev/null || true
+	if [[ -e $SSH_DROPIN ]]; then
+		rm -f "$SSH_DROPIN"
+		sshd -t || die "sshd не принимает свои настройки без файла airlok: проверьте /etc/ssh/sshd_config"
+		systemctl reload ssh
+	fi
+	if sshd -T | grep -qxE '(passwordauthentication|kbdinteractiveauthentication) yes'; then
+		ok "вход по паролю открыт"
+		return
+	fi
+	die "вход по паролю выключен в настройках sshd хостера, airlok их не меняет"
 }
 
 main() {
@@ -254,6 +274,10 @@ main() {
 
 case ${1:-} in
 confirm-ssh) confirm_ssh ;;
+ssh-open)
+	need_root
+	ssh_open
+	;;
 ssh)
 	need_root
 	ssh_hardening

@@ -4,7 +4,8 @@
 # Работает службой airlok-agent от root, потому что деплою нужны его права. Умеет только
 # выкатить коммит из GitHub, перезапустить выкаченное приложение, убрать его с сервера,
 # прочитать данные его базы (только чтение, через dbquery.py), положить root'у SSH-ключи
-# устройств (sshkeys.py) и обновиться сам, когда это подтвердил человек в дашборде:
+# устройств (sshkeys.py), закрыть или открыть вход по паролю и обновиться сам, когда это
+# подтвердил человек в дашборде:
 # произвольную команду дашборд прислать не может, а каждое поле команды проверяется здесь
 # заново — значения доходят до команд от root.
 # Сервер сам ходит в дашборд, входящих соединений агент не принимает.
@@ -22,6 +23,8 @@ RESTART_TIMEOUT=600
 REMOVE_TIMEOUT=600
 DBQUERY_TIMEOUT=30
 SSHKEYS_TIMEOUT=30
+# Столько ждём, пока человек войдёт на сервер по ключу после закрытия пароля; откат — чуть позже.
+SSH_LOGIN_WAIT=300
 PROGRESS_EVERY=3
 # Шифротексты из команды и расшифрованные значения — только на tmpfs и только на время выкатки.
 ENV_JSON=$RUN_DIR/env.json
@@ -107,6 +110,11 @@ if kind == "ssh_keys":
     with open(sys.argv[3], "w", encoding="utf-8") as f:
         json.dump(k, f)
     emit("ok", cid, "ssh_keys")
+if kind == "ssh_password":
+    p = cmd.get("ssh_password")
+    if not isinstance(p, dict) or p.get("login") not in ("closed", "open"):
+        emit("bad", cid, "в команде нет нужного входа по паролю: closed или open")
+    emit("ok", cid, "ssh_password", p["login"])
 if kind == "restart":
     r = cmd.get("restart")
     if not isinstance(r, dict):
@@ -423,6 +431,62 @@ run_ssh_keys() {
 	rm -f "$KEYS_JSON"
 }
 
+# run_ssh_password — закрыть или открыть вход по паролю по кнопке в дашборде. Закрытие
+# закрепляется, только если на сервер вошли новым соединением по ключу устройства; иначе
+# пароль возвращается сразу, не дожидаясь таймера отката.
+run_ssh_password() {
+	local id=$1 login=$2 log=$STATE_DIR/command.log since rc
+	echo "команда ${id}: вход по паролю — ${login}"
+	install -m 600 /dev/null "$log"
+	if [[ $login == open ]]; then
+		if timeout 60 "$RECIPES_DIR/server-base.sh" ssh-open </dev/null >"$log" 2>&1; then
+			send_result "$id" success "вход по паролю открыт" "$log"
+		else
+			send_result "$id" failed "" "$log"
+		fi
+		heartbeat_now
+		return
+	fi
+	since=$(date +%s)
+	if ! AIRLOK_SSH_CONFIRM=agent AIRLOK_SSH_ROLLBACK_SECONDS=$((SSH_LOGIN_WAIT + 60)) \
+		timeout 120 "$RECIPES_DIR/server-base.sh" ssh </dev/null >"$log" 2>&1; then
+		send_result "$id" failed "" "$log"
+		return
+	fi
+	if ! systemctl is-active --quiet airlok-ssh-rollback.timer; then
+		# Таймера нет: пароль был закрыт раньше или на сервере нет ключей — server-base.sh сказал почему.
+		if sshd -T 2>/dev/null | grep -qx 'passwordauthentication no'; then
+			send_result "$id" success "вход по паролю уже закрыт" "$log"
+		else
+			send_result "$id" failed "вход по паролю не закрыт: на сервере нет SSH-ключей root" "$log"
+		fi
+		heartbeat_now
+		return
+	fi
+	heartbeat_now
+	python3 "$RECIPES_DIR/sshkeys.py" wait-login "$since" "$SSH_LOGIN_WAIT" >>"$log" 2>&1
+	rc=$?
+	if ((rc == 0)); then
+		"$RECIPES_DIR/server-base.sh" confirm-ssh >>"$log" 2>&1
+		send_result "$id" success "вход по паролю закрыт, вход по ключу проверен" "$log"
+	else
+		systemctl start airlok-ssh-rollback.service >>"$log" 2>&1
+		systemctl stop airlok-ssh-rollback.timer 2>/dev/null
+		if ((rc == 2)); then
+			send_result "$id" failed "за $((SSH_LOGIN_WAIT / 60)) минут на сервер не вошли по ключу устройства — вход по паролю вернули" "$log"
+		else
+			send_result "$id" failed "" "$log"
+		fi
+	fi
+	heartbeat_now
+}
+
+# heartbeat_now — отметка с состоянием сервера сразу, а не через минуту: дашборд покажет,
+# открыт ли теперь вход по паролю.
+heartbeat_now() {
+	systemctl start --no-block airlok-healthcheck.service 2>/dev/null
+}
+
 # run_update — обновление агента, которое человек подтвердил в дашборде. После отчёта агент
 # перезапускается: так он продолжит на новом коде, даже если сам agent.sh не менялся.
 run_update() {
@@ -467,6 +531,7 @@ handle() {
 	remove) run_remove "${f[1]}" "${f[3]}" "${f[4]}" ;;
 	db_query) run_db_query "${f[1]}" ;;
 	ssh_keys) run_ssh_keys "${f[1]}" ;;
+	ssh_password) run_ssh_password "${f[1]}" "${f[3]}" ;;
 	*) run_deploy "${f[1]}" "${f[@]:3}" ;;
 	esac
 }

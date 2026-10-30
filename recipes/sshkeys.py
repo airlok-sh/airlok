@@ -2,6 +2,8 @@
 """SSH-ключи устройств из дашборда — в authorized_keys root.
 
     sshkeys.py < ключи.json
+    sshkeys.py wait-login НАЧАЛО СЕКУНД  — дождаться входа root по ключу устройства
+
 
 Агент передаёт поле ssh_keys своей команды: {"keys": [{"id", "key"}]} — полный список ключей
 устройств, которым открыт этот сервер. Свои строки агент помечает комментарием
@@ -11,8 +13,14 @@ airlok-device:<id> и заменяет только их: ключи, полож
 
 Последний ключ root агент не уберёт, если войти root'ом по паролю нельзя: так сервер остался
 бы без входа, и вернуть его можно было бы только через консоль хостера.
+
+wait-login нужен, когда вход по паролю закрывают из дашборда: настройки закрепляются, только если
+после закрытия на сервер вошли новым соединением по ключу одного из устройств. Вход любым ключом
+не годится — на сервер ходят и скрипты, а проверить нужно ключ человека. Код выхода 0 — вход
+был, 2 — не дождались, 1 — проверить нечем.
 """
 import base64
+import hashlib
 import json
 import os
 import re
@@ -20,6 +28,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT_HOME = "/root"
 MAX_KEYS = 50
@@ -30,6 +39,7 @@ TYPES = ("ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha
 KEY = re.compile(r"^(" + "|".join(re.escape(t) for t in TYPES) + r") ([A-Za-z0-9+/]+={0,2})$")
 MARK = re.compile(r" airlok-device:[0-9a-f-]{36}$")
 # Ключ в строке authorized_keys: перед ним бывают опции (from=…, command="…").
+ACCEPTED = re.compile(r"^Accepted publickey for root from \S+ port \d+ ssh2: \S+ (SHA256:[A-Za-z0-9+/]+)$")
 LINE_KEY = re.compile(r"(?:^|\s)(" + "|".join(re.escape(t) for t in TYPES) + r"|ssh-dss)\s+([A-Za-z0-9+/]+={0,2})(?=\s|$)")
 
 
@@ -160,7 +170,56 @@ def apply(path, keys, password_login):
     return True
 
 
+def fingerprint(b64):
+    """Отпечаток как у ssh-keygen -l и в журнале sshd: SHA256 и base64 без «=»."""
+    digest = hashlib.sha256(base64.b64decode(b64)).digest()
+    return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+
+
+def device_fingerprints(text):
+    return {fingerprint(k[1]) for line in text.split("\n") if MARK.search(line.rstrip()) and (k := line_key(line))}
+
+
+def device_login(journal, fps):
+    """Отпечаток устройства из строки журнала sshd о входе root по ключу; None — такого входа не было."""
+    for line in journal.splitlines():
+        m = ACCEPTED.match(line.strip())
+        if m and m.group(1) in fps:
+            return m.group(1)
+    return None
+
+
+def wait_login(since, seconds):
+    with open(keys_path(sshd_conf()), encoding="utf-8", errors="surrogateescape") as f:
+        fps = device_fingerprints(f.read())
+    if not fps:
+        raise Failed("на сервере нет ключей устройств — вход по ключу проверить нечем")
+    deadline = time.monotonic() + seconds
+    while True:
+        r = subprocess.run(["journalctl", "--since", f"@{since}", "-t", "sshd", "-t", "sshd-session", "-o", "cat", "--no-pager"],
+                           capture_output=True, text=True, timeout=30)
+        fp = device_login(r.stdout, fps)
+        if fp or time.monotonic() >= deadline:
+            return fp
+        time.sleep(3)
+
+
+def main_wait(args):
+    try:
+        since, seconds = (int(a) for a in args)
+        fp = wait_login(since, seconds)
+    except (Failed, ValueError, OSError, subprocess.SubprocessError) as e:
+        print(f"Ошибка: {e}")
+        sys.exit(1)
+    if not fp:
+        sys.exit(2)
+    print(f"на сервер вошли по ключу устройства {fp}")
+
+
 def main():
+    if sys.argv[1:2] == ["wait-login"]:
+        main_wait(sys.argv[2:])
+        return
     try:
         keys = parse_request(json.load(sys.stdin))
         conf = sshd_conf()

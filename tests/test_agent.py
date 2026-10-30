@@ -59,6 +59,18 @@ class ParseTest(unittest.TestCase):
                   {"login": "closed", "user": ["root"]}):
             self.assertEqual(parse({"id": CID, "kind": "ssh_password", "ssh_password": p})[0], "bad", p)
 
+    def test_data_move(self):
+        url = "https://storage.yandexcloud.net/airlok/moves/1/db.sql.gz?X-Amz-Signature=ab%2Fc&X-Amz-Expires=7200"
+        cmd = {"id": CID, "kind": "data_move", "data_move": {"op": "export", "app": "shop", "db_url": url, "files_url": ""}}
+        self.assertEqual(parse(cmd), ["ok", CID, "data_move", "export", "shop", url, ""])
+        self.assertEqual(parse({"id": CID, "kind": "data_move", "data_move": {"op": "resume", "app": "shop"}}),
+                         ["ok", CID, "data_move", "resume", "shop", "", ""])
+        for m in (None, {"op": "drop", "app": "shop"}, {"op": "export", "app": "../shop"},
+                  {"op": "import", "app": "shop", "db_url": "http://storage/x"},
+                  {"op": "import", "app": "shop", "db_url": "https://s/x'; reboot"},
+                  {"op": "import", "app": "shop", "files_url": "https://s/x y"}):
+            self.assertEqual(parse({"id": CID, "kind": "data_move", "data_move": m})[0], "bad", m)
+
     def test_deploy(self):
         sha = "a" * 40
         got = parse({"id": CID, "kind": "deploy", "deploy": {"app": "shop", "repo": "acme/shop", "sha": sha, "ref": "main",

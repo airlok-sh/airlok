@@ -262,3 +262,11 @@ load_manifest() {
 	vars=$(python3 "$RECIPES_DIR/manifest.py" "$1") || exit 1
 	eval "$vars"
 }
+
+# start_cron_timers ИМЯ — снова запустить включённые задачи по расписанию приложения, которые
+# остановил перенос данных. Без задач systemctl отвечает ошибкой — это не сбой.
+start_cron_timers() {
+	local timers
+	timers=$(systemctl list-unit-files "airlok-cron@${1}_*.timer" --state=enabled --no-legend 2>/dev/null | awk '{print $1}') || true
+	[[ -z $timers ]] || echo "$timers" | xargs systemctl start
+}

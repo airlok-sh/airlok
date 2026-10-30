@@ -56,6 +56,10 @@ main() {
 
 	step "Перезапуск ${name}"
 	compose up -d --force-recreate --no-deps app || die "контейнер приложения не создался"
+	# После переноса данных приложение остановлено целиком, вместе с задачами по расписанию:
+	# «Запустить снова» в дашборде — это перезапуск, и он поднимает всё остальное тоже.
+	compose up -d || die "службы приложения не запустились"
+	start_cron_timers "$name"
 	# Порт наружу публикуют только сайты: у фонового приложения его нет.
 	grep -q '^    ports:' "$APP_DIR/compose.yml" && port=$(<"$APP_DIR/shared/port")
 	release=$(readlink -f "$APP_DIR/current")

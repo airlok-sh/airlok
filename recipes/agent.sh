@@ -4,8 +4,8 @@
 # Работает службой airlok-agent от root, потому что деплою нужны его права. Умеет только
 # выкатить коммит из GitHub, перезапустить выкаченное приложение, убрать его с сервера,
 # прочитать данные его базы (только чтение, через dbquery.py), положить root'у SSH-ключи
-# устройств (sshkeys.py), закрыть или открыть вход по паролю и обновиться сам, когда это
-# подтвердил человек в дашборде:
+# устройств (sshkeys.py), закрыть или открыть вход по паролю, выгрузить и загрузить данные
+# приложения при переезде (app-data.sh) и обновиться сам, когда это подтвердил человек в дашборде:
 # произвольную команду дашборд прислать не может, а каждое поле команды проверяется здесь
 # заново — значения доходят до команд от root.
 # Сервер сам ходит в дашборд, входящих соединений агент не принимает.
@@ -23,6 +23,7 @@ RESTART_TIMEOUT=600
 REMOVE_TIMEOUT=600
 DBQUERY_TIMEOUT=30
 SSHKEYS_TIMEOUT=30
+DATA_TIMEOUT=3600
 # Столько ждём, пока человек войдёт на сервер по ключу после закрытия пароля; откат — чуть позже.
 SSH_LOGIN_WAIT=300
 PROGRESS_EVERY=3
@@ -47,6 +48,8 @@ import json, re, sys
 UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+# Временная ссылка хранилища: только https и без пробелов и кавычек; в shell она не попадает.
+STORE_URL = re.compile(r"^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[^\s\"\x27\\]{1,8192}$")
 REPO_PART = re.compile(r"^[A-Za-z0-9_.-]+$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 REF = re.compile(r"^[A-Za-z0-9._/][A-Za-z0-9._/-]*$")
@@ -120,6 +123,17 @@ if kind == "ssh_password":
     if not isinstance(user, str) or not USER.match(user):
         emit("bad", cid, "некорректный пользователь сервера")
     emit("ok", cid, "ssh_password", p["login"], user)
+if kind == "data_move":
+    m = cmd.get("data_move")
+    if not isinstance(m, dict) or m.get("op") not in ("export", "import", "resume"):
+        emit("bad", cid, "в команде нет нужного действия с данными: export, import или resume")
+    app = m.get("app")
+    if not isinstance(app, str) or not NAME.match(app):
+        emit("bad", cid, "некорректное имя приложения")
+    urls = [m.get(k) or "" for k in ("db_url", "files_url")]
+    if not all(isinstance(u, str) and (u == "" or STORE_URL.fullmatch(u)) for u in urls):
+        emit("bad", cid, "некорректная ссылка на хранилище")
+    emit("ok", cid, "data_move", m["op"], app, *urls)
 if kind == "restart":
     r = cmd.get("restart")
     if not isinstance(r, dict):
@@ -486,6 +500,25 @@ run_ssh_password() {
 	heartbeat_now
 }
 
+# run_data_move — данные приложения при переезде: выгрузить, загрузить или запустить
+# остановленное снова. Ссылки на хранилище — только в окружении app-data.sh.
+run_data_move() {
+	local id=$1 op=$2 app=$3 db_url=$4 files_url=$5 log=$STATE_DIR/command.log rc message=""
+	echo "команда ${id}: данные ${app} — ${op}"
+	install -m 600 /dev/null "$log"
+	AIRLOK_DB_URL=$db_url AIRLOK_FILES_URL=$files_url timeout --kill-after=60 "$DATA_TIMEOUT" \
+		"$RECIPES_DIR/app-data.sh" "$op" "$app" </dev/null >"$log" 2>&1
+	rc=$?
+	if ((rc == 124 || rc == 137)); then
+		message="перенос данных не уложился в $((DATA_TIMEOUT / 60)) минут и был остановлен"
+	fi
+	if ((rc == 0)); then
+		send_result "$id" success "$message" "$log"
+	else
+		send_result "$id" failed "$message" "$log"
+	fi
+}
+
 # heartbeat_now — отметка с состоянием сервера сразу, а не через минуту: дашборд покажет,
 # открыт ли теперь вход по паролю.
 heartbeat_now() {
@@ -537,6 +570,7 @@ handle() {
 	db_query) run_db_query "${f[1]}" ;;
 	ssh_keys) run_ssh_keys "${f[1]}" ;;
 	ssh_password) run_ssh_password "${f[1]}" "${f[3]}" "${f[4]}" ;;
+	data_move) run_data_move "${f[1]}" "${f[3]}" "${f[4]}" "${f[5]}" "${f[6]}" ;;
 	*) run_deploy "${f[1]}" "${f[@]:3}" ;;
 	esac
 }

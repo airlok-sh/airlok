@@ -111,6 +111,95 @@ class CollectTest(unittest.TestCase):
         self.assertEqual([r["route"] for r in later[0]["routes"]], ["/"])
 
 
+CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/141.0 Safari/537.36"
+
+
+def visit(at=MINUTE + 5, status=200, uri="/", ip="5.1.2.3", ua=CHROME, ref="", **extra):
+    v = {"t": at, "s": status, "ip": ip, "host": "shop.example.ru", "uri": uri, "ct": "text/html; charset=utf-8",
+         "dest": "document", "rsc": "", "sp": "", "pu": "", "nrp": "", "ref": ref, "ua": ua}
+    v.update(extra)
+    return json.dumps(v)
+
+
+def geo_file():
+    """База стран в формате internal/geoip: 5.0.0.0/8 — RU, остальное неизвестно, IPv6 нет."""
+    starts = [bytes([0, 0, 0, 0]), bytes([5, 0, 0, 0]), bytes([6, 0, 0, 0])]
+    return (b"AIRGEO1\n" + (3).to_bytes(4, "big") + b"".join(starts) + b"--RU--" + (0).to_bytes(4, "big"))
+
+
+class VisitsTest(unittest.TestCase):
+    """Правила те же, что у edge хостинга (internal/edge/visits_test.go в backend)."""
+
+    def test_page_view(self):
+        cases = [
+            ({}, 200, True),
+            ({}, 304, True),
+            ({}, 404, False),
+            ({"ct": "application/json"}, 200, False),
+            ({"dest": "iframe"}, 200, False),
+            ({"sp": "prefetch;prerender"}, 200, False),
+            ({"rsc": "1", "dest": "empty", "ct": "text/x-component"}, 200, True),
+            ({"rsc": "1", "nrp": "1"}, 200, False),
+        ]
+        for extra, status, want in cases:
+            v = json.loads(visit(**extra))
+            self.assertEqual(metrics.page_view(v, status, CHROME), want, extra)
+        self.assertFalse(metrics.page_view(json.loads(visit()), 200, "Mozilla/5.0 (compatible; YandexBot/3.0)"))
+        self.assertFalse(metrics.page_view(json.loads(visit()), 200, ""))
+
+    def test_source_and_device(self):
+        self.assertEqual(metrics.visit_source("", "", "shop.example.ru"), "")
+        self.assertEqual(metrics.visit_source("", "https://www.Yandex.ru/", "shop.example.ru"), "yandex.ru")
+        self.assertEqual(metrics.visit_source("utm_source=VK", "https://vk.com/", "shop.example.ru"), "vk")
+        self.assertIsNone(metrics.visit_source("", "https://shop.example.ru/a", "www.shop.example.ru"))
+        self.assertEqual(metrics.device("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0) Mobile/15E148"), "mobile")
+        self.assertEqual(metrics.device("Mozilla/5.0 (Linux; Android 13; SM-X710) Chrome/141.0 Safari/537.36"), "tablet")
+        self.assertEqual(metrics.device(CHROME), "desktop")
+
+    def test_geoip(self):
+        geo = metrics.GeoIP(geo_file())
+        self.assertEqual(geo.country("5.1.2.3"), "RU")
+        self.assertEqual(geo.country("::ffff:5.1.2.3"), "RU")
+        self.assertEqual(geo.country("7.7.7.7"), "")
+        self.assertEqual(geo.country("2a02:6b8::1"), "")
+        with self.assertRaises(ValueError):
+            metrics.GeoIP(geo_file()[:-1])
+
+    def test_visits_go_with_minute(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "airlok-shop.access.log"), "w", encoding="utf-8") as f:
+                for _ in range(5):
+                    f.write(line(200, "/") + "\n")
+                f.write(line(200, "/", at=MINUTE + 65) + "\n")
+            visits = os.path.join(d, "airlok-shop.visits.log")
+            with open(visits, "w", encoding="utf-8") as f:
+                f.write(visit(ref="https://yandex.ru/") + "\n")
+                f.write(visit(uri="/price?utm_source=tg", ref="https://shop.example.ru/") + "\n")
+                f.write(visit(uri="/%D1%86%D0%B5%D0%BD%D1%8B", ref="https://shop.example.ru/") + "\n")
+                f.write(visit(ua="curl/8.5.0") + "\n")
+                f.write(visit(ip="7.7.7.7", ua="Mozilla/5.0 (iPhone; CPU iPhone OS 18_0) Mobile/15E148") + "\n")
+                f.write("не json\n")
+            glob_was = metrics.LOG_GLOB
+            metrics.LOG_GLOB = os.path.join(d, "airlok-*.access.log")
+            try:
+                salts = {}
+                done = metrics.collect({}, MINUTE + 70, salts, metrics.GeoIP(geo_file()))
+                left = os.path.getsize(visits)
+            finally:
+                metrics.LOG_GLOB = glob_was
+        self.assertEqual(len(done), 1)
+        v = done[0]["visits"]
+        self.assertEqual(v["views"], 4)
+        self.assertEqual(len(v["visitors"]), 2, "тот же IP и браузер — один посетитель")
+        self.assertEqual(v["pages"], {"/": 2, "/price": 1, "/цены": 1})
+        self.assertEqual(v["sources"], {"yandex.ru": 1, "tg": 1, "": 1}, "переход внутри сайта — не заход")
+        self.assertEqual(v["devices"], {"desktop": 3, "mobile": 1})
+        self.assertEqual(v["countries"], {"RU": 3, "": 1})
+        self.assertEqual(left, 0, "прочитанный лог посещений с IP стёрт")
+        self.assertEqual(list(salts), [metrics.msk_day(MINUTE)])
+        self.assertNotIn("5.1.2.3", json.dumps(done), "IP в дашборд не уходит")
+
+
 class BatchTest(unittest.TestCase):
     def test_batch_fits_body_limit(self):
         route = {"method": "GET", "route": "/x" * 50, "requests": 1, "status_4xx": 0, "status_5xx": 0, "p50_ms": 1, "p95_ms": 1}

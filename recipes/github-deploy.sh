@@ -8,6 +8,9 @@
 # Агент (agent.sh) вызывает deploy с переменными окружения вместо deploy key:
 #   AIRLOK_GITHUB_TOKEN  — токен GitHub App только на чтение, код забирается по HTTPS;
 #   AIRLOK_GITHUB_PUBLIC — 1: публичный репозиторий, по HTTPS без токена;
+#   AIRLOK_GIT_AUTH      — доступ к репозиторию по ссылке (Basic, base64), когда вместо
+#                          владелец/репозиторий передана ссылка https://хост/путь.git (GitVerse, GitFlic);
+#   AIRLOK_TITLE_FILE    — сюда записывается заголовок выкатываемого коммита;
 #   AIRLOK_FETCH_REF     — ветка, в которой искать коммит (забирается только она);
 #   AIRLOK_ROOT_DIR      — каталог проекта внутри репозитория (там airlok.yml, если он есть);
 #   AIRLOK_APP_NAME      — имя приложения на сервере вместо app.name из манифеста;
@@ -31,6 +34,17 @@ GITHUB_HOST_KEY="github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6
 
 parse_repo() {
 	local repo=${1:-}
+	GIT_URL=""
+	# Код по ссылке на любой git-хостинг: тот же формат, что проверяют дашборд и агент.
+	if [[ $repo =~ ^https://[a-z0-9.-]+(/[A-Za-z0-9_][A-Za-z0-9_.~-]*){2,8}\.git$ && $repo != *..* && $repo != https://github.com/* ]]; then
+		GIT_URL=$repo
+		REPO=${repo#https://}
+		REPO=${REPO%.git}
+		SLUG=${REPO//\//__}
+		KEY=""
+		GIT_DIR_PATH=$CACHE_DIR/$SLUG.git
+		return
+	fi
 	repo=${repo#https://github.com/}
 	repo=${repo#git@github.com:}
 	repo=${repo%.git}
@@ -72,6 +86,17 @@ EOF
 # было бы видно в ps, а git пишет URL в сообщения об ошибках.
 git_https() {
 	export GIT_TERMINAL_PROMPT=0
+	if [[ -n $GIT_URL ]]; then
+		local host=${GIT_URL#https://}
+		host=${host%%/*}
+		# Доступ — только этому серверу git; переадресацией его не увести.
+		export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.followRedirects GIT_CONFIG_VALUE_0=false
+		if [[ -n ${AIRLOK_GIT_AUTH:-} ]]; then
+			export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_1=http.https://${host}/.extraheader \
+				GIT_CONFIG_VALUE_1="AUTHORIZATION: basic ${AIRLOK_GIT_AUTH}"
+		fi
+		return
+	fi
 	if [[ -n ${AIRLOK_GITHUB_TOKEN:-} ]]; then
 		local basic
 		basic=$(printf 'x-access-token:%s' "$AIRLOK_GITHUB_TOKEN" | base64 -w0)
@@ -80,29 +105,36 @@ git_https() {
 	fi
 }
 
-https_mode() { [[ -n ${AIRLOK_GITHUB_TOKEN:-} || ${AIRLOK_GITHUB_PUBLIC:-} == 1 ]]; }
+https_mode() { [[ -n $GIT_URL || -n ${AIRLOK_GITHUB_TOKEN:-} || ${AIRLOK_GITHUB_PUBLIC:-} == 1 ]]; }
 
 # fetch [ВЕТКА] — забрать код в кэш. URL передаётся прямо в git fetch, а не через remote:
 # один и тот же кэш забирают и по deploy key, и по HTTPS.
 fetch() {
-	local branch=${1:-} url
-	if https_mode; then
+	local branch=${1:-}
+	if [[ -n $GIT_URL ]]; then
 		git_https
-		url=https://github.com/${REPO}.git
+		FETCH_URL=$GIT_URL
+	elif https_mode; then
+		git_https
+		FETCH_URL=https://github.com/${REPO}.git
 	else
 		git_ssh
 		[[ -s $KEY ]] || die "нет ключа для ${REPO}, сначала: $0 setup ${REPO}"
-		url=git@github.com:${REPO}.git
+		FETCH_URL=git@github.com:${REPO}.git
 	fi
 	install -d -m 700 "$CACHE_DIR"
 	[[ -d $GIT_DIR_PATH ]] || git init -q --bare "$GIT_DIR_PATH"
 	local refspec='+refs/heads/*:refs/heads/*'
 	[[ -n $branch ]] && refspec="+refs/heads/${branch}:refs/heads/${branch}"
 	local err
-	if ! err=$(git --git-dir="$GIT_DIR_PATH" fetch -q --prune "$url" "$refspec" 2>&1); then
+	if ! err=$(git --git-dir="$GIT_DIR_PATH" fetch -q --prune "$FETCH_URL" "$refspec" 2>&1); then
 		fetch_failed "$err"
 	fi
-	ok "код получен из github.com/${REPO}"
+	if [[ -n $GIT_URL ]]; then
+		ok "код получен из ${REPO}"
+	else
+		ok "код получен из github.com/${REPO}"
+	fi
 }
 
 fetch_failed() {
@@ -110,14 +142,16 @@ fetch_failed() {
 	case $err in
 	*"Permission denied"* | *"Repository not found"* | *"Could not read from remote"* | *"Authentication failed"* | \
 		*"could not read Username"* | *"returned error: 401"* | *"returned error: 403"* | *"returned error: 404"*)
-		if [[ -n ${AIRLOK_GITHUB_TOKEN:-} ]]; then
+		if [[ -n $GIT_URL ]]; then
+			die "сервер git не дал доступ к ${REPO}: проверьте ссылку, логин и токен в настройках приложения в дашборде"
+		elif [[ -n ${AIRLOK_GITHUB_TOKEN:-} ]]; then
 			die "GitHub не дал доступ к репозиторию ${REPO}: проверьте, что приложение airlok установлено и у него есть доступ к этому репозиторию"
 		elif [[ ${AIRLOK_GITHUB_PUBLIC:-} == 1 ]]; then
 			die "репозиторий ${REPO} не найден или закрытый: для закрытого репозитория подключите GitHub в дашборде"
 		fi
 		die "GitHub не пустил по ключу. Проверьте, что ключ добавлен в Deploy keys репозитория ${REPO}: $0 setup ${REPO}" ;;
 	*"couldn't find remote ref"*) die "в ${REPO} нет такой ветки" ;;
-	*) die "не удалось получить код из GitHub: ${err}" ;;
+	*) die "не удалось получить код из ${GIT_URL:+${REPO}}${GIT_URL:-GitHub}: ${err}" ;;
 	esac
 }
 
@@ -167,7 +201,7 @@ deploy() {
 	if https_mode && [[ $ref =~ ^[0-9a-f]{40}$ ]] &&
 		! git --git-dir="$GIT_DIR_PATH" cat-file -e "${ref}^{commit}" 2>/dev/null; then
 		local err
-		err=$(git --git-dir="$GIT_DIR_PATH" fetch -q "https://github.com/${REPO}.git" "$ref" 2>&1) || fetch_failed "$err"
+		err=$(git --git-dir="$GIT_DIR_PATH" fetch -q "$FETCH_URL" "$ref" 2>&1) || fetch_failed "$err"
 	fi
 	resolve "$ref"
 	SRC=$(mktemp -d /tmp/airlok-src.XXXXXX)
@@ -182,8 +216,9 @@ deploy() {
 	local subject
 	subject=$(git --git-dir="$GIT_DIR_PATH" log -1 --format='%s' "$SHA")
 	ok "${REF_KIND}: ${SHA:0:12} «${subject}»"
+	[[ -n ${AIRLOK_TITLE_FILE:-} ]] && printf '%s' "$subject" >"$AIRLOK_TITLE_FILE"
 	# Дальше код уже на диске: сборке и приложению токен не нужен.
-	unset AIRLOK_GITHUB_TOKEN GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+	unset AIRLOK_GITHUB_TOKEN AIRLOK_GIT_AUTH GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1
 	HANDED_OFF=1
 	AIRLOK_RELEASE_ID=${SHA:0:12} AIRLOK_RELEASE_TITLE=$subject "$RECIPES_DIR/app-deploy.sh" "$src"
 }

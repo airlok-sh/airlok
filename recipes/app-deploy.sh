@@ -604,6 +604,7 @@ ${tls_listen}
     client_max_body_size ${UPLOAD_MAX_MB}m;
     include snippets/airlok-security-headers.conf;
     access_log /var/log/nginx/airlok-${APP_NAME}.access.log airlok;
+    access_log /var/log/nginx/airlok-${APP_NAME}.visits.log airlok_visit if=\$airlok_visit;
 
     location ~ /\\.(?!well-known/) { deny all; }
     # Появляется после github-deploy.sh webhook; пока файла нет, include ничего не добавляет.

@@ -237,9 +237,22 @@ write_if_changed() {
 # (/orders/:id) — персональные данные посетителей серверу airlok не нужны. Путь последний:
 # в нём бывают пробелы. Нужен и server-base.sh, и app-deploy.sh: сайт с access_log … airlok
 # без формата nginx не примет.
+#
+# Второй лог — посещения: только открытия страниц (GET с Accept: text/html или переход
+# Next.js с заголовком RSC). В нём есть IP и браузер, но metrics.py раз в минуту превращает
+# их в обезличенный хэш с солью суток и сразу стирает прочитанное: в дашборд уходят только
+# хэши и счётчики.
 ensure_log_format() {
 	write_if_changed /etc/nginx/conf.d/airlok-log.conf 0644 <<'EOF'
 log_format airlok '$msec $status $request_time $body_bytes_sent $request_method $uri';
+map "$request_method:$http_accept:$http_rsc" $airlok_visit {
+    default 0;
+    "~^GET:[^:]*text/html" 1;
+    "~^GET:.*:1$" 1;
+}
+log_format airlok_visit escape=json '{"t":$msec,"s":$status,"ip":"$remote_addr","host":"$host","uri":"$request_uri",'
+    '"ct":"$sent_http_content_type","dest":"$http_sec_fetch_dest","rsc":"$http_rsc","sp":"$http_sec_purpose",'
+    '"pu":"$http_purpose","nrp":"$http_next_router_prefetch","ref":"$http_referer","ua":"$http_user_agent"}';
 EOF
 }
 

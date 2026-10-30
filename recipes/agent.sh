@@ -47,6 +47,10 @@ REF = re.compile(r"^[A-Za-z0-9._/][A-Za-z0-9._/-]*$")
 SEGMENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
 # Токены установки GitHub App бывают и короткими ghs_…, и длинными, с точками (около 400 символов).
 TOKEN = re.compile(r"^[A-Za-z0-9_.-]{1,2048}$")
+# Код по ссылке (GitVerse, GitFlic и другие): дашборд присылает её в виде https://хост/путь.git,
+# а доступ — готовым значением Basic (base64).
+GIT_URL = re.compile(r"^https://[a-z0-9.-]+(/[A-Za-z0-9_][A-Za-z0-9_.~-]*){2,8}\.git$")
+GIT_AUTH = re.compile(r"^[A-Za-z0-9+/=]{1,4096}$")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 # Домен из дашборда — ASCII, кириллица уже в punycode (xn--p1ai для .рф).
 DOMAIN = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})$")
@@ -116,13 +120,19 @@ def text(key):
     return v
 
 
-app, repo, sha, ref, root, title, token, domain = (
-    text(k) for k in ("app", "repo", "sha", "ref", "root_dir", "title", "github_token", "domain"))
+app, repo, sha, ref, root, title, token, domain, git_auth = (
+    text(k) for k in ("app", "repo", "sha", "ref", "root_dir", "title", "github_token", "domain", "git_auth"))
 if not NAME.match(app):
     emit("bad", cid, "некорректное имя приложения")
-parts = repo.split("/")
-if len(parts) != 2 or not all(REPO_PART.match(p) and p not in (".", "..") for p in parts):
-    emit("bad", cid, "некорректный репозиторий")
+if repo.startswith("https://"):
+    if not GIT_URL.fullmatch(repo) or ".." in repo:
+        emit("bad", cid, "некорректная ссылка на репозиторий")
+else:
+    parts = repo.split("/")
+    if len(parts) != 2 or not all(REPO_PART.match(p) and p not in (".", "..") for p in parts):
+        emit("bad", cid, "некорректный репозиторий")
+if git_auth and not GIT_AUTH.fullmatch(git_auth):
+    emit("bad", cid, "некорректный доступ к репозиторию")
 if not SHA.match(sha):
     emit("bad", cid, "некорректный коммит")
 if ref and (not REF.match(ref) or ".." in ref):
@@ -136,7 +146,7 @@ if domain and not DOMAIN.fullmatch(domain):
     emit("bad", cid, "некорректный домен")
 # Нет поля — у дашборда нет ключа сервера или он старый: файл переменных не трогаем.
 has_env = save_env(d.get("env"))
-emit("ok", cid, "deploy", app, repo, sha, ref, root, " ".join(title.split())[:200], token, domain, has_env)
+emit("ok", cid, "deploy", app, repo, sha, ref, root, " ".join(title.split())[:200], token, domain, has_env, git_auth)
 '
 
 # Тело запроса к дашборду в JSON: режим progress — хвост лога и этапы идущей выкатки,
@@ -198,6 +208,7 @@ def stages(path, status, now):
 
 
 mode, status, message, log_path, stages_path = sys.argv[1:6]
+title_path = sys.argv[6] if len(sys.argv) > 6 else ""
 log = ANSI.sub("", read(log_path))
 tail = log.encode()[-32768:].decode("utf-8", "ignore")
 st = stages(stages_path, status if mode == "result" else "running", time.time())
@@ -215,14 +226,18 @@ if not message and status == "failed":
 body = {"status": status, "message": message[:2000], "log": tail}
 if st is not None:
     body["stages"] = st
+# Заголовок коммита из кода по ссылке: дашборд без API площадки его не знает.
+title = " ".join(read(title_path).split())[:500]
+if title:
+    body["title"] = title
 print(json.dumps(body, ensure_ascii=False))
 '
 
 # send_result ID STATUS СООБЩЕНИЕ [ЛОГ] [ЭТАПЫ] — итог важнее скорости: при сбое связи
 # повторяем несколько раз, иначе дашборд будет час считать команду выполняющейся.
 send_result() {
-	local id=$1 status=$2 message=$3 log=${4:-} stages=${5:-} body=$RUN_DIR/result.json code i
-	python3 -c "$PAYLOAD_PY" result "$status" "$message" "$log" "$stages" >"$body" || return
+	local id=$1 status=$2 message=$3 log=${4:-} stages=${5:-} title=${6:-} body=$RUN_DIR/result.json code i
+	python3 -c "$PAYLOAD_PY" result "$status" "$message" "$log" "$stages" "$title" >"$body" || return
 	for i in 1 2 3 4 5 6; do
 		code=$(dashboard_fetch POST "/agent/v1/commands/${id}/result" /dev/null "@${body}") || code=000
 		case $code in
@@ -270,8 +285,8 @@ open_env() {
 }
 
 run_deploy() {
-	local id=$1 app=$2 repo=$3 sha=$4 ref=$5 root=$6 title=$7 token=$8 domain=$9 has_env=${10}
-	local log=$STATE_DIR/command.log stages=$STATE_DIR/command.stages public=0 rc message="" streamer panel=""
+	local id=$1 app=$2 repo=$3 sha=$4 ref=$5 root=$6 title=$7 token=$8 domain=$9 has_env=${10} git_auth=${11:-}
+	local log=$STATE_DIR/command.log stages=$STATE_DIR/command.stages subject=$STATE_DIR/command.title public=0 rc message="" streamer panel=""
 	[[ -z $token ]] && public=1
 	echo "команда ${id}: выкатка ${repo}${root:+/${root}} ${sha:0:12} «${title}» как ${app}${domain:+ на ${domain}}"
 	if [[ $has_env == 1 ]]; then
@@ -285,12 +300,13 @@ run_deploy() {
 	rm -f "$ENV_JSON" "$RUN_DIR/env.err"
 	install -m 600 /dev/null "$log"
 	install -m 600 /dev/null "$stages"
+	install -m 600 /dev/null "$subject"
 	stream_progress "$id" "$log" "$stages" &
 	streamer=$!
 	# Токен — только в окружении дочернего процесса: в аргументах его было бы видно в ps.
-	AIRLOK_GITHUB_TOKEN=$token AIRLOK_GITHUB_PUBLIC=$public AIRLOK_FETCH_REF=$ref \
+	AIRLOK_GITHUB_TOKEN=$token AIRLOK_GITHUB_PUBLIC=$public AIRLOK_GIT_AUTH=$git_auth AIRLOK_FETCH_REF=$ref \
 		AIRLOK_ROOT_DIR=$root AIRLOK_APP_NAME=$app AIRLOK_STAGE_FILE=$stages AIRLOK_BUILD_OUTPUT=1 \
-		AIRLOK_PANEL_ENV=$panel AIRLOK_APP_DOMAIN=$domain \
+		AIRLOK_PANEL_ENV=$panel AIRLOK_APP_DOMAIN=$domain AIRLOK_TITLE_FILE=$subject \
 		timeout --kill-after=60 "$DEPLOY_TIMEOUT" "$RECIPES_DIR/github-deploy.sh" deploy "$repo" "$sha" \
 		</dev/null >"$log" 2>&1
 	rc=$?
@@ -301,10 +317,11 @@ run_deploy() {
 		message="выкатка не уложилась в $((DEPLOY_TIMEOUT / 60)) минут и была остановлена"
 	fi
 	if ((rc == 0)); then
-		send_result "$id" success "$message" "$log" "$stages"
+		send_result "$id" success "$message" "$log" "$stages" "$subject"
 	else
-		send_result "$id" failed "$message" "$log" "$stages"
+		send_result "$id" failed "$message" "$log" "$stages" "$subject"
 	fi
+	rm -f "$subject"
 }
 
 # run_restart — перезапуск выкаченного приложения без сборки: с переменными из дашборда, если

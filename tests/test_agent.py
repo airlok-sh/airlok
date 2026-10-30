@@ -44,13 +44,25 @@ class ParseTest(unittest.TestCase):
         sha = "a" * 40
         got = parse({"id": CID, "kind": "deploy", "deploy": {"app": "shop", "repo": "acme/shop", "sha": sha, "ref": "main",
                                                              "root_dir": "web", "title": "Новая  корзина\n", "github_token": ""}})
-        self.assertEqual(got, ["ok", CID, "deploy", "shop", "acme/shop", sha, "main", "web", "Новая корзина", "", "", "0"],
+        self.assertEqual(got, ["ok", CID, "deploy", "shop", "acme/shop", sha, "main", "web", "Новая корзина", "", "", "0", ""],
                          "без env в команде агент не трогает файл переменных")
+
+    def test_deploy_by_link(self):
+        sha, auth = "a" * 40, "YWNtZTp0b2s="
+        deploy = {"app": "shop", "repo": "https://gitflic.ru/project/acme/shop.git", "sha": sha, "ref": "main", "git_auth": auth}
+        got = parse({"id": CID, "kind": "deploy", "deploy": deploy})
+        self.assertEqual(got[:5], ["ok", CID, "deploy", "shop", "https://gitflic.ru/project/acme/shop.git"])
+        self.assertEqual(got[-1], auth)
+        for repo in ("https://gitverse.ru/acme.git", "http://gitverse.ru/acme/shop.git", "https://gitverse.ru/acme/../shop.git",
+                     "https://user:x@gitverse.ru/acme/shop.git", "https://gitverse.ru/acme/shop", "https://gitverse.ru/-x/shop.git"):
+            self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "repo": repo}})[0], "bad", repo)
+        for bad in ("a b", "x\n", "токен"):
+            self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "git_auth": bad}})[0], "bad", bad)
 
     def test_deploy_domain(self):
         deploy = {"app": "shop", "repo": "acme/shop", "sha": "a" * 40}
         for domain in ("shop.example.ru", "xn--80aairftm.xn--p1ai", "a1.b-c.io"):
-            self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "domain": domain}})[-2], domain)
+            self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "domain": domain}})[-3], domain)
         for domain in ("Shop.Example.ru", "shop..ru", "-shop.ru", "shop.ru; reboot", "shop.ru\n", "shop", "x" * 250 + ".ru", 42):
             self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "domain": domain}})[0], "bad", domain)
 
@@ -59,10 +71,10 @@ class ParseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "env.json")
             env = [{"name": "API_KEY", "value": "v1:QUJD", "extra": "x"}]
-            self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "env": env}}, path)[-1], "1")
+            self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "env": env}}, path)[-2], "1")
             with open(path) as f:
                 self.assertEqual(json.load(f), [{"name": "API_KEY", "value": "v1:QUJD"}])
-            self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "env": []}}, path)[-1], "1",
+            self.assertEqual(parse({"id": CID, "kind": "deploy", "deploy": {**deploy, "env": []}}, path)[-2], "1",
                              "пустой список — в дашборде переменных не осталось, файл очистится")
             for env in ("x", [{"name": "A B", "value": "v1:QUJD"}], [{"name": "A", "value": "plain"}],
                         [{"name": "A", "value": "v1:QUJD\nB=1"}], [{"name": "A"}]):
@@ -105,10 +117,17 @@ class PayloadTest(unittest.TestCase):
         with open(self.stages, "a", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line in lines))
 
-    def payload(self, mode, status="running", message=""):
-        out = subprocess.run([sys.executable, "-c", PAYLOAD_PY, mode, status, message, self.log, self.stages],
+    def payload(self, mode, status="running", message="", title=""):
+        out = subprocess.run([sys.executable, "-c", PAYLOAD_PY, mode, status, message, self.log, self.stages, title],
                              capture_output=True, check=True)
         return json.loads(out.stdout)
+
+    def test_commit_title_goes_with_result(self):
+        path = os.path.join(self.tmp.name, "command.title")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("Корзина\n")
+        self.assertEqual(self.payload("result", "success", "Готово", path)["title"], "Корзина")
+        self.assertNotIn("title", self.payload("result", "success", "Готово"), "у GitHub заголовок дашборд знает сам")
 
     def test_progress(self):
         self.assertEqual(self.payload("progress")["stages"], [], "до первой отметки этапов нет")

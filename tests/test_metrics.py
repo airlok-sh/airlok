@@ -15,8 +15,11 @@ spec.loader.exec_module(metrics)
 MINUTE = 1761541200  # 2025-10-27T05:00:00Z
 
 
-def line(status, path, method="GET", took=0.005, sent=10, at=MINUTE + 5):
-    return "%.3f %d %.3f %d %s %s" % (at, status, took, sent, method, path)
+def line(status, path, method="GET", took=0.005, sent=10, at=MINUTE + 5, upstream=None):
+    """Строка лога в формате airlok; время приложения по умолчанию равно длительности запроса."""
+    if upstream is None:
+        upstream = "%.3f" % took
+    return '%.3f %d %.3f %d %s %s "%s"' % (at, status, took, sent, method, path, upstream)
 
 
 class RouteOfTest(unittest.TestCase):
@@ -83,12 +86,39 @@ class AddLineTest(unittest.TestCase):
         m = minutes[str(MINUTE)]
         self.assertEqual((m["requests"], m["status_5xx"], m["routes"]), (1, 1, {}))
 
+    def test_app_time_instead_of_request_time(self):
+        # Сканер медленно шлёт тело POST: nginx принимал его 1,3 с, а приложение ответило 405 сразу.
+        cases = [
+            ("0.001", 1),
+            ("-", 1309),
+            ("0.002, 0.004", 6),
+            ("0.003 : 0.005", 8),
+            ("-, 0.004 : -", 4),
+        ]
+        for upstream, want in cases:
+            minutes = {}
+            metrics.add_line(minutes, line(405, "/", method="POST", took=1.309, upstream=upstream))
+            m = minutes[str(MINUTE)]
+            self.assertEqual((m["ms"], m["routes"]["POST /"]["ms"]), ([want], [want]), upstream)
+
+    def test_path_before_app_time(self):
+        minutes = {}
+        metrics.add_line(minutes, line(200, "/say \\x22hi\\x22", took=0.5, upstream="0.003"))
+        metrics.add_line(minutes, "%.3f 200 0.004 10 GET /old with space" % (MINUTE + 1))
+        metrics.add_line(minutes, '%.3f 200 0.004 10 GET /cut "0.00' % (MINUTE + 1))
+        routes = minutes[str(MINUTE)]["routes"]
+        self.assertEqual(routes['GET /say "hi"']["ms"], [3], "кавычка в пути экранирована и не путает разбор")
+        self.assertEqual(routes["GET /old with space"]["ms"], [4], "строка без времени приложения — по длительности")
+        self.assertEqual(minutes[str(MINUTE)]["requests"], 2, "строка с незакрытой кавычкой отброшена")
+
 
 class CollectTest(unittest.TestCase):
     def test_finished_minute_goes_with_routes(self):
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "airlok-shop.access.log"), "w", encoding="utf-8") as f:
-                f.write(line(200, "/api/items/5", took=0.010) + "\n")
+                # Формат сменился посреди минуты: строки до reload nginx — без времени приложения.
+                f.write("%.3f 200 0.020 10 GET /api/items/4\n" % (MINUTE + 1))
+                f.write(line(200, "/api/items/5", took=1.200, upstream="0.010") + "\n")
                 f.write(line(500, "/api/items/6", took=0.030) + "\n")
                 f.write(line(200, "/", at=MINUTE + 65) + "\n")
             glob_was = metrics.LOG_GLOB
@@ -103,10 +133,11 @@ class CollectTest(unittest.TestCase):
                 metrics.LOG_GLOB = glob_was
         self.assertEqual(len(done), 1)
         b = done[0]
-        self.assertEqual((b["app"], b["requests"], b["status_5xx"]), ("shop", 2, 1))
+        self.assertEqual((b["app"], b["requests"], b["status_5xx"]), ("shop", 3, 1))
+        self.assertEqual((b["p50_ms"], b["p95_ms"]), (20, 30))
         self.assertEqual(b["routes"], [{
-            "method": "GET", "route": "/api/items/:id", "requests": 2, "status_4xx": 0, "status_5xx": 1,
-            "p50_ms": 10, "p95_ms": 30,
+            "method": "GET", "route": "/api/items/:id", "requests": 3, "status_4xx": 0, "status_5xx": 1,
+            "p50_ms": 20, "p95_ms": 30,
         }])
         self.assertEqual([r["route"] for r in later[0]["routes"]], ["/"])
 

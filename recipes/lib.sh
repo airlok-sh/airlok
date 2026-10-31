@@ -232,10 +232,12 @@ write_if_changed() {
 	return 0
 }
 
-# Формат логов nginx для метрик: время, код, длительность, размер ответа, метод и путь.
-# Без IP и query-строки, а путь metrics.py отправляет в дашборд только шаблоном
-# (/orders/:id) — персональные данные посетителей серверу airlok не нужны. Путь последний:
-# в нём бывают пробелы. Нужен и server-base.sh, и app-deploy.sh: сайт с access_log … airlok
+# Формат логов nginx для метрик: время, код, длительность, размер ответа, метод, путь и
+# время ответа приложения — в $request_time входят ещё приём тела запроса и отдача ответа
+# медленному клиенту. Без IP и query-строки, а путь metrics.py отправляет в дашборд только
+# шаблоном (/orders/:id) — персональные данные посетителей серверу airlok не нужны. В пути
+# бывают пробелы, поэтому время приложения после него — в кавычках: кавычку в значениях
+# nginx пишет как \x22. Нужен и server-base.sh, и app-deploy.sh: сайт с access_log … airlok
 # без формата nginx не примет.
 #
 # Второй лог — посещения: только открытия страниц (GET с Accept: text/html или переход
@@ -244,7 +246,7 @@ write_if_changed() {
 # хэши и счётчики.
 ensure_log_format() {
 	write_if_changed /etc/nginx/conf.d/airlok-log.conf 0644 <<'EOF'
-log_format airlok '$msec $status $request_time $body_bytes_sent $request_method $uri';
+log_format airlok '$msec $status $request_time $body_bytes_sent $request_method $uri "$upstream_response_time"';
 map "$request_method:$http_accept:$http_rsc" $airlok_visit {
     default 0;
     "~^GET:[^:]*text/html" 1;

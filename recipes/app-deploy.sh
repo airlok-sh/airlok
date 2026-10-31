@@ -541,7 +541,8 @@ nginx_site() {
 		TLS_KIND="самоподписанный"
 		le_enabled || note "сертификат самоподписанный; выпустить настоящий: sudo ${RECIPES_DIR}/server-base.sh letsencrypt"
 	fi
-	ensure_log_format || true
+	local reload=no
+	ensure_log_format && reload=yes
 
 	local uploads_block="" images=() others=() e
 	if ((UPLOADS_ENABLED && UPLOADS_PUBLIC)); then
@@ -626,8 +627,10 @@ EOF
 			rm -f "/etc/nginx/sites-enabled/airlok-${APP_NAME}.conf" "/etc/nginx/sites-available/airlok-${APP_NAME}.conf"
 			die "nginx не принял конфиг сайта, конфиг убран, остальные сайты не затронуты"
 		fi
-		systemctl reload nginx
+		reload=yes
 	fi
+	# Формат лога мог смениться и без правки сайта, а nginx перечитывает его только по reload.
+	[[ $reload == no ]] || systemctl reload nginx
 	ok "https://${APP_DOMAIN} → 127.0.0.1:${APP_PORT}, сертификат ${TLS_KIND}, HTTP перенаправляется на HTTPS"
 }
 

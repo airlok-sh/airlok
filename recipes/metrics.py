@@ -2,9 +2,11 @@
 """Считает запросы к сайтам по минутам из логов nginx и отправляет их в дашборд.
 
 Запускается из healthcheck.sh раз в минуту. Лог каждого сайта — формат airlok из
-lib.sh: «$msec $status $request_time $body_bytes_sent $request_method $uri», без IP и
-query-строки. Путь из сервера уходит только шаблоном, как у edge хостинга: /orders/:id.
-Строки старого формата, без метода и пути, считаются в итоги без адресов.
+lib.sh: «$msec $status $request_time $body_bytes_sent $request_method $uri
+"$upstream_response_time"», без IP и query-строки. Путь из сервера уходит только шаблоном,
+как у edge хостинга: /orders/:id. Время запроса — время ответа приложения, а если nginx
+ответил сам — $request_time. Строки старых форматов считаются по $request_time, а самые
+старые, без метода и пути, — в итоги без адресов.
 
 Файл читается с места, где остановились в прошлый раз (по inode и смещению), поэтому
 каждую строку считаем один раз, а ротацию logrotate замечаем по смене inode. Минута
@@ -71,6 +73,8 @@ SCANNER_SUFFIXES = (".php", ".asp", ".aspx", ".jsp", ".cgi", ".sql", ".bak")
 KNOWN_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 # nginx экранирует в логе байты вне ASCII как \xD0: возвращаем их, чтобы кириллица в пути осталась читаемой.
 NGINX_ESCAPE = re.compile(rb"\\x([0-9A-Fa-f]{2})")
+# Элемент $upstream_response_time: «0.004» или «-», если до приложения не дошло.
+UPSTREAM_TIME = re.compile(r"\d+\.\d+")
 # Посещения: лимиты за минуту — как у edge; сверх лимита — VISIT_OTHER.
 MAX_VISITORS, MAX_VISIT_PAGES, MAX_VISIT_SOURCES = 5000, 100, 50
 MAX_PAGE_LEN, MAX_SOURCE_LEN = 200, 100
@@ -191,15 +195,30 @@ def unescape(path):
     return NGINX_ESCAPE.sub(lambda g: bytes([int(g.group(1), 16)]), path.encode()).decode("utf-8", "replace")
 
 
+def upstream_time(value):
+    """Сколько отвечало приложение, по $upstream_response_time. После повтора на другой апстрим
+    или внутреннего редиректа там список через «, » и « : » — время складываем. None — nginx
+    ответил сам."""
+    times = UPSTREAM_TIME.findall(value)
+    return sum(map(float, times)) if times else None
+
+
 def add_line(minutes, line):
-    # Путь последний и может содержать пробелы: nginx их не экранирует.
-    parts = line.split(" ", 5)
+    # В пути бывают пробелы, но не кавычки — их nginx пишет как \x22: первая кавычка
+    # открывает время приложения.
+    head, quote, upstream = line.partition(' "')
+    if quote and not upstream.endswith('"'):
+        return
+    parts = head.split(" ", 5)
     if len(parts) not in (4, 6):
         return
     try:
         ts, status, took, sent = float(parts[0]), int(parts[1]), float(parts[2]), int(parts[3])
     except ValueError:
         return
+    app_took = upstream_time(upstream[:-1]) if quote else None
+    if app_took is not None:
+        took = app_took
     m = minutes.setdefault(str(int(ts) // 60 * 60), new_minute())
     count(m, status, took, MAX_SAMPLES)
     m["bytes_sent"] += sent

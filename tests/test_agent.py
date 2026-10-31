@@ -71,6 +71,14 @@ class ParseTest(unittest.TestCase):
                   {"op": "import", "app": "shop", "files_url": "https://s/x y"}):
             self.assertEqual(parse({"id": CID, "kind": "data_move", "data_move": m})[0], "bad", m)
 
+    def test_backup_and_restore(self):
+        url = "https://storage.yandexcloud.net/airlok/backups/apps/1/2.sql.gz?X-Amz-Signature=ab%2Fc"
+        for op in ("backup", "restore"):
+            cmd = {"id": CID, "kind": "data_move", "data_move": {"op": op, "app": "shop", "db_url": url}}
+            self.assertEqual(parse(cmd), ["ok", CID, "data_move", op, "shop", url, ""])
+            self.assertEqual(parse({"id": CID, "kind": "data_move", "data_move": {"op": op, "app": "shop"}})[0], "bad",
+                             "без ссылки на копию агенту нечего делать")
+
     def test_deploy(self):
         sha = "a" * 40
         got = parse({"id": CID, "kind": "deploy", "deploy": {"app": "shop", "repo": "acme/shop", "sha": sha, "ref": "main",

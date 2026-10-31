@@ -5,7 +5,8 @@
 # выкатить коммит из GitHub, перезапустить выкаченное приложение, убрать его с сервера,
 # прочитать данные его базы (только чтение, через dbquery.py), положить root'у SSH-ключи
 # устройств (sshkeys.py), закрыть или открыть вход по паролю, выгрузить и загрузить данные
-# приложения при переезде (app-data.sh) и обновиться сам, когда это подтвердил человек в дашборде:
+# приложения при переезде, сделать копию базы в хранилище и восстановить её оттуда (app-data.sh)
+# и обновиться сам, когда это подтвердил человек в дашборде:
 # произвольную команду дашборд прислать не может, а каждое поле команды проверяется здесь
 # заново — значения доходят до команд от root.
 # Сервер сам ходит в дашборд, входящих соединений агент не принимает.
@@ -125,14 +126,16 @@ if kind == "ssh_password":
     emit("ok", cid, "ssh_password", p["login"], user)
 if kind == "data_move":
     m = cmd.get("data_move")
-    if not isinstance(m, dict) or m.get("op") not in ("export", "import", "resume"):
-        emit("bad", cid, "в команде нет нужного действия с данными: export, import или resume")
+    if not isinstance(m, dict) or m.get("op") not in ("export", "import", "resume", "backup", "restore"):
+        emit("bad", cid, "в команде нет нужного действия с данными: export, import, resume, backup или restore")
     app = m.get("app")
     if not isinstance(app, str) or not NAME.match(app):
         emit("bad", cid, "некорректное имя приложения")
     urls = [m.get(k) or "" for k in ("db_url", "files_url")]
     if not all(isinstance(u, str) and (u == "" or STORE_URL.fullmatch(u)) for u in urls):
         emit("bad", cid, "некорректная ссылка на хранилище")
+    if m["op"] in ("backup", "restore") and not urls[0]:
+        emit("bad", cid, "нет ссылки на копию базы в хранилище")
     emit("ok", cid, "data_move", m["op"], app, *urls)
 if kind == "restart":
     r = cmd.get("restart")
@@ -500,8 +503,8 @@ run_ssh_password() {
 	heartbeat_now
 }
 
-# run_data_move — данные приложения при переезде: выгрузить, загрузить или запустить
-# остановленное снова. Ссылки на хранилище — только в окружении app-data.sh.
+# run_data_move — данные приложения: выгрузить и загрузить при переезде, запустить остановленное
+# снова, сделать копию базы или восстановить её. Ссылки на хранилище — только в окружении app-data.sh.
 run_data_move() {
 	local id=$1 op=$2 app=$3 db_url=$4 files_url=$5 log=$STATE_DIR/command.log rc message=""
 	echo "команда ${id}: данные ${app} — ${op}"
@@ -510,7 +513,7 @@ run_data_move() {
 		"$RECIPES_DIR/app-data.sh" "$op" "$app" </dev/null >"$log" 2>&1
 	rc=$?
 	if ((rc == 124 || rc == 137)); then
-		message="перенос данных не уложился в $((DATA_TIMEOUT / 60)) минут и был остановлен"
+		message="работа с данными не уложилась в $((DATA_TIMEOUT / 60)) минут и была остановлена"
 	fi
 	if ((rc == 0)); then
 		send_result "$id" success "$message" "$log"

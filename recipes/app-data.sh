@@ -5,6 +5,8 @@
 #   app-data.sh export ИМЯ  — остановить приложение и выгрузить базу и загрузки
 #   app-data.sh import ИМЯ  — заменить базу и загрузки выгруженными и запустить приложение
 #   app-data.sh resume ИМЯ  — запустить остановленное переездом снова: перенос не удался
+#   app-data.sh backup ИМЯ  — копия базы в хранилище, приложение продолжает работать
+#   app-data.sh restore ИМЯ — заменить базу копией из хранилища (на время замены приложение стоит)
 #
 # Ссылки — в AIRLOK_DB_URL и AIRLOK_FILES_URL (PUT при выгрузке, GET при загрузке), а не в
 # аргументах: там их было бы видно в ps. Пустая ссылка — эта часть не нужна. Приложение
@@ -86,7 +88,7 @@ import_data() {
 		# \restrict — psql из старого образа postgres:16, который мог остаться на сервере.
 		gunzip -c "$WORK/db.sql.gz" | grep -v -e '^SET transaction_timeout' -e '^\\restrict ' -e '^\\unrestrict ' |
 			psql_in >/dev/null || die "дамп базы не загрузился"
-		ok "база заменена данными со старого места"
+		ok "база заменена данными из хранилища"
 	fi
 	if [[ -n ${AIRLOK_FILES_URL:-} ]]; then
 		step "Загрузка файлов"
@@ -99,16 +101,30 @@ import_data() {
 		ok "загрузки заменены файлами со старого места"
 	fi
 	start_app
-	printf 'Готово: данные перенесены, приложение запущено\n'
+	printf 'Готово: %s\n' "${1:-данные перенесены, приложение запущено}"
 }
 
-# on_exit убирает временные файлы и, если перенос оборвался после остановки, запускает
+# backup_data — копия базы в хранилище. Базы у приложения нет — нет и копии: дашборд увидит,
+# что файл в хранилище не появился.
+backup_data() {
+	[[ -n ${AIRLOK_DB_URL:-} ]] || die "нет ссылки на хранилище для копии"
+	if ! has_db; then
+		printf 'Готово: у приложения нет базы — копировать нечего\n'
+		return
+	fi
+	step "Копия базы"
+	compose exec -T db pg_dump -U app --no-owner --no-privileges app | gzip >"$WORK/db.sql.gz"
+	put "$WORK/db.sql.gz" "$AIRLOK_DB_URL"
+	printf 'Готово: копия базы в хранилище, %s в сжатом виде\n' "$(du -h "$WORK/db.sql.gz" | cut -f1)"
+}
+
+# on_exit убирает временные файлы и, если работа оборвалась после остановки, запускает
 # приложение снова: старое место не должно остаться без сайта из-за сбоя хранилища.
 on_exit() {
 	local rc=$?
 	rm -f "$WORK/db.sql.gz" "$WORK/files.tar.gz"
 	if ((RESTART_ON_EXIT)); then
-		echo "перенос оборвался — запускаем приложение снова"
+		echo "не получилось — запускаем приложение снова"
 		start_app
 	fi
 	exit "$rc"
@@ -132,7 +148,13 @@ main() {
 		start_app
 		printf 'Готово: приложение снова запущено\n'
 		;;
-	*) die "app-data.sh export|import|resume ИМЯ" ;;
+	backup) backup_data ;;
+	restore)
+		[[ -n ${AIRLOK_DB_URL:-} ]] || die "нет ссылки на копию базы"
+		has_db || die "у приложения на этом сервере нет базы"
+		AIRLOK_FILES_URL="" import_data "база восстановлена из копии, приложение запущено"
+		;;
+	*) die "app-data.sh export|import|resume|backup|restore ИМЯ" ;;
 	esac
 }
 

@@ -53,7 +53,9 @@ export async function readLink(dir) {
 export async function saveLink(dir, link) {
   const path = linkPath(dir)
   await mkdir(dirname(path), { recursive: true })
-  await writeFile(path, JSON.stringify(link, null, 2) + '\n')
+  // Свои поля сюда дописывает и ИИ-агент (secrets_in_chat): новая привязка их не стирает.
+  const prev = await readJSON(path).catch(() => null)
+  await writeFile(path, JSON.stringify({ ...prev, ...link }, null, 2) + '\n')
   // Сам файл не секретный, но в git ему делать нечего: у каждого своя привязка.
   await writeFile(join(dirname(path), '.gitignore'), '*\n')
   return path

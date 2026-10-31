@@ -86,7 +86,8 @@ class SchemaTest(unittest.TestCase):
         for name, data in doc_examples():
             found += 1
             self.assertEqual(errors(data, SCHEMA), [], name)
-        self.assertGreaterEqual(found, 4, "примеры из README и навыков должны находиться")
+        # Большие примеры живут в инструкциях MCP guide (backend), их проверяет тест там.
+        self.assertGreaterEqual(found, 2, "примеры из README должны находиться")
 
     def test_accepts_examples(self):
         paths = glob.glob(os.path.join(ROOT, "examples", "*", "airlok.yml"))

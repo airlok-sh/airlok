@@ -382,8 +382,9 @@ async function deploy(target, opts, io, env) {
   // С --json вывод читает ИИ-агент: ему хватает этапов, а лог целиком — при ошибке.
   const result = await follow(api, cmd.id, io, !opts.json)
   const url = app.domain ? `https://${app.domain}` : ''
+  const failedStage = result.status === 'failed' ? result.stages?.find((st) => st.status === 'failed')?.key : undefined
   if (opts.json) {
-    io.out(JSON.stringify({ status: result.status, command_id: cmd.id, app: app.name, url, message: result.message }))
+    io.out(JSON.stringify({ status: result.status, command_id: cmd.id, app: app.name, url, message: result.message, failed_stage: failedStage }))
   }
   if (result.status === 'success') {
     const took = result.started_at && result.finished_at ? ` за ${duration((Date.parse(result.finished_at) - Date.parse(result.started_at)) / 1000)}` : ''
@@ -396,6 +397,11 @@ async function deploy(target, opts, io, env) {
     return 1
   }
   io.err(`\n✗ ${result.message || 'Сборка не удалась'}`)
+  if (failedStage === 'release') {
+    // Сборка прошла, а новая версия не запустилась: причина в выводе приложения, а не в логе сборки.
+    io.err(`\nЛоги приложения: ${s.url}/apps/${app.id}?tab=logs`)
+    return 1
+  }
   const tail = (result.log ?? '').trimEnd().split('\n').slice(-25)
   if (opts.json && tail.length > 1) io.err(`\nКонец лога:\n${tail.map((l) => `  ${l}`).join('\n')}`)
   io.err(`\nПолный лог: ${s.url}/apps/${app.id}?tab=deploys`)

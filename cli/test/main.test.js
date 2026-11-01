@@ -85,6 +85,14 @@ async function fakeDashboard() {
       const n = ++state.commandPolls
       const at = '2026-10-22T10:00:00Z'
       if (n === 1) return send(200, { id: 'c1', status: 'queued', stages: [] })
+      if (state.noStart) {
+        const built = [{ key: 'source', status: 'done', started_at: at, finished_at: '2026-10-22T10:00:02Z' }]
+        if (n === 2) return send(200, { id: 'c1', status: 'running', stages: [...built, { key: 'release', status: 'running', note: 'запускаем новую версию', started_at: at }] })
+        return send(200, {
+          id: 'c1', status: 'failed', message: 'Новая версия не запустилась. Сайт работает на прежней версии.', log: 'npm ci\nadded 3 packages\n',
+          stages: [...built, { key: 'release', status: 'failed', started_at: at, finished_at: '2026-10-22T10:01:00Z' }],
+        })
+      }
       if (n === 2) return send(200, { id: 'c1', status: 'running', stages: [{ key: 'source', status: 'running', started_at: at }], log: '→ Код\nnpm ci\n' })
       return send(200, {
         id: 'c1', status: 'success', started_at: at, finished_at: '2026-10-22T10:00:48Z', log: '→ Код\nnpm ci\nadded 3 packages\n',
@@ -154,6 +162,18 @@ test('login, then deploy a folder into a new app and follow the build', { timeou
   assert.equal(dash.state.archiveApp, 'a2')
   assert.deepEqual(JSON.parse(again.outLines.at(-1)), { status: 'success', command_id: 'c1', app: 'promo', url: 'https://promo.apps.airlok.ru' })
   assert.equal(again.errLines.filter((l) => l.startsWith('    ')).length, 0, 'с --json лог не печатается: его читает ИИ-агент')
+
+  // Собралась, но не запустилась: выкатка ждёт итога запуска, а причину надо искать в логах приложения.
+  dash.state.commandPolls = 0
+  dash.state.noStart = true
+  const broken = captureIO()
+  assert.equal(await main(['deploy', dir, '--json'], broken, env), 1)
+  assert.equal(JSON.parse(broken.outLines.at(-1)).failed_stage, 'release')
+  const brokenLog = broken.errLines.join('\n')
+  assert.match(brokenLog, /→ Выкатка {7}запускаем новую версию/)
+  assert.match(brokenLog, /✗ Новая версия не запустилась/)
+  assert.match(brokenLog, /Логи приложения: .*\/apps\/a2\?tab=logs/)
+  assert.doesNotMatch(brokenLog, /Конец лога/, 'лог сборки тут ни при чём: она прошла')
 
   assert.equal(await main(['logout'], captureIO(), env), 0)
   const after = captureIO()

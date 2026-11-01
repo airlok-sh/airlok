@@ -15,7 +15,7 @@ function captureIO() {
 async function fakeDashboard() {
   const state = { domain: null, dns: false, requests: [] }
   const apps = [
-    { id: 'h1', name: 'landing', hosted: true, server_name: '@hosting', domain: 'landing.apps.airlok.ru' },
+    { id: 'h1', name: 'landing', hosted: true, server_name: '@hosting', domain: 'landing.airlok.site' },
     { id: 's1', name: 'shop', hosted: false, server_id: 'srv1', server_name: 'prod', domain: 'shop.203-0-113-7.sslip.io' },
   ]
   const fail = (res, code, errCode) => send(res, code, { error: { code: errCode, message: errCode } })

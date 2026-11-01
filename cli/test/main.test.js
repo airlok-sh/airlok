@@ -50,7 +50,7 @@ test('logUpdate prints only new whole lines while the log window slides', () => 
 // проходит этапы и завершается успехом.
 async function fakeDashboard() {
   const state = { polls: 0, created: [], archive: null, title: '', commandPolls: 0 }
-  const app = { id: 'a1', name: 'shop', domain: 'shop.apps.airlok.ru', hosted: true }
+  const app = { id: 'a1', name: 'shop', domain: 'shop.airlok.site', hosted: true }
   const server = createServer(async (req, res) => {
     const chunks = []
     for await (const c of req) chunks.push(c)
@@ -72,7 +72,7 @@ async function fakeDashboard() {
     if (req.method === 'GET' && url.pathname === '/api/cli/v1/apps') return send(200, { apps: [app, { id: 's1', name: 'vps-app', hosted: false }, ...state.created] })
     if (req.method === 'POST' && url.pathname === '/api/cli/v1/apps') {
       const { name } = JSON.parse(body)
-      state.created.push({ id: 'a2', name, domain: `${name}.apps.airlok.ru`, hosted: true })
+      state.created.push({ id: 'a2', name, domain: `${name}.airlok.site`, hosted: true })
       return send(201, { id: 'a2' })
     }
     if (req.method === 'POST' && url.pathname.endsWith('/archive')) {
@@ -149,8 +149,8 @@ test('login, then deploy a folder into a new app and follow the build', { timeou
   assert.match(log, /Ждём сборщика/)
   assert.match(log, /✓ Код {11}· 2 с/)
   assert.deepEqual(dep.errLines.filter((l) => l.startsWith('    ')), ['    → Код', '    npm ci', '    added 3 packages'], 'строки лога — по мере появления, без повторов')
-  assert.match(log, /✓ Выкачено за 48 с: https:\/\/promo\.apps\.airlok\.ru/)
-  assert.deepEqual(dep.outLines, ['https://promo.apps.airlok.ru'])
+  assert.match(log, /✓ Выкачено за 48 с: https:\/\/promo\.airlok\.site/)
+  assert.deepEqual(dep.outLines, ['https://promo.airlok.site'])
 
   const link = JSON.parse(await readFile(join(dir, '.airlok', 'project.json'), 'utf8'))
   assert.deepEqual(link, { app_id: 'a2', app: 'promo' })
@@ -160,7 +160,7 @@ test('login, then deploy a folder into a new app and follow the build', { timeou
   const again = captureIO()
   assert.equal(await main(['deploy', dir, '--json'], again, env), 0)
   assert.equal(dash.state.archiveApp, 'a2')
-  assert.deepEqual(JSON.parse(again.outLines.at(-1)), { status: 'success', command_id: 'c1', app: 'promo', url: 'https://promo.apps.airlok.ru' })
+  assert.deepEqual(JSON.parse(again.outLines.at(-1)), { status: 'success', command_id: 'c1', app: 'promo', url: 'https://promo.airlok.site' })
   assert.equal(again.errLines.filter((l) => l.startsWith('    ')).length, 0, 'с --json лог не печатается: его читает ИИ-агент')
 
   // Собралась, но не запустилась: выкатка ждёт итога запуска, а причину надо искать в логах приложения.

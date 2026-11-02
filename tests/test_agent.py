@@ -56,6 +56,9 @@ class ParseTest(unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), k)
         self.assertEqual(parse({"id": CID, "kind": "ssh_keys", "ssh_keys": ["ssh-ed25519 AAAA"]})[0], "bad")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "keys.json")
+            self.assertEqual(parse({"id": CID, "kind": "ssh_keys_remove", "ssh_keys": k}, keys_path=path), ["ok", CID, "ssh_keys"])
 
     def test_ssh_password(self):
         for login in ("closed", "open"):

@@ -122,7 +122,9 @@ if kind == "db_query":
     with open(sys.argv[2], "w", encoding="utf-8") as f:
         json.dump(q, f)
     emit("ok", cid, "db_query")
-if kind == "ssh_keys":
+# ssh_keys_remove — те же ключи плюс чужие, которые надо убрать: агент, не знающий этой команды,
+# откажется от неё и не отчитается об успехе, ничего не убрав.
+if kind in ("ssh_keys", "ssh_keys_remove"):
     k = cmd.get("ssh_keys")
     if not isinstance(k, dict):
         emit("bad", cid, "в команде нет ключей устройств")

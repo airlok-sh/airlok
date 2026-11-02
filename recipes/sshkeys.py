@@ -6,10 +6,12 @@
     sshkeys.py report КАТАЛОГ           — опись ключей и новые входы для отметки в дашборд
     sshkeys.py report-sent КАТАЛОГ      — отметка дошла: запомнить, что уже отправлено
 
-Агент передаёт поле ssh_keys своей команды: {"user", "keys": [{"id", "key"}]} — пользователя и полный
-список ключей устройств, которым открыт этот сервер. У остальных пользователей строки устройств
+Агент передаёт поле ssh_keys своей команды: {"user", "keys": [{"id", "key"}], "remove": [{"user",
+"fingerprint"}]} — пользователя, полный список ключей устройств, которым открыт этот сервер, и ключи
+не из «Устройств», которые человек велел убрать. У остальных пользователей строки устройств
 убираются: так ключи переезжают, когда в дашборде выбирают другого. Свои строки агент помечает комментарием
-airlok-device:<id> и заменяет только их: ключи, положенные на сервер иначе, остаются. Строка
+airlok-device:<id> и заменяет только их: ключи, положенные на сервер иначе, остаются, пока их не
+попросили убрать по отпечатку. Строка
 без пометки с тем же ключом, что у устройства, уходит: иначе, отключив устройство в дашборде,
 человек думал бы, что закрыл ему доступ.
 
@@ -60,6 +62,7 @@ LOGIN = re.compile(r"^Accepted (publickey|password|keyboard-interactive/pam) for
 MAX_INVENTORY = 100
 MAX_LOGINS = 500
 MAX_COMMENT = 100
+FINGERPRINT = re.compile(r"^SHA256:[A-Za-z0-9+/]{1,64}$")
 # Опись уходит и без изменений раз в час: дашборд мог обновиться и ещё её не знать.
 INVENTORY_EVERY = 3600
 # Ключ в строке authorized_keys: перед ним бывают опции (from=…, command="…").
@@ -113,6 +116,20 @@ def parse_request(req):
     return out
 
 
+def parse_removals(req):
+    """Какие ключи убрать: {пользователь: {отпечаток}}."""
+    items = req.get("remove", [])
+    if not isinstance(items, list) or len(items) > MAX_INVENTORY:
+        raise Failed("в команде некорректный список ключей, которые надо убрать")
+    out = {}
+    for r in items:
+        user, fp = (r.get("user"), r.get("fingerprint")) if isinstance(r, dict) else (None, None)
+        if not isinstance(user, str) or not USER.fullmatch(user) or not isinstance(fp, str) or not FINGERPRINT.fullmatch(fp):
+            raise Failed("в команде некорректный ключ, который надо убрать")
+        out.setdefault(user, set()).add(fp)
+    return out
+
+
 def blob_type(b64):
     try:
         raw = base64.b64decode(b64, validate=True)
@@ -129,12 +146,22 @@ def line_key(line):
     return (m.group(1), m.group(2)) if m else None
 
 
-def render(text, keys):
-    """Новое содержимое authorized_keys: чужие строки на месте, ключи устройств — в конце."""
+def line_fingerprint(line):
+    key = line_key(line)
+    try:
+        return fingerprint(key[1]) if key else None
+    except ValueError:
+        return None
+
+
+def render(text, keys, remove=frozenset()):
+    """Новое содержимое authorized_keys: чужие строки на месте, кроме remove (отпечатки), ключи
+    устройств — в конце."""
     wanted = {(t, b) for _, t, b in keys}
     kept = []
     for line in text.split("\n"):
-        if MARK.search(line.rstrip()) or (not line.lstrip().startswith("#") and line_key(line) in wanted):
+        comment = line.lstrip().startswith("#")
+        if MARK.search(line.rstrip()) or (not comment and (line_key(line) in wanted or (remove and line_fingerprint(line) in remove))):
             continue
         kept.append(line)
     while kept and not kept[-1].strip():
@@ -202,7 +229,7 @@ def own(path, account):
         os.chown(path, account.uid, account.gid)
 
 
-def apply(path, keys, password_login, account=ROOT):
+def apply(path, keys, password_login, account=ROOT, remove=frozenset()):
     """Переписывает файл, если что-то поменялось; возвращает True, если поменялось."""
     check_owned(path, account)
     try:
@@ -210,7 +237,7 @@ def apply(path, keys, password_login, account=ROOT):
             old = f.read()
     except FileNotFoundError:
         old = ""
-    new = render(old, keys)
+    new = render(old, keys, remove)
     if new == old:
         return False
     if has_keys(old) and not has_keys(new) and not password_login:
@@ -396,23 +423,33 @@ def sync(req, conf, accs):
     """Ключи устройств — выбранному пользователю, у остальных строки устройств убираются. Чужой
     последний ключ не трогаем: об этом — в итоге, а ключи нужному пользователю уже на месте."""
     keys = parse_request(req)
+    removals = parse_removals(req)
     user = req.get("user", "root")
     target = next((a for a in accs if a.name == user), None) if isinstance(user, str) else None
     if target is None:
         raise Failed(f"на сервере нет пользователя {user!s:.40}, которому можно класть ключи")
+    unknown = set(removals) - {a.name for a in accs}
+    if unknown:
+        raise Failed(f"на сервере нет пользователя {sorted(unknown)[0]}, у которого надо убрать ключ")
     path = keys_path(conf, target)
-    changed = apply(path, keys, password_login(conf, user), target)
+    changed = apply(path, keys, password_login(conf, user), target, removals.get(user, frozenset()))
     left = []
     for a in accs:
         other = keys_path(conf, a)
-        if a.name == user or "airlok-device:" not in read_keys(other):
+        drop = removals.get(a.name, frozenset())
+        if a.name == user or (not drop and "airlok-device:" not in read_keys(other)):
             continue
         try:
-            changed = apply(other, [], password_login(conf, a.name), a) or changed
+            changed = apply(other, [], password_login(conf, a.name), a, drop) or changed
         except Failed:
+            # Просьбу человека убрать ключ нельзя молча оставить невыполненной.
+            if drop:
+                raise
             left.append(a.name)
     state = "обновлены" if changed else "уже на месте"
     msg = f"Готово: ключи устройств ({len(keys)}) {state} в {path}"
+    if removals:
+        msg += f"; убрано ключей не из «Устройств»: {sum(len(v) for v in removals.values())}"
     if left:
         msg += f"; у {', '.join(left)} прежние ключи устройств оставлены — это их последние ключи, а по паролю не войти"
     return msg

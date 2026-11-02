@@ -216,6 +216,41 @@ test('server connect retries reuse a server that never came online', async (t) =
   assert.match(again.errLines.join('\n'), /уже подключён.*--name/s)
 })
 
+test('server connect finds a renamed server by its address', async (t) => {
+  const dash = await fakeDashboard([{ id: 's1', name: 'Основной', public_ip: '1.2.3.4', last_seen_at: '2026-10-28T10:00:00Z' }])
+  t.after(dash.close)
+  const env = { AIRLOK_URL: dash.url, AIRLOK_TOKEN: 't', HOME: await home() }
+  const io = captureIO()
+  const sys = fakeSystem(dash, [{ code: 0 }])
+  assert.equal(await main(['server', 'connect', 'root@1.2.3.4'], io, env, sys), 1)
+  assert.match(io.errLines.join('\n'), /1\.2\.3\.4 под именем Основной уже подключён.*--name/s)
+  assert.deepEqual(dash.state.created, [])
+  assert.deepEqual(dash.state.rotated, [])
+  assert.equal(sys.calls.length, 1, 'до установки дело не доходит')
+})
+
+test('server connect --name still adds a separate server at the same address', async (t) => {
+  const dash = await fakeDashboard([{ id: 's1', name: 'Основной', public_ip: '1.2.3.4', last_seen_at: '2026-10-28T10:00:00Z' }])
+  t.after(dash.close)
+  const env = { AIRLOK_URL: dash.url, AIRLOK_TOKEN: 't', HOME: await home() }
+  const io = captureIO()
+  const code = await main(['server', 'connect', 'root@1.2.3.4', '--name', 'second', '--json'], io, env, fakeSystem(dash, [{ code: 0 }, { code: 0, online: true }]))
+  assert.equal(code, 0, io.errLines.join('\n'))
+  assert.deepEqual(dash.state.created, ['second'])
+  assert.equal(JSON.parse(io.outLines[0]).server, 'second')
+})
+
+test('server connect --name retries reuse a server that never came online', async (t) => {
+  const dash = await fakeDashboard([{ id: 'old', name: 'second', last_seen_at: null }])
+  t.after(dash.close)
+  const env = { AIRLOK_URL: dash.url, AIRLOK_TOKEN: 't', HOME: await home() }
+  const io = captureIO()
+  const code = await main(['server', 'connect', 'root@1.2.3.4', '--name', 'second'], io, env, fakeSystem(dash, [{ code: 0 }, { code: 0, online: true }]))
+  assert.equal(code, 0, io.errLines.join('\n'))
+  assert.deepEqual(dash.state.rotated, ['old'])
+  assert.deepEqual(dash.state.created, [])
+})
+
 test('server connect explains a failed install and a changed host key', async (t) => {
   const dash = await fakeDashboard()
   t.after(dash.close)

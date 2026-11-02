@@ -110,7 +110,7 @@ export async function serverCommand(api, origin, sub, rest, opts, io, home, sys 
   const key = join(home, '.ssh', KEY_NAME)
   const usedKey = await ensureAccess(target, key, port, io, sys, echo)
 
-  const server = await registerServer(api, name)
+  const server = await registerServer(api, name, opts.name ? '' : target.host)
   io.err(`\nСтавлю airlok на ${target.host} — несколько минут: Docker, nginx, файрвол, агент.\n`)
   const install = await sys.run('ssh', [...sshArgs(usedKey, target, { port }), remote], { input: `${server.token}\n`, out: echo })
   if (install.code !== 0) {
@@ -127,13 +127,13 @@ export async function serverCommand(api, origin, sub, rest, opts, io, home, sys 
   io.err('\nЖду, когда агент выйдет на связь…')
   const online = await waitOnline(api, server.id, sys)
   const login = `ssh${usedKey ? ` -i ${usedKey}` : ''}${port ? ` -p ${port}` : ''} ${target.dest}`
-  if (online) io.err(`\n✓ Сервер ${name} подключён: ${origin}/servers`)
+  if (online) io.err(`\n✓ Сервер ${server.name} подключён: ${origin}/servers`)
   else io.err(`\nУстановка прошла, но агент пока не на связи. Проверьте на сервере: journalctl -u airlok-agent -n 50`)
   io.err(`Зайти на сервер: ${login}`)
   if (keysOnly) io.err('Вход по паролю закрыт: на сервер пускает только по ключу.')
   if (device) io.err(`Доступ этого компьютера — устройство «${device}»: открыть другим или закрыть можно в ${origin}/devices`)
-  const osUpdates = online ? await offerOSUpdates(api, server.id, name, opts, io, sys) : null
-  if (opts.json) io.out(JSON.stringify({ status: online ? 'ok' : 'pending', server: name, server_id: server.id, host: target.host, ssh: login, password_login_closed: keysOnly, device, os_updates: osUpdates }))
+  const osUpdates = online ? await offerOSUpdates(api, server.id, server.name, opts, io, sys) : null
+  if (opts.json) io.out(JSON.stringify({ status: online ? 'ok' : 'pending', server: server.name, server_id: server.id, host: target.host, ssh: login, password_login_closed: keysOnly, device, os_updates: osUpdates }))
   return online ? 0 : 1
 }
 
@@ -311,16 +311,20 @@ function explainProbe(output, target) {
   }
 }
 
-// registerServer заводит сервер в дашборде. Сервер с тем же именем, ни разу не выходивший на
-// связь, — прошлая попытка: ему выпускается новый токен вместо второй записи.
-async function registerServer(api, name) {
-  const existing = (await api.servers()).find((s) => s.name === name)
+// registerServer заводит сервер в дашборде. Сервер, ни разу не выходивший на связь, — прошлая попытка:
+// ему выпускается новый токен вместо второй записи. Без --name сервер ищется и по адресу: его могли
+// переименовать, и вторая запись с новым токеном отключила бы прежнюю вместе с её приложениями.
+async function registerServer(api, name, address) {
+  const servers = await api.servers()
+  const byAddress = address ? servers.find((s) => s.public_ip === address) : undefined
+  const existing = byAddress ?? servers.find((s) => s.name === name)
   if (existing?.last_seen_at) {
-    throw new ServerError(`Сервер ${name} уже подключён к airlok. Подключить другой сервер с этим адресом — задайте имя: --name <имя>.`)
+    const known = existing.name === name ? `Сервер ${name}` : `Сервер ${address} под именем ${existing.name}`
+    throw new ServerError(`${known} уже подключён к airlok. Подключить другой сервер с этим адресом — задайте имя: --name <имя>.`)
   }
   try {
     const created = existing ? await api.rotateServerToken(existing.id) : await api.createServer(name)
-    return { id: created.server.id, token: created.agent_token }
+    return { id: created.server.id, name: created.server.name, token: created.agent_token }
   } catch (err) {
     if (err instanceof ApiError && err.code === 'name_taken') throw new ServerError(`Имя ${name} уже занято: задайте другое через --name.`)
     throw err

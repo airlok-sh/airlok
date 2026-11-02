@@ -303,6 +303,12 @@ EOF
       GRADIO_SERVER_PORT: "${CONTAINER_PORT}"
 EOF
 		fi
+		if [[ $APP_STACK == node ]] && ((APP_BUN)); then
+			cat <<EOF
+    environment:
+      PATH: /app/.airlok/bun/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EOF
+		fi
 		cat <<EOF
     env_file:
       - path: shared/app.env

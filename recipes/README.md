@@ -11,10 +11,11 @@
 | Стек | Как узнаётся | Запуск |
 | --- | --- | --- |
 | Next.js | `next` в package.json | `next start` |
-| Node | Express, Nest, Fastify, Koa, Hono… или `scripts.start` | `npm run start:prod`, `npm start` или `node server.js` |
+| Node | Express, Nest, Fastify, Koa, Hono, Elysia… или `scripts.start` | `npm run start:prod`, `npm start` или `node server.js`; на Bun без `scripts.start` — `bun run` точки входа |
+| Фреймворки с сервером | SvelteKit с `adapter-node`, Nuxt, TanStack Start, React Router, Astro с `@astrojs/node` | собственный сервер фреймворка |
 | Python | requirements.txt, pyproject.toml или Pipfile | FastAPI и Starlette — uvicorn, Flask и Django — gunicorn, Streamlit, Gradio |
 | Go | `go.mod` в корне, версия — из директивы `go` (1.25–1.27) | программа из корня или единственного `cmd/*`, собранная `go build` в образе golang |
-| Статика | Vite, Astro, CRA, Docusaurus… или `index.html` | nginx в контейнере; без `404.html` любой путь ведёт на `index.html` (SPA) |
+| Статика | Vite, Astro, CRA, Docusaurus, SvelteKit с `adapter-static`, `nuxt generate`, React Router с `ssr: false`… или `index.html` | nginx в контейнере; без `404.html` любой путь ведёт на `index.html` (SPA) |
 | Фоновое | бот (aiogram, telegraf…) без веб-фреймворка или `app.type: worker` | без сайта и порта, работает всегда |
 
 Сборка идёт в той же изолированной песочнице, что и раньше: отдельный пользователь, без секретов и базы, только папка релиза. Приложение слушает порт из `PORT` на `0.0.0.0`.

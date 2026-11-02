@@ -20,6 +20,12 @@ GO_VERSIONS = ["1.25", "1.26", "1.27"]
 STACKS = ("static", "nextjs", "node", "python", "go")
 # Куда сборка кладёт программу Go-приложения.
 GO_BINARY = ".airlok/app"
+# Куда сборка ставит Bun: в образе Node его нет, а отдельный образ Bun не годится,
+# потому что без npm и Node многие пакеты не соберутся.
+BUN_BIN = "/app/.airlok/bun/node_modules/.bin"
+BUN_SETUP = f"npm install --no-audit --no-fund --prefix .airlok/bun bun@1 && export PATH={BUN_BIN}:$PATH"
+# Сервер, который собирает Nitro (Nuxt, TanStack Start).
+NITRO_SERVER = "node .output/server/index.mjs"
 
 # Статические сайты: зависимость сборщика → куда он кладёт готовый сайт.
 STATIC_BUILDERS = [
@@ -45,7 +51,14 @@ GO_SERVERS = [
 NODE_SERVERS = [
     ("@nestjs/core", "NestJS"), ("express", "Express"), ("fastify", "Fastify"), ("koa", "Koa"),
     ("hono", "Hono"), ("@hapi/hapi", "Hapi"), ("@adonisjs/core", "AdonisJS"), ("@remix-run/serve", "Remix"),
+    ("elysia", "Elysia"),
 ]
+# Точка входа приложения на Bun без scripts.start: TypeScript он запускает сам.
+BUN_ENTRIES = ["index.ts", "src/index.ts", "server.ts", "src/server.ts", "main.ts", "src/main.ts", "index.js", "server.js"]
+BUN_COMMAND = re.compile(r"(^|[\s;&|])bunx?\s")
+# Настройки, от которых зависит, будет ли у приложения свой сервер.
+REACT_ROUTER_SPA = re.compile(r"\bssr\s*:\s*false\b")
+ASTRO_MIDDLEWARE = re.compile(r"""\bmode\s*:\s*["']middleware["']""")
 # Точка входа Python-приложения ищется в этих файлах по порядку.
 PYTHON_ENTRIES = ["main.py", "app.py", "app/main.py", "src/main.py", "server.py", "api.py", "wsgi.py", "asgi.py", "streamlit_app.py"]
 SEGMENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$")
@@ -83,6 +96,7 @@ class Package:
         self.scripts = data.get("scripts") or {}
         self.deps = {**(data.get("dependencies") or {}), **(data.get("devDependencies") or {})}
         self.main = data.get("main") or ""
+        self.module = data.get("module") or ""
         self.engines = (data.get("engines") or {}).get("node") or ""
 
     def has(self, dep):
@@ -102,13 +116,83 @@ def load_package(root):
     return Package(data)
 
 
+def js_app(root, pkg):
+    """Как запускается JS-фреймворк, у которого зависимость от Vite или Astro не значит статику:
+    (имя, команда сервера, каталог сайта, почему не запустится). Без команды и каталога решает
+    scripts.start."""
+    scripts = pkg.scripts
+    if pkg.has("@sveltejs/kit"):
+        if pkg.has("@sveltejs/adapter-node"):
+            # Без настоящего протокола SvelteKit отклоняет POST-формы как запросы с чужого сайта.
+            return "SvelteKit", "PROTOCOL_HEADER=x-forwarded-proto node build", "", ""
+        if pkg.has("@sveltejs/adapter-static"):
+            return "SvelteKit", "", "build", ""
+        return "SvelteKit", "", "", ("SvelteKit запускается с @sveltejs/adapter-node: поставьте его и укажите в vite.config.ts или svelte.config.js "
+                                     "вместо текущего адаптера, либо задайте run.command в airlok.yml")
+    if pkg.has("nuxt"):
+        if "nuxt generate" in scripts.get("build", ""):
+            return "Nuxt", "", ".output/public", ""
+        return "Nuxt", NITRO_SERVER, "", ""
+    if pkg.has("@tanstack/react-start") or pkg.has("@tanstack/solid-start"):
+        if scripts.get("start"):
+            return "TanStack Start", "", "", ""
+        if pkg.has("nitro"):
+            return "TanStack Start", NITRO_SERVER, "", ""
+        return "TanStack Start", "", "", ("TanStack Start нужен сервер: поставьте nitro, подключите nitro() из nitro/vite в vite.config.ts, "
+                                          "либо задайте run.command в airlok.yml")
+    if pkg.has("@react-router/dev"):
+        config = "".join(read_text(root, f) for f in ("react-router.config.ts", "react-router.config.js", "react-router.config.mjs"))
+        if REACT_ROUTER_SPA.search(config):
+            return "React Router", "", "build/client", ""
+        if scripts.get("start"):
+            return "React Router", "", "", ""
+        if pkg.has("@react-router/serve"):
+            return "React Router", "node_modules/.bin/react-router-serve ./build/server/index.js", "", ""
+        return "React Router", "", "", ("React Router нужен сервер: поставьте @react-router/serve и добавьте scripts.start, "
+                                        "либо задайте run.command в airlok.yml")
+    if pkg.has("astro") and pkg.has("@astrojs/node"):
+        config = "".join(read_text(root, f) for f in ("astro.config.mjs", "astro.config.ts", "astro.config.js"))
+        # В режиме middleware Astro — обработчик внутри сервера проекта.
+        return "Astro", "" if ASTRO_MIDDLEWARE.search(config) else "node ./dist/server/entry.mjs", "", ""
+    if pkg.has("astro") and any(pkg.has(a) for a in ("@astrojs/vercel", "@astrojs/netlify", "@astrojs/cloudflare")):
+        return "Astro", "", "", ("этот адаптер Astro работает только на своей платформе: поставьте @astrojs/node и укажите его "
+                                 "в astro.config, либо задайте run.command в airlok.yml")
+    return "", "", "", ""
+
+
+def has_bun_lock(root):
+    return (exists(root, "bun.lock") or exists(root, "bun.lockb")) and not any(
+        exists(root, f) for f in ("package-lock.json", "pnpm-lock.yaml", "yarn.lock"))
+
+
+def uses_bun(root, build_command, run_command, pkg):
+    """Проект ставится или запускается через Bun. Lock-файл рядом с другим менеджером не в счёт:
+    Lovable, например, кладёт и bun.lockb, и package-lock.json."""
+    if pkg is None:
+        return False
+    commands = (build_command, run_command, pkg.scripts.get("build", ""), pkg.scripts.get("start", ""), pkg.scripts.get("start:prod", ""))
+    return has_bun_lock(root) or pkg.has("elysia") or any(BUN_COMMAND.search(c) for c in commands)
+
+
+def bun_entry(root, pkg):
+    """Файл, который запустит Bun, если у проекта нет scripts.start."""
+    return next((f for f in (pkg.module, pkg.main, *BUN_ENTRIES) if f and exists(root, f)), "")
+
+
+def js_install(root, bun):
+    """Установка зависимостей. Bun ставится внутрь проекта через npm и остаётся доступен сборке."""
+    if not bun:
+        return NPM_INSTALL
+    return BUN_SETUP + " && bun install" + (" --frozen-lockfile" if has_bun_lock(root) else "")
+
+
 def detect(root, stack="", kind="", build_command="", build_output="", run_command="", node="", python="", go=""):
     """План сборки: то, что задано в airlok.yml, плюс найденное по файлам проекта."""
     pkg = load_package(root)
     py_deps = "\n".join(read_text(root, f) for f in ("requirements.txt", "pyproject.toml", "Pipfile")).lower()
     is_python = any(exists(root, f) for f in ("requirements.txt", "pyproject.toml", "Pipfile"))
 
-    plan = {"stack": stack, "framework": "", "kind": kind, "node": "", "python": "", "go": "",
+    plan = {"stack": stack, "framework": "", "kind": kind, "node": "", "python": "", "go": "", "bun": False,
             "install": "", "build": "", "output": "", "start": ""}
     if not plan["stack"]:
         plan["stack"], plan["framework"] = guess_stack(root, pkg, is_python)
@@ -119,6 +203,7 @@ def detect(root, stack="", kind="", build_command="", build_output="", run_comma
 
     if plan["stack"] in ("static", "nextjs", "node"):
         plan["node"] = node_version(root, node, pkg)
+        plan["bun"] = uses_bun(root, build_command, run_command, pkg)
     elif plan["stack"] == "python":
         plan["python"] = python_version(root, python)
     elif plan["stack"] == "go":
@@ -128,11 +213,11 @@ def detect(root, stack="", kind="", build_command="", build_output="", run_comma
         raise DetectError("фоновым (app.type: worker) может быть только Node-, Python- или Go-приложение")
     if plan["stack"] == "static":
         plan["kind"] = "web"
-        return plan_static(pkg, build_command, build_output, plan)
+        return plan_static(root, pkg, build_command, build_output, plan)
     if plan["stack"] == "nextjs":
         if pkg is None:
             raise DetectError("для Next.js нужен package.json")
-        plan.update(install=NPM_INSTALL, build=build_command or "npm run build", kind="web")
+        plan.update(install=js_install(root, plan["bun"]), build=build_command or "npm run build", kind="web")
         plan["framework"] = plan["framework"] or "Next.js"
         return plan
     if plan["stack"] == "node":
@@ -151,6 +236,9 @@ def guess_stack(root, pkg, is_python):
     if pkg is not None:
         if pkg.has("next"):
             return "nextjs", "Next.js"
+        name, _, output, _ = js_app(root, pkg)
+        if name:
+            return ("static" if output else "node"), name
         server = next((name for dep, name in NODE_SERVERS if pkg.has(dep)), "")
         # У CRA и Vite тоже бывает scripts.start, но это сервер разработки, а не прод.
         if not server:
@@ -159,7 +247,7 @@ def guess_stack(root, pkg, is_python):
                     return "static", name
         if server or pkg.scripts.get("start"):
             return "node", server
-        if any(pkg.has(b) for b in NODE_BOTS):
+        if any(pkg.has(b) for b in NODE_BOTS) or (has_bun_lock(root) and bun_entry(root, pkg)):
             return "node", ""
     if is_python:
         return "python", ""
@@ -168,14 +256,16 @@ def guess_stack(root, pkg, is_python):
     return "", ""
 
 
-def plan_static(pkg, build_command, build_output, plan):
+def plan_static(root, pkg, build_command, build_output, plan):
     plan["output"] = build_output
     if build_command:
-        plan["install"], plan["build"] = NPM_INSTALL, build_command
+        plan["install"], plan["build"] = js_install(root, plan["bun"]), build_command
     elif pkg is not None and pkg.scripts.get("build"):
-        plan["install"], plan["build"] = NPM_INSTALL, "npm run build"
+        plan["install"], plan["build"] = js_install(root, plan["bun"]), "npm run build"
     if pkg is None and build_command:
         plan["install"] = ""
+    if not plan["output"] and plan["build"] and pkg is not None:
+        plan["output"] = js_app(root, pkg)[2]
     if not plan["output"] and plan["build"] and pkg is not None:
         plan["output"] = next((out for dep, out, _ in STATIC_BUILDERS if pkg.has(dep)), "")
     plan["framework"] = plan["framework"] or "статический сайт"
@@ -185,15 +275,22 @@ def plan_static(pkg, build_command, build_output, plan):
 def plan_node(root, pkg, build_command, run_command, plan):
     if pkg is None:
         raise DetectError("для Node-приложения нужен package.json")
-    plan["install"] = NPM_INSTALL
+    plan["install"] = js_install(root, plan["bun"])
     plan["build"] = build_command or ("npm run build" if pkg.scripts.get("build") else "")
+    app_name, app_start, _, app_problem = js_app(root, pkg)
     start = run_command
     if not start:
-        if pkg.scripts.get("start:prod"):
+        if app_problem:
+            raise DetectError(app_problem)
+        if app_start:
+            start = app_start
+        elif pkg.scripts.get("start:prod"):
             # NestJS: start — через CLI из devDependencies, а нужен собранный код.
             start = "npm run start:prod"
         elif pkg.scripts.get("start"):
             start = "npm start"
+        elif plan["bun"] and bun_entry(root, pkg):
+            start = "bun run " + bun_entry(root, pkg)
         elif pkg.main and exists(root, pkg.main):
             start = "node " + pkg.main
         else:
@@ -203,7 +300,7 @@ def plan_node(root, pkg, build_command, run_command, plan):
     plan["start"] = start
     if not plan["kind"]:
         plan["kind"] = "web"
-        has_server = any(pkg.has(dep) for dep, _ in NODE_SERVERS)
+        has_server = bool(app_name) or any(pkg.has(dep) for dep, _ in NODE_SERVERS)
         bot = next((b for b in NODE_BOTS if pkg.has(b)), "")
         if bot and not has_server:
             plan["kind"], plan["framework"] = "worker", f"бот ({bot})"

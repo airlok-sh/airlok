@@ -484,6 +484,13 @@ async function ask(api, apps, dir, io) {
   }
 }
 
+// appLimitText: нет хостинга и пробник сам не включился — чинится на странице тарифа, а не удалением.
+export function appLimitText(message) {
+  return message.includes('no hosting')
+    ? 'На вашем тарифе нет хостинга, а пробный период не включился. Что сделать — на странице https://app.airlok.ru/settings?tab=plan. Свой сервер работает и без тарифа.'
+    : 'На хостинге уже максимум приложений. Удалите ненужное в дашборде.'
+}
+
 async function create(api, name) {
   if (!APP_NAME.test(name)) throw new UserError('Имя: латиница в нижнем регистре, цифры и дефис, от 2 до 28 символов, начинается с буквы.')
   try {
@@ -492,7 +499,7 @@ async function create(api, name) {
     return app ?? { id, name, domain: '' }
   } catch (err) {
     if (err instanceof ApiError && err.code === 'name_taken') throw new UserError(`Имя ${name} уже занято на хостинге — выберите другое.`)
-    if (err instanceof ApiError && err.code === 'app_limit') throw new UserError('На хостинге уже максимум приложений. Удалите ненужное в дашборде.')
+    if (err instanceof ApiError && err.code === 'app_limit') throw new UserError(appLimitText(err.message))
     throw err
   }
 }

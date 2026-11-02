@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { gunzipSync } from 'node:zlib'
 
-import { duration, logUpdate, main, stageUpdates, suggestName } from '../src/main.js'
+import { appLimitText, duration, logUpdate, main, stageUpdates, suggestName } from '../src/main.js'
 import { untar } from './untar.js'
 
 test('duration reads like the dashboard', () => {
@@ -179,4 +179,9 @@ test('login, then deploy a folder into a new app and follow the build', { timeou
   const after = captureIO()
   assert.equal(await main(['whoami'], after, env), 1)
   assert.match(after.errLines.join('\n'), /Вы не вошли/)
+})
+
+test('appLimitText tells a missing plan from a full one', () => {
+  assert.match(appLimitText('the current plan has no hosting: trial is not available: link Yandex ID to start the trial'), /settings\?tab=plan/)
+  assert.match(appLimitText('hosting allows up to 3 apps per user'), /максимум приложений/)
 })

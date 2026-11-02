@@ -27,6 +27,22 @@ die() {
 	exit 1
 }
 
+# Рецептов ещё нет, поэтому ждать как server-base.sh нечем: занят ли apt, узнаём по его ошибке.
+# На только что арендованном сервере он часто занят автообновлениями.
+install_git() {
+	local out deadline=$((SECONDS + 600)) told=0
+	while ! out=$(export LC_ALL=C.UTF-8; { apt-get update -qq && apt-get install -y -qq git; } 2>&1); do
+		case $out in
+		*"Could not get lock"* | *"Unable to acquire the dpkg frontend lock"*) ;;
+		*) die "не удалось поставить git: apt-get install git" ;;
+		esac
+		((SECONDS < deadline)) || die "система занята другой установкой уже 10 мин (часто это автообновления). Ничего не сломалось: подождите несколько минут и запустите команду ещё раз"
+		((told)) || echo "  система занята другой установкой (часто это автообновления), ждём…"
+		told=1
+		sleep 5
+	done
+}
+
 [[ $EUID -eq 0 ]] || die "запустите через sudo"
 [[ -r /etc/os-release ]] && [[ $(. /etc/os-release && echo "$ID") == ubuntu ]] || die "airlok ставится на Ubuntu"
 
@@ -69,7 +85,7 @@ fi
 
 if ! command -v git >/dev/null; then
 	echo "→ Ставим git"
-	{ apt-get update -qq && apt-get install -y -qq git; } >/dev/null 2>&1 || die "не удалось поставить git: apt-get install git"
+	install_git
 fi
 
 if [[ -d $DIR/.git ]]; then

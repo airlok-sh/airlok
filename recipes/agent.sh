@@ -5,8 +5,9 @@
 # выкатить коммит из GitHub, перезапустить выкаченное приложение, убрать его с сервера,
 # прочитать данные его базы (только чтение, через dbquery.py), положить root'у SSH-ключи
 # устройств (sshkeys.py), закрыть или открыть вход по паролю, выгрузить и загрузить данные
-# приложения при переезде, сделать копию базы в хранилище и восстановить её оттуда (app-data.sh)
-# и обновиться сам, когда это подтвердил человек в дашборде:
+# приложения при переезде, сделать копию базы в хранилище и восстановить её оттуда (app-data.sh),
+# а по подтверждению человека в дашборде — обновиться сам, поставить обновления системы и
+# перезагрузить сервер (os-upgrade.sh):
 # произвольную команду дашборд прислать не может, а каждое поле команды проверяется здесь
 # заново — значения доходят до команд от root.
 # Сервер сам ходит в дашборд, входящих соединений агент не принимает.
@@ -28,6 +29,16 @@ DATA_TIMEOUT=3600
 # Столько ждём, пока человек войдёт на сервер по ключу после закрытия пароля; откат — чуть позже.
 SSH_LOGIN_WAIT=300
 PROGRESS_EVERY=3
+OS_UPGRADE_TIMEOUT=2700
+# За столько сервер точно ушёл в перезагрузку, если собирался: дальше — итог «не перезагрузился».
+OS_REBOOT_WAIT=180
+OS_UNIT=airlok-os-upgrade
+# Обновление системы может перезапустить самого агента, а перезагрузка — точно: что он выполняет,
+# лежит на диске, и новый запуск дождётся конца и отправит итог.
+OS_JOB=$STATE_DIR/os-upgrade.job
+OS_RC=$STATE_DIR/os-upgrade.rc
+OS_LOG=$STATE_DIR/os-upgrade.log
+OS_APPS=$STATE_DIR/os-upgrade.apps
 # Шифротексты из команды и расшифрованные значения — только на tmpfs и только на время выкатки.
 ENV_JSON=$RUN_DIR/env.json
 PANEL_ENV=$RUN_DIR/panel.env
@@ -124,6 +135,11 @@ if kind == "ssh_password":
     if not isinstance(user, str) or not USER.match(user):
         emit("bad", cid, "некорректный пользователь сервера")
     emit("ok", cid, "ssh_password", p["login"], user)
+if kind == "os_upgrade":
+    u = cmd.get("os_upgrade")
+    if not isinstance(u, dict) or u.get("action") not in ("upgrade", "reboot"):
+        emit("bad", cid, "в команде нет нужного действия с системой: upgrade или reboot")
+    emit("ok", cid, "os_upgrade", u["action"])
 if kind == "data_move":
     m = cmd.get("data_move")
     if not isinstance(m, dict) or m.get("op") not in ("export", "import", "resume", "backup", "restore"):
@@ -528,6 +544,85 @@ heartbeat_now() {
 	systemctl start --no-block airlok-healthcheck.service 2>/dev/null
 }
 
+# os_job_result ID СТАТУС [СООБЩЕНИЕ] — итог команды с системой. Сначала отметка: к моменту итога
+# дашборд уже должен знать, остались ли обновления и нужна ли перезагрузка.
+os_job_result() {
+	timeout 120 systemctl start airlok-healthcheck.service 2>/dev/null
+	send_result "$1" "$2" "${3:-}" "$OS_LOG"
+	rm -f "$OS_JOB" "$OS_RC" "$OS_APPS"
+}
+
+# finish_os_upgrade ID — дождаться службы с установкой и отправить итог. Нет файла с кодом — служба
+# не дошла до конца: её оборвал таймаут или выключение сервера.
+finish_os_upgrade() {
+	local id=$1 rc
+	while systemctl is-active --quiet "$OS_UNIT"; do
+		sleep 3
+	done
+	rc=$(cat "$OS_RC" 2>/dev/null)
+	case $rc in
+	0) os_job_result "$id" success ;;
+	"") os_job_result "$id" failed "установка оборвалась, не дойдя до конца. Запустите обновление ещё раз: оно продолжит с того же места" ;;
+	*) os_job_result "$id" failed ;;
+	esac
+}
+
+# run_os_upgrade — поставить обновления отдельной службой: у неё свой cgroup, и перезапуск агента
+# её не оборвёт, иначе dpkg остановился бы на полпути. Nice и idle — чтобы приложения не тормозили.
+run_os_upgrade() {
+	local id=$1
+	echo "команда ${id}: обновления системы"
+	install -m 600 /dev/null "$OS_LOG"
+	rm -f "$OS_RC"
+	printf '%s upgrade\n' "$id" >"$OS_JOB"
+	systemctl reset-failed "$OS_UNIT" 2>/dev/null
+	# shellcheck disable=SC2016 # аргументы раскрывает bash внутри службы
+	if ! systemd-run --quiet --collect --unit="$OS_UNIT" --property=Nice=10 --property=IOSchedulingClass=idle \
+		--property=RuntimeMaxSec="$OS_UPGRADE_TIMEOUT" \
+		/bin/bash -c '"$1" upgrade >"$2" 2>&1; echo $? >"$3"' _ "$RECIPES_DIR/os-upgrade.sh" "$OS_LOG" "$OS_RC" >>"$OS_LOG" 2>&1; then
+		os_job_result "$id" failed "не удалось запустить установку"
+		return
+	fi
+	finish_os_upgrade "$id"
+}
+
+# run_os_reboot — перезагрузка. Итог отправит агент уже после неё: успех значит, что сервер вернулся.
+run_os_reboot() {
+	local id=$1
+	echo "команда ${id}: перезагрузка сервера"
+	install -m 600 /dev/null "$OS_LOG"
+	printf '%s reboot %s\n' "$id" "$(cat /proc/sys/kernel/random/boot_id)" >"$OS_JOB"
+	if ! "$RECIPES_DIR/os-upgrade.sh" reboot "$OS_APPS" </dev/null >"$OS_LOG" 2>&1; then
+		os_job_result "$id" failed
+		return
+	fi
+	sleep "$OS_REBOOT_WAIT"
+	os_job_result "$id" failed "сервер не перезагрузился: перезагрузите его в панели хостера"
+}
+
+# resume_os_job — агент запустился, а команда с системой не закрыта: его перезапустило обновление
+# или команда была перезагрузкой.
+resume_os_job() {
+	local id action boot
+	[[ -s $OS_JOB ]] || return 0
+	read -r id action boot <"$OS_JOB"
+	echo "команда ${id}: продолжаем после запуска агента"
+	if [[ $action == upgrade ]]; then
+		finish_os_upgrade "$id"
+		return
+	fi
+	if [[ $boot == "$(cat /proc/sys/kernel/random/boot_id)" ]]; then
+		sleep "$OS_REBOOT_WAIT"
+		os_job_result "$id" failed "сервер не перезагрузился: перезагрузите его в панели хостера"
+		return
+	fi
+	if "$RECIPES_DIR/os-upgrade.sh" check-apps "$OS_APPS" </dev/null >"$OS_LOG" 2>&1; then
+		os_job_result "$id" success
+	else
+		os_job_result "$id" failed
+	fi
+}
+
 # run_update — обновление агента, которое человек подтвердил в дашборде. После отчёта агент
 # перезапускается: так он продолжит на новом коде, даже если сам agent.sh не менялся.
 run_update() {
@@ -574,6 +669,13 @@ handle() {
 	ssh_keys) run_ssh_keys "${f[1]}" ;;
 	ssh_password) run_ssh_password "${f[1]}" "${f[3]}" "${f[4]}" ;;
 	data_move) run_data_move "${f[1]}" "${f[3]}" "${f[4]}" "${f[5]}" "${f[6]}" ;;
+	os_upgrade)
+		if [[ ${f[3]} == reboot ]]; then
+			run_os_reboot "${f[1]}"
+		else
+			run_os_upgrade "${f[1]}"
+		fi
+		;;
 	*) run_deploy "${f[1]}" "${f[@]:3}" ;;
 	esac
 }
@@ -588,6 +690,7 @@ main() {
 	else
 		echo "не удалось создать ключ ${ENV_KEY}: переменные из дашборда не расшифровать"
 	fi
+	[[ -r $DASHBOARD_CONF ]] && resume_os_job
 	while :; do
 		# git pull заменяет файл новым: между командами перезапускаемся на свежем коде.
 		if [[ $(stat -c %i "$SELF" 2>/dev/null) != "$SELF_INODE" ]]; then

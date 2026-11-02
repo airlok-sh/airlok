@@ -31,6 +31,12 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(parse({"id": CID, "kind": "update", "deploy": {"app": "x; rm -rf /"}}), ["ok", CID, "update"],
                          "поля у обновления не используются, что бы ни прислал дашборд")
 
+    def test_os_upgrade_action_is_checked(self):
+        self.assertEqual(parse({"id": CID, "kind": "os_upgrade", "os_upgrade": {"action": "upgrade"}}), ["ok", CID, "os_upgrade", "upgrade"])
+        self.assertEqual(parse({"id": CID, "kind": "os_upgrade", "os_upgrade": {"action": "reboot"}}), ["ok", CID, "os_upgrade", "reboot"])
+        for bad in ({"action": "reboot; rm -rf /"}, {"action": ["reboot"]}, {}, "reboot", None):
+            self.assertEqual(parse({"id": CID, "kind": "os_upgrade", "os_upgrade": bad})[0], "bad", bad)
+
     def test_db_query_goes_to_file(self):
         q = {"app": "shop", "statements": [{"sql": "SELECT 'a\x00'; DROP", "params": []}], "max_rows": 50, "max_cell": 300}
         with tempfile.TemporaryDirectory() as tmp:

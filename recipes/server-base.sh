@@ -16,6 +16,8 @@ SSH_ROLLBACK_UNIT=airlok-ssh-rollback
 # Агенту нужно окно дольше: человек идёт в терминал по подсказке из дашборда.
 SSH_ROLLBACK_SECONDS=${AIRLOK_SSH_ROLLBACK_SECONDS:-180}
 [[ $SSH_ROLLBACK_SECONDS =~ ^[1-9][0-9]{1,3}$ ]] || die "AIRLOK_SSH_ROLLBACK_SECONDS — число секунд от 10 до 9999"
+APT_LOG=/var/log/airlok-apt.log
+APT_LOCK_WAIT=${AIRLOK_APT_LOCK_WAIT:-600}
 
 preflight() {
 	step "Предварительная проверка"
@@ -32,14 +34,29 @@ preflight() {
 	ok "Ubuntu ${os#ubuntu-}, ${mem} МБ памяти, ${disk} МБ на диске"
 }
 
+# apt_install ЧТО ПАКЕТ… — на только что арендованном сервере apt часто занят автообновлениями.
+# Проверка не исключает гонку: apt могут занять сразу после неё, а его DPkg::Lock::Timeout на
+# блокировку списков пакетов не действует. Поэтому на занятый apt отвечаем новой попыткой.
+apt_install() {
+	local what=$1 deadline=$((SECONDS + APT_LOCK_WAIT)) busy
+	shift
+	busy="система занята другой установкой уже $((APT_LOCK_WAIT / 60)) мин (часто это автообновления). Ничего не сломалось: подождите несколько минут и запустите команду ещё раз"
+	while :; do
+		python3 "$RECIPES_DIR/osupdates.py" wait-lock "$((deadline - SECONDS))" || [[ $? != 3 ]] || die "$busy"
+		{ apt-get update -qq && apt-get install -y -qq "$@"; } >"$APT_LOG" 2>&1 && return 0
+		if ! grep -qE 'Could not get lock|Unable to acquire the dpkg frontend lock' "$APT_LOG"; then
+			tail -20 "$APT_LOG" >&2
+			die "не удалось установить ${what}, полный лог: ${APT_LOG}"
+		fi
+		((SECONDS < deadline)) || die "$busy"
+		sleep 5
+	done
+}
+
 packages() {
 	step "Пакеты и обновления"
-	local log=/var/log/airlok-apt.log
-	if ! { apt-get update -qq && apt-get install -y -qq docker.io docker-compose-v2 nginx ufw fail2ban \
-		unattended-upgrades python3-yaml openssl rsync; } >"$log" 2>&1; then
-		tail -20 "$log" >&2
-		die "не удалось установить пакеты, полный лог: ${log}"
-	fi
+	apt_install пакеты docker.io docker-compose-v2 nginx ufw fail2ban \
+		unattended-upgrades python3-yaml openssl rsync
 	ok "docker, nginx, ufw, fail2ban установлены"
 
 	if write_if_changed /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'EOF'; then
@@ -160,11 +177,7 @@ letsencrypt() {
 install_certbot() {
 	step "Let's Encrypt"
 	if ! command -v certbot >/dev/null; then
-		local log=/var/log/airlok-apt.log
-		if ! { apt-get update -qq && apt-get install -y -qq certbot; } >"$log" 2>&1; then
-			tail -20 "$log" >&2
-			die "не удалось установить certbot, полный лог: ${log}"
-		fi
+		apt_install certbot certbot
 	fi
 	systemctl enable --now certbot.timer >/dev/null 2>&1 || true
 	ok "certbot установлен, сертификаты продлеваются сами"

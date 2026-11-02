@@ -19,6 +19,8 @@ MIN_FREE_MEM_MB=300
 MIN_DISK_MB=1024
 MIN_BOOT_MB=150
 APT_LOG=/var/log/airlok-apt.log
+# Сюда apt пишет проценты скачивания и установки, агент показывает их в дашборде.
+APT_STATUS=${AIRLOK_OS_STATUS:-/dev/null}
 DPKG_OPTS=(-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o "DPkg::Lock::Timeout=${LOCK_WAIT}" -o Dpkg::Use-Pty=0)
 
 running_apps() { docker ps --format '{{.Names}}' 2>/dev/null | sort || true; }
@@ -96,7 +98,7 @@ upgrade() {
 		return
 	fi
 	ok "к установке: ${count}"
-	apt_step apt-get -y -q --with-new-pkgs "${DPKG_OPTS[@]}" -o Acquire::Retries=3 upgrade
+	apt_step apt-get -y -q --with-new-pkgs "${DPKG_OPTS[@]}" -o Acquire::Retries=3 -o APT::Status-Fd=3 upgrade 3>>"$APT_STATUS"
 	# Скачанные пакеты больше не нужны, а диск на небольшом сервере мал.
 	apt-get clean || true
 	left=$(python3 "$RECIPES_DIR/osupdates.py" count) || left=0

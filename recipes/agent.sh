@@ -38,6 +38,7 @@ OS_UNIT=airlok-os-upgrade
 OS_JOB=$STATE_DIR/os-upgrade.job
 OS_RC=$STATE_DIR/os-upgrade.rc
 OS_LOG=$STATE_DIR/os-upgrade.log
+OS_STATUS=$STATE_DIR/os-upgrade.status
 OS_APPS=$STATE_DIR/os-upgrade.apps
 # Шифротексты из команды и расшифрованные значения — только на tmpfs и только на время выкатки.
 ENV_JSON=$RUN_DIR/env.json
@@ -275,13 +276,32 @@ def stages(path, status, now):
     return out
 
 
+# apt_percent — общий прогресс по строкам APT::Status-Fd: скачивание идёт по одной
+# шкале, установка по другой, а по времени установка заметно дольше. 99 — конец приходит с итогом.
+def apt_percent(path):
+    for line in reversed(read(path).splitlines()):
+        parts = line.split(":", 3)
+        if len(parts) < 3 or parts[0] not in ("dlstatus", "pmstatus"):
+            continue
+        try:
+            value = float(parts[2])
+        except ValueError:
+            continue
+        return min(99, max(0, int(value * 0.3 if parts[0] == "dlstatus" else 30 + value * 0.7)))
+    return 0
+
+
 mode, status, message, log_path, stages_path = sys.argv[1:6]
 title_path = sys.argv[6] if len(sys.argv) > 6 else ""
+status_path = sys.argv[7] if len(sys.argv) > 7 else ""
 log = ANSI.sub("", read(log_path))
 tail = log.encode()[-32768:].decode("utf-8", "ignore")
 st = stages(stages_path, status if mode == "result" else "running", time.time())
 if mode == "progress":
-    print(json.dumps({"log": tail, "stages": st or []}, ensure_ascii=False))
+    body = {"log": tail, "stages": st or []}
+    if status_path:
+        body["percent"] = apt_percent(status_path)
+    print(json.dumps(body, ensure_ascii=False))
     sys.exit(0)
 if not message:
     prefix = "Ошибка:" if status == "failed" else "Готово:"
@@ -327,9 +347,9 @@ send_result() {
 # они меняются: иначе человек минутами смотрит на «Выкатывается» без единой строки.
 # 404 — старый дашборд без этого запроса или выкатка уже закрыта: дальше слать незачем.
 stream_progress() {
-	local id=$1 log=$2 stages=$3 body=$RUN_DIR/progress.json sent="" sum code
+	local id=$1 log=$2 stages=$3 apt_status=${4:-} body=$RUN_DIR/progress.json sent="" sum code
 	while sleep "$PROGRESS_EVERY"; do
-		python3 -c "$PAYLOAD_PY" progress running "" "$log" "$stages" >"$body" || continue
+		python3 -c "$PAYLOAD_PY" progress running "" "$log" "$stages" "" "$apt_status" >"$body" || continue
 		sum=$(cksum <"$body")
 		[[ $sum == "$sent" ]] && continue
 		code=$(dashboard_fetch POST "/agent/v1/commands/${id}/log" /dev/null "@${body}") || code=000
@@ -549,16 +569,20 @@ heartbeat_now() {
 os_job_result() {
 	timeout 120 systemctl start airlok-healthcheck.service 2>/dev/null
 	send_result "$1" "$2" "${3:-}" "$OS_LOG"
-	rm -f "$OS_JOB" "$OS_RC" "$OS_APPS"
+	rm -f "$OS_JOB" "$OS_RC" "$OS_APPS" "$OS_STATUS"
 }
 
 # finish_os_upgrade ID — дождаться службы с установкой и отправить итог. Нет файла с кодом — служба
 # не дошла до конца: её оборвал таймаут или выключение сервера.
 finish_os_upgrade() {
-	local id=$1 rc
+	local id=$1 rc streamer
+	stream_progress "$id" "$OS_LOG" "" "$OS_STATUS" &
+	streamer=$!
 	while systemctl is-active --quiet "$OS_UNIT"; do
 		sleep 3
 	done
+	kill "$streamer" 2>/dev/null
+	wait "$streamer" 2>/dev/null
 	rc=$(cat "$OS_RC" 2>/dev/null)
 	case $rc in
 	0) os_job_result "$id" success ;;
@@ -573,12 +597,12 @@ run_os_upgrade() {
 	local id=$1
 	echo "команда ${id}: обновления системы"
 	install -m 600 /dev/null "$OS_LOG"
-	rm -f "$OS_RC"
+	rm -f "$OS_RC" "$OS_STATUS"
 	printf '%s upgrade\n' "$id" >"$OS_JOB"
 	systemctl reset-failed "$OS_UNIT" 2>/dev/null
 	# shellcheck disable=SC2016 # аргументы раскрывает bash внутри службы
 	if ! systemd-run --quiet --collect --unit="$OS_UNIT" --property=Nice=10 --property=IOSchedulingClass=idle \
-		--property=RuntimeMaxSec="$OS_UPGRADE_TIMEOUT" \
+		--property=RuntimeMaxSec="$OS_UPGRADE_TIMEOUT" --setenv=AIRLOK_OS_STATUS="$OS_STATUS" \
 		/bin/bash -c '"$1" upgrade >"$2" 2>&1; echo $? >"$3"' _ "$RECIPES_DIR/os-upgrade.sh" "$OS_LOG" "$OS_RC" >>"$OS_LOG" 2>&1; then
 		os_job_result "$id" failed "не удалось запустить установку"
 		return

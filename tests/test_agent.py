@@ -169,6 +169,21 @@ class PayloadTest(unittest.TestCase):
         with open(self.stages, "a", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line in lines))
 
+    def test_apt_percent(self):
+        status = os.path.join(self.tmp.name, "status")
+        def percent(text):
+            with open(status, "w", encoding="utf-8") as f:
+                f.write(text)
+            out = subprocess.run([sys.executable, "-c", PAYLOAD_PY, "progress", "running", "", self.log, self.stages, "", status],
+                                 capture_output=True, text=True, check=True).stdout
+            return json.loads(out)["percent"]
+        self.assertEqual(percent(""), 0, "apt ещё ничего не сообщил")
+        self.assertEqual(percent("dlstatus:1:50.0:Retrieving file 1 of 2\n"), 15)
+        self.assertEqual(percent("dlstatus:2:100:done\npmstatus:curl:50.0:Unpacking curl\n"), 65)
+        self.assertEqual(percent("pmstatus:curl:100:Done\n"), 99, "конец приходит с итогом")
+        self.assertEqual(percent("pmstatus:curl:50:ok\npmerror:x:60:broken: disk\n"), 65, "чужие строки не сбивают")
+        self.assertNotIn("percent", self.payload("progress"), "у выкатки процентов нет")
+
     def payload(self, mode, status="running", message="", title=""):
         out = subprocess.run([sys.executable, "-c", PAYLOAD_PY, mode, status, message, self.log, self.stages, title],
                              capture_output=True, check=True)

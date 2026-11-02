@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Считает запросы к сайтам по минутам из логов nginx и отправляет их в дашборд.
 
-Запускается из healthcheck.sh раз в минуту. Лог каждого сайта — формат airlok из
+Запускается из healthcheck.sh раз в минуту. Лог каждого сайта — формат Airlok из
 lib.sh: «$msec $status $request_time $body_bytes_sent $request_method $uri
 "$upstream_response_time"», без IP и query-строки. Путь из сервера уходит только шаблоном,
 как у edge хостинга: /orders/:id. Время запроса — время ответа приложения, а если nginx

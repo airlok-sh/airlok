@@ -1,6 +1,6 @@
 """Задачи по расписанию и команда перед запуском на своём сервере: python3 -m unittest discover tests
 
-Расписание разбирается по тем же правилам, что у хостинга airlok (internal/cronexpr), и
+Расписание разбирается по тем же правилам, что у хостинга Airlok (internal/cronexpr), и
 переводится в OnCalendar таймеров systemd.
 """
 import json

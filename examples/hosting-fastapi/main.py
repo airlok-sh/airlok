@@ -15,5 +15,5 @@ def index():
 
 @app.get("/boom")
 def boom():
-    log.error("пример ошибки для логов airlok")
+    log.error("пример ошибки для логов Airlok")
     raise RuntimeError("пример исключения")

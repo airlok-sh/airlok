@@ -209,7 +209,7 @@ def load_jobs(app):
 
 
 def systemctl(*args):
-    """systemctl без «Created symlink…» в выводе выкатки; причину неудачи — в текст ошибки."""
+    """systemctl без «Created symlink…» в выводе публикации; причину неудачи — в текст ошибки."""
     r = subprocess.run(["systemctl", *args], stdin=subprocess.DEVNULL, capture_output=True, text=True)
     if r.returncode:
         raise CronError(f"systemctl {' '.join(args)}: {r.stderr.strip() or f'код {r.returncode}'}")
@@ -305,7 +305,7 @@ def deployed(app):
 
 
 def wait_deploy(app, limit):
-    """Дождаться конца идущей выкатки: на её время compose.yml уже указывает на новую версию,
+    """Дождаться конца идущей публикации: на её время compose.yml уже указывает на новую версию,
     которая ещё может не подняться и откатиться."""
     deadline = time.monotonic() + limit
     with open(f"/run/airlok-deploy-{app}.lock", "w") as lock:
@@ -335,10 +335,10 @@ def run(instance, now=None):
     started, at = now_rfc3339(), time.monotonic()
     first = f"{label} запущена ({job['schedule']})"
     if not deployed(app):
-        report(app, "", started, first, [], 0, f"{label} не запущена: приложение ещё не выкачено")
+        report(app, "", started, first, [], 0, f"{label} не запущена: приложение ещё не опубликовано")
         return 1
     if not wait_deploy(app, limit):
-        report(app, "", started, first, [], 0, f"{label} не запущена: выкатка идёт дольше {job['timeout_min']} мин")
+        report(app, "", started, first, [], 0, f"{label} не запущена: публикация идёт дольше {job['timeout_min']} мин")
         return 1
     # Выкатка, которой задача дождалась, могла убрать её из airlok.yml или поменять команду.
     jobs = load_jobs(app)

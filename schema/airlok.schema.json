@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://raw.githubusercontent.com/airlok-sh/airlok/main/schema/airlok.schema.json",
   "title": "airlok.yml",
-  "description": "Что проекту нужно от airlok: стек и команды, если определились не так, база, загрузки, задачи по расписанию и переменные окружения. Проверка без выкатки: npx @airlok/cli check.",
+  "description": "Что проекту нужно от airlok: стек и команды, если определились не так, база, загрузки, задачи по расписанию и переменные окружения. Проверка без публикации: npx @airlok/cli check.",
   "type": "object",
   "additionalProperties": false,
   "required": ["version"],
@@ -15,7 +15,7 @@
         "name": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9-]{1,30}$",
-          "description": "Имя приложения при выкатке на своём сервере вручную; из дашборда имя задаёт дашборд."
+          "description": "Имя приложения при публикации на своём сервере вручную; из дашборда имя задаёт дашборд."
         },
         "domain": {
           "type": "string",
@@ -132,7 +132,7 @@
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                  "required": { "type": "boolean", "description": "Без неё выкатка остановится. По умолчанию — да, если нет default." },
+                  "required": { "type": "boolean", "description": "Без неё публикация остановится. По умолчанию — да, если нет default." },
                   "secret": { "type": "boolean", "description": "Секрет: дашборд предложит сгенерировать значение." },
                   "description": { "type": "string", "maxLength": 500, "description": "Что это и где взять — для человека." },
                   "default": { "type": "string", "maxLength": 1000, "pattern": "^[^\\n\\r]*$", "description": "Значение, с которым код работает без переменной." },

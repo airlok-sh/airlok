@@ -34,7 +34,7 @@ export async function domainCommand(api, sub, args, opts, io) {
     case 'rm':
       await api.removeServerDomain(app.id).catch(explain)
       if (opts.json) io.out(JSON.stringify({ status: 'ok', app: app.name, state: 'none' }))
-      io.err('✓ Домен отключён: со следующей выкатки сайт вернётся на адрес из airlok.yml или на адрес по умолчанию.')
+      io.err('✓ Домен отключён: со следующей публикации сайт вернётся на адрес из airlok.yml или на адрес по умолчанию.')
       return 0
   }
   const state = domainState(app, d)
@@ -46,7 +46,7 @@ export async function domainCommand(api, sub, args, opts, io) {
 }
 
 function report(app, ref, d, state, ip) {
-  const address = app.domain ? `Сейчас сайт открывается на ${app.domain}.` : 'Адрес появится после первой выкатки.'
+  const address = app.domain ? `Сейчас сайт открывается на ${app.domain}.` : 'Адрес появится после первой публикации.'
   switch (state) {
     case 'none':
       return [`У ${app.name} нет своего домена. ${address}`, `Подключить: npx @airlok/cli domain add shop.example.ru --app ${ref}`]
@@ -56,12 +56,12 @@ function report(app, ref, d, state, ip) {
         `${d.display}: ждём DNS${d.error ? ` — ${d.error}` : ''}.`,
         'Заведите у регистратора A-запись и удалите другие A-записи этого имени:',
         `  A  ${d.display}  →  ${ip}`,
-        `airlok проверяет её сам каждую минуту, а пока она не готова, выкатки идут на прежний адрес. Проверить сейчас: npx @airlok/cli domain check --app ${ref}`,
+        `airlok проверяет её сам каждую минуту, а пока она не готова, публикации идут на прежний адрес. Проверить сейчас: npx @airlok/cli domain check --app ${ref}`,
       ]
     case 'waiting_deploy':
       return [
-        `✓ ${d.display} указывает на сервер. Домен включится следующей выкаткой: push в ветку, кнопка в дашборде или deploy у ИИ-агента.`,
-        'Если выкатка прошла, а домен не включился, на сервере старый агент: обновите его в дашборде (Серверы → «Обновить»).',
+        `✓ ${d.display} указывает на сервер. Домен включится следующей публикацией: push в ветку, кнопка в дашборде или deploy у ИИ-агента.`,
+        'Если публикация прошла, а домен не включился, на сервере старый агент: обновите его в дашборде (Серверы → «Обновить»).',
       ]
     default:
       return [`✓ Сайт работает на ${d.display}.`]

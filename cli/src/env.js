@@ -77,7 +77,7 @@ export async function envCommand(api, sub, names, opts, io) {
       if (big.length) throw new EnvError(`Значение больше 32 КБ: ${big.join(', ')}`)
       const set = app.hosted ? await setHosted(api, app, vars) : await setServer(api, app, vars, io)
       json({ set })
-      io.err(`✓ Заданы: ${set.join(', ')}. ${app.hosted ? 'Применятся со следующего запроса к сайту.' : 'Попадут на сервер при следующей выкатке.'}`)
+      io.err(`✓ Заданы: ${set.join(', ')}. ${app.hosted ? 'Применятся со следующего запроса к сайту.' : 'Попадут на сервер при следующей публикации.'}`)
       return 0
     }
     case 'rm':
@@ -87,7 +87,7 @@ export async function envCommand(api, sub, names, opts, io) {
         throw err
       })
       json({ deleted: names[0] })
-      io.err(`✓ ${names[0]} удалена${app.hosted ? '' : ': с сервера пропадёт при следующей выкатке'}.`)
+      io.err(`✓ ${names[0]} удалена${app.hosted ? '' : ': с сервера пропадёт при следующей публикации'}.`)
       return 0
     default:
       throw new EnvError('env list | set | rm — см. npx @airlok/cli help')

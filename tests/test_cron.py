@@ -230,7 +230,7 @@ class RunTest(unittest.TestCase):
 
         with mock.patch.object(cron, "wait_deploy", deploy):
             _, calls = self.run_with((0, [], 0))
-        self.assertEqual(calls[0][2], "python digest2.py", "команда из выкаченной версии")
+        self.assertEqual(calls[0][2], "python digest2.py", "команда из опубликованной версии")
 
         def removed(app, limit):
             self.server.jobs("shop", [{"name": "другая", "schedule": "0 9 * * *", "command": "x"}])
@@ -238,7 +238,7 @@ class RunTest(unittest.TestCase):
 
         with mock.patch.object(cron, "wait_deploy", removed):
             code, calls = self.run_with((0, [], 0))
-        self.assertEqual((code, calls), (0, []), "выкатка, которую ждали, убрала задачу")
+        self.assertEqual((code, calls), (0, []), "публикация, которую ждали, убрала задачу")
 
     def test_removed_job_and_bad_instance(self):
         self.server.jobs("shop", [])

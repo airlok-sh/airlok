@@ -79,7 +79,7 @@ async function walk(root, prefix) {
 // checkFiles — понятная причина, почему папку не выкатить, ещё до упаковки.
 export function checkFiles(files) {
   if (files.length === 0) return 'В папке нет файлов проекта.'
-  if (files.length > MAX_FILES) return 'В папке больше 50 тысяч файлов — выкатывайте папку самого проекта.'
+  if (files.length > MAX_FILES) return 'В папке больше 50 тысяч файлов — публикуйте папку самого проекта.'
   if (files.reduce((n, f) => n + f.size, 0) > MAX_UNPACKED) return 'Файлы проекта занимают больше 1 ГБ.'
   return ''
 }

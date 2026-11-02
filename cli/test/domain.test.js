@@ -84,7 +84,7 @@ test('domain add, check and rm on own server', { timeout: 30_000 }, async (t) =>
   const out = JSON.parse(check.outLines[0])
   assert.equal(out.state, 'waiting_deploy')
   assert.deepEqual(out.record, { type: 'A', name: 'shop.example.ru', value: '203.0.113.7' })
-  assert.match(check.errLines.join('\n'), /включится следующей выкаткой/)
+  assert.match(check.errLines.join('\n'), /включится следующей публикацией/)
 
   dash.apps[1].domain = 'shop.example.ru'
   const live = captureIO()

@@ -41,10 +41,10 @@ export function formatReport(report) {
     lines.push(`Переменные (${r.env.length}):`, ...r.env.map((v) => envLine(v, width)))
   }
   const section = (title, items, mark) => items.length && lines.push('', title, ...items.map((s) => `  ${mark} ${s}`))
-  section('Остановит выкатку:', r.errors, '✗')
+  section('Остановит публикацию:', r.errors, '✗')
   section('Проверьте:', r.warnings, '!')
   section('Подсказки:', r.notes, '·')
   section('На своём сервере:', r.server, '·')
-  lines.push('', r.errors.length ? '✗ Выкатка с такими файлами не пройдёт.' : '✓ Можно выкатывать.')
+  lines.push('', r.errors.length ? '✗ Публикация с такими файлами не пройдёт.' : '✓ Можно публиковать.')
   return lines.join('\n')
 }

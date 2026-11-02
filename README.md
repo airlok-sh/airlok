@@ -8,12 +8,12 @@
 
 | Каталог | Что |
 | --- | --- |
-| [recipes](recipes) | рецепты: настройка сервера, песочница и деплой приложения, деплой из GitHub и по push, агент для выкатки кнопкой из дашборда, Let's Encrypt, проверка доступности и метрики, уведомления |
+| [recipes](recipes) | рецепты: настройка сервера, песочница и деплой приложения, деплой из GitHub и по push, агент для публикации кнопкой из дашборда, Let's Encrypt, проверка доступности и метрики, уведомления |
 | [checkup](checkup) | проверка сервера только на чтение: SSH, открытые порты, файрвол, обновления, бэкапы, Docker, nginx |
 | [examples](examples) | примеры проектов: с манифестом `airlok.yml` и без него |
 | [schema](schema) | схема `airlok.yml` для редакторов и ИИ-агентов: все поля, значения и подсказки |
-| [cli](cli) | `npx @airlok/cli` — проверка проекта (`check`), выкатка папки на хостинг без GitHub (`deploy`), переменные своего сервера (`env`) |
-| [skills](skills) | навыки для ИИ-агентов: `airlok` — выкатка и сопровождение, `airlok-yml` — подготовка `airlok.yml`; ставятся `npx @airlok/cli setup` вместе с MCP или отдельно — `npx skills add airlok-sh/airlok` |
+| [cli](cli) | `npx @airlok/cli` — проверка проекта (`check`), публикация папки на хостинге без GitHub (`deploy`), переменные своего сервера (`env`) |
+| [skills](skills) | навыки для ИИ-агентов: `airlok` — публикация и сопровождение, `airlok-yml` — подготовка `airlok.yml`; ставятся `npx @airlok/cli setup` вместе с MCP или отдельно — `npx skills add airlok-sh/airlok` |
 
 С чего начать — [recipes/README.md](recipes/README.md).
 

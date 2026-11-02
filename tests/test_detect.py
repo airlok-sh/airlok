@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "recipes"))
 
-from detect import DEFAULT_GO, DEFAULT_NODE, DEFAULT_PYTHON, NPM_INSTALL, DetectError, detect, static_output  # noqa: E402
+from detect import BUN_SETUP, DEFAULT_GO, DEFAULT_NODE, DEFAULT_PYTHON, NPM_INSTALL, DetectError, detect, static_output  # noqa: E402
 from manifest import ManifestError, parse  # noqa: E402
 
 
@@ -95,6 +95,53 @@ class DetectTest(unittest.TestCase):
             detect(project({"go.mod": "module x\n", "main.go": "package main\n"}), go="1.20")
         with self.assertRaisesRegex(DetectError, "go.mod"):
             detect(project({"main.go": "package main\n"}), stack="go")
+
+    def test_js_frameworks(self):
+        vite = '"devDependencies":{"vite":"7"'
+        self.check({"package.json": '{"scripts":{"build":"vite build"},' + vite + ',"@sveltejs/kit":"2","@sveltejs/adapter-node":"5"}}'},
+                   stack="node", framework="SvelteKit", start="PROTOCOL_HEADER=x-forwarded-proto node build", bun=False)
+        self.check({"package.json": '{"scripts":{"build":"vite build"},' + vite + ',"@sveltejs/kit":"2","@sveltejs/adapter-static":"3"}}'},
+                   stack="static", framework="SvelteKit", output="build")
+        self.check({"package.json": '{"scripts":{"build":"nuxt build"},"dependencies":{"nuxt":"4"}}'},
+                   stack="node", framework="Nuxt", start="node .output/server/index.mjs")
+        self.check({"package.json": '{"scripts":{"build":"nuxt generate"},"dependencies":{"nuxt":"4"}}'},
+                   stack="static", framework="Nuxt", output=".output/public")
+        self.check({"package.json": '{"scripts":{"build":"vite build","start":"node .output/server/index.mjs"},'
+                                    '"dependencies":{"@tanstack/react-start":"1"}}'},
+                   stack="node", framework="TanStack Start", start="npm start")
+        self.check({"package.json": '{"scripts":{"build":"vite build"},"dependencies":{"@tanstack/react-start":"1","nitro":"3"}}'},
+                   stack="node", framework="TanStack Start", start="node .output/server/index.mjs")
+        self.check({"package.json": '{"scripts":{"build":"react-router build"},"devDependencies":{"@react-router/dev":"7"}}',
+                    "react-router.config.ts": "export default { ssr: false }\n"},
+                   stack="static", framework="React Router", output="build/client")
+        self.check({"package.json": '{"scripts":{"build":"astro build","start":"astro dev"},"dependencies":{"astro":"5","@astrojs/node":"9"}}'},
+                   stack="node", framework="Astro", start="node ./dist/server/entry.mjs")
+        self.check({"package.json": '{"scripts":{"build":"astro build"},"dependencies":{"astro":"5"}}'},
+                   stack="static", framework="Astro", output="dist")
+
+    def test_js_framework_problems(self):
+        for pkg, want in (('{"scripts":{"build":"vite build"},"devDependencies":{"@sveltejs/kit":"2","@sveltejs/adapter-auto":"6"}}', "adapter-node"),
+                          ('{"scripts":{"build":"vite build"},"dependencies":{"@tanstack/react-start":"1"}}', "nitro"),
+                          ('{"scripts":{"build":"react-router build"},"devDependencies":{"@react-router/dev":"7"}}', "@react-router/serve"),
+                          ('{"scripts":{"build":"astro build"},"dependencies":{"astro":"5","@astrojs/vercel":"8"}}', "@astrojs/node")):
+            root = project({"package.json": pkg})
+            with self.assertRaisesRegex(DetectError, want):
+                detect(root)
+            self.assertEqual(detect(root, run_command="node server.js")["start"], "node server.js")
+
+    def test_bun(self):
+        frozen = BUN_SETUP + " && bun install --frozen-lockfile"
+        self.check({"bun.lock": "{}", "package.json": '{"scripts":{"build":"vite build"},"devDependencies":{"vite":"7"}}'},
+                   stack="static", bun=True, install=frozen)
+        self.check({"bun.lockb": "x", "package-lock.json": "{}", "package.json": '{"scripts":{"build":"vite build"},"devDependencies":{"vite":"7"}}'},
+                   bun=False, install=NPM_INSTALL)
+        self.check({"bun.lock": "{}", "src/app.ts": "", "package.json": '{"module":"src/app.ts","dependencies":{"hono":"4"}}'},
+                   stack="node", start="bun run src/app.ts", install=frozen)
+        self.check({"bun.lock": "{}", "index.ts": "", "package.json": "{}"}, stack="node", start="bun run index.ts")
+        self.check({"src/index.ts": "", "package.json": '{"dependencies":{"elysia":"1"}}'},
+                   framework="Elysia", start="bun run src/index.ts", install=BUN_SETUP + " && bun install")
+        self.check({"package.json": '{"scripts":{"start":"bun run server.ts"}}'}, bun=True, start="npm start")
+        self.check({"package.json": '{"scripts":{"start":"node bun/server.js"}}'}, bun=False)
 
     def test_errors(self):
         for files in ({"README.md": "# hi"}, {"requirements.txt": "requests\n", "main.py": ""},

@@ -250,6 +250,7 @@ def parse(data, root):
         "NODE_VERSION": plan["node"],
         "PYTHON_VERSION": plan["python"],
         "GO_VERSION": plan["go"],
+        "APP_BUN": int(plan["bun"]),
         "BUILD_INSTALL": plan["install"],
         "BUILD_CMD": plan["build"],
         "BUILD_OUTPUT": plan["output"],

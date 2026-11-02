@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/airlok-sh/airlok/main/schema/airlok.schema.json
-# Next.js без базы на хостинге airlok: страницы рендерятся на сервере по запросу.
+# Next.js без базы на хостинге Airlok: страницы рендерятся на сервере по запросу.
 version: 1
 
 app:

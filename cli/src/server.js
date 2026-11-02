@@ -111,7 +111,7 @@ export async function serverCommand(api, origin, sub, rest, opts, io, home, sys 
   const usedKey = await ensureAccess(target, key, port, io, sys, echo)
 
   const server = await registerServer(api, name, opts.name ? '' : target.host)
-  io.err(`\nСтавлю airlok на ${target.host} — несколько минут: Docker, nginx, файрвол, агент.\n`)
+  io.err(`\nСтавлю Airlok на ${target.host} — несколько минут: Docker, nginx, файрвол, агент.\n`)
   const install = await sys.run('ssh', [...sshArgs(usedKey, target, { port }), remote], { input: `${server.token}\n`, out: echo })
   if (install.code !== 0) {
     if (target.user !== 'root' && /sudo: a (terminal|password) is required/.test(install.output)) {
@@ -320,7 +320,7 @@ async function registerServer(api, name, address) {
   const existing = byAddress ?? servers.find((s) => s.name === name)
   if (existing?.last_seen_at) {
     const known = existing.name === name ? `Сервер ${name}` : `Сервер ${address} под именем ${existing.name}`
-    throw new ServerError(`${known} уже подключён к airlok. Подключить другой сервер с этим адресом — задайте имя: --name <имя>.`)
+    throw new ServerError(`${known} уже подключён к Airlok. Подключить другой сервер с этим адресом — задайте имя: --name <имя>.`)
   }
   try {
     const created = existing ? await api.rotateServerToken(existing.id) : await api.createServer(name)

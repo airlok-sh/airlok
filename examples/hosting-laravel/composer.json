@@ -1,7 +1,7 @@
 {
     "name": "airlok/hosting-laravel",
     "type": "project",
-    "description": "Laravel с PostgreSQL на хостинге airlok",
+    "description": "Laravel с PostgreSQL на хостинге Airlok",
     "require": {
         "php": "^8.3",
         "laravel/framework": "^13.17"

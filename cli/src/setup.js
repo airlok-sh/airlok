@@ -29,7 +29,7 @@ export function mergeServers(text, entry, file) {
     try {
       cfg = JSON.parse(text)
     } catch {
-      throw new Error(`${file} — не JSON, править его вслепую не будем. Исправьте файл или добавьте airlok вручную.`)
+      throw new Error(`${file} — не JSON, править его вслепую не будем. Исправьте файл или добавьте Airlok вручную.`)
     }
   }
   if (typeof cfg !== 'object' || cfg === null || Array.isArray(cfg)) throw new Error(`${file}: ожидался объект JSON`)

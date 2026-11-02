@@ -19,19 +19,19 @@ const run = promisify(execFile)
 const POLL_MS = 2000
 const FOLLOW_LIMIT_MS = 30 * 60_000
 
-const help = `airlok — публикация проекта на хостинге airlok или свой сервер из терминала
+const help = `Airlok — публикация проекта на хостинге Airlok или свой сервер из терминала
 
   npx @airlok/cli setup             один раз: вход и подключение ИИ-агентов (Claude Code, Codex, Antigravity, Cursor)
   npx @airlok/cli login             войти через браузер
   npx @airlok/cli deploy [папка]    собрать и опубликовать папку (по умолчанию текущую)
-  npx @airlok/cli check [папка]     что airlok сделает с проектом и что помешает публикации — без сборки
+  npx @airlok/cli check [папка]     что Airlok сделает с проектом и что помешает публикации — без сборки
   npx @airlok/cli env list --app <имя>          переменные окружения приложения (без значений)
   npx @airlok/cli env set ИМЯ… --app <имя>      задать: значение спросит без показа на экране или прочитает из stdin
   npx @airlok/cli env set --app <имя> --from .env   задать все переменные из файла
   npx @airlok/cli env rm ИМЯ --app <имя>        удалить
   npx @airlok/cli domain add ДОМЕН --app <имя>  свой домен приложения на своём сервере: подключить или заменить
   npx @airlok/cli domain show|check|rm --app <имя>   что с доменом, проверить DNS сейчас, отключить
-  npx @airlok/cli server connect root@IP        подключить свой сервер: поставить на него airlok по SSH
+  npx @airlok/cli server connect root@IP        подключить свой сервер: поставить на него Airlok по SSH
   npx @airlok/cli server upgrade <имя>          поставить обновления системы на подключённом сервере
   npx @airlok/cli server reboot <имя>           перезагрузить его: сайты недоступны 1–2 минуты
   npx @airlok/cli device add [--server <сервер>]   добавить SSH-ключ этого компьютера в «Устройства» и открыть ему серверы
@@ -358,7 +358,7 @@ async function setup(opts, io, env) {
       throw new UserError(`Не нашёл ни одного агента. Укажите явно: --agents ${list.map((a) => a.id).join(',')}`)
     }
   }
-  io.err(`Подключу к airlok (${s.url}): ${chosen.map((a) => a.label).join(', ')}.`)
+  io.err(`Подключу к Airlok (${s.url}): ${chosen.map((a) => a.label).join(', ')}.`)
   if (io.interactive && !opts.yes) {
     const answer = (await io.ask('Продолжить? [Y/n] ')).toLowerCase()
     if (answer && !['y', 'yes', 'д', 'да'].includes(answer)) return 0
@@ -368,7 +368,7 @@ async function setup(opts, io, env) {
     if (r.ok) io.err(`  ✓ ${r.agent.padEnd(12)} MCP: ${homePath(r.mcp, home)} · навыки ${SKILLS.join(', ')}: ${r.skills.map((d) => homePath(d, home)).join(', ')}`)
     else io.err(`  ✗ ${r.agent.padEnd(12)} ${r.error}`)
   }
-  io.err('\nПерезапустите агентов, чтобы они увидели airlok. Проверка: спросите агента «какие у меня приложения на airlok?».')
+  io.err('\nПерезапустите агентов, чтобы они увидели Airlok. Проверка: спросите агента «какие у меня приложения на Airlok?».')
   return report.every((r) => r.ok) ? 0 : 1
 }
 

@@ -131,7 +131,7 @@ test('server connect with a working key installs without asking anything', async
   const [probe, install] = sys.calls
   assert.equal(probe.args.at(-1), 'true')
   assert.ok(probe.args.includes('BatchMode=yes'))
-  assert.ok(!probe.args.includes('-i'), 'своего ключа airlok ещё нет — пускают ключи человека')
+  assert.ok(!probe.args.includes('-i'), 'своего ключа Airlok ещё нет — пускают ключи человека')
   assert.equal(install.input, 'airlok_srv_secret\n', 'токен идёт через stdin')
   assert.ok(!install.args.join(' ').includes('airlok_srv_'), 'и не попадает в аргументы')
   assert.equal(install.args.at(-1), `bash -c "$(curl -fsSL https://airlok.ru/install.sh)" install ${dash.url} --letsencrypt`)
@@ -208,7 +208,7 @@ test('server connect retries reuse a server that never came online', async (t) =
   assert.deepEqual(dash.state.rotated, ['old'])
   assert.deepEqual(dash.state.created, [])
   assert.equal(sys.calls[1].input, 'airlok_srv_rotated\n')
-  assert.ok(sys.calls[0].args.includes(join(dir, '.ssh', 'airlok_ed25519')), 'свой ключ airlok уже есть — входим с ним')
+  assert.ok(sys.calls[0].args.includes(join(dir, '.ssh', 'airlok_ed25519')), 'свой ключ Airlok уже есть — входим с ним')
 
   dash.state.servers[0].last_seen_at = '2026-10-28T10:00:00Z'
   const again = captureIO()
@@ -256,8 +256,8 @@ test('server connect explains a failed install and a changed host key', async (t
   t.after(dash.close)
   const env = { AIRLOK_URL: dash.url, AIRLOK_TOKEN: 't', HOME: await home() }
   const failed = captureIO()
-  assert.equal(await main(['server', 'connect', '1.2.3.4'], failed, env, fakeSystem(dash, [{ code: 0 }, { code: 1, output: 'Ошибка: airlok ставится на Ubuntu' }])), 1)
-  assert.match(failed.errLines.join('\n'), /Ошибка: airlok ставится на Ubuntu[\s\S]*Установка не закончилась/)
+  assert.equal(await main(['server', 'connect', '1.2.3.4'], failed, env, fakeSystem(dash, [{ code: 0 }, { code: 1, output: 'Ошибка: Airlok ставится на Ubuntu' }])), 1)
+  assert.match(failed.errLines.join('\n'), /Ошибка: Airlok ставится на Ubuntu[\s\S]*Установка не закончилась/)
 
   const changed = captureIO()
   assert.equal(await main(['server', 'connect', '5.6.7.8'], changed, env, fakeSystem(dash, [{ code: 255, output: 'Host key verification failed.' }])), 1)

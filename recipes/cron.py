@@ -7,7 +7,7 @@
 
 Задача и команда идут разовым контейнером приложения (docker compose run): с той же
 изоляцией, переменными и базой, что у него, но со своим таймаутом. Расписание — как на
-хостинге airlok: пять полей cron, время московское. Вывод уходит в журнал службы и, если
+хостинге Airlok: пять полей cron, время московское. Вывод уходит в журнал службы и, если
 сервер подключён к дашборду, в логи приложения с пометкой задачи.
 """
 import collections
@@ -50,7 +50,7 @@ WEEKDAYS = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
 Schedule = collections.namedtuple("Schedule", "minute hour dom month dow dom_star dow_star")
 
 SERVICE = """[Unit]
-Description=Задача по расписанию airlok %i
+Description=Задача по расписанию Airlok %i
 After=docker.service
 
 [Service]

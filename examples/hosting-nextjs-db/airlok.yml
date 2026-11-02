@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/airlok-sh/airlok/main/schema/airlok.schema.json
-# Next.js с Postgres на хостинге airlok: базу airlok создаёт сам и передаёт DATABASE_URL.
+# Next.js с Postgres на хостинге Airlok: базу Airlok создаёт сам и передаёт DATABASE_URL.
 # GREETING задаётся на странице приложения в дашборде — без неё публикация остановится.
 version: 1
 
@@ -12,4 +12,4 @@ capabilities:
     enabled: true
 
 env:
-  GREETING: Приветствие на главной странице, например «Привет из airlok»
+  GREETING: Приветствие на главной странице, например «Привет из Airlok»

@@ -6,4 +6,4 @@ app = Flask(__name__)
 
 @app.get("/")
 def index():
-    return "<h1>Flask на хостинге airlok</h1>"
+    return "<h1>Flask на хостинге Airlok</h1>"

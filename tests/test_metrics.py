@@ -16,7 +16,7 @@ MINUTE = 1761541200  # 2025-10-27T05:00:00Z
 
 
 def line(status, path, method="GET", took=0.005, sent=10, at=MINUTE + 5, upstream=None):
-    """Строка лога в формате airlok; время приложения по умолчанию равно длительности запроса."""
+    """Строка лога в формате Airlok; время приложения по умолчанию равно длительности запроса."""
     if upstream is None:
         upstream = "%.3f" % took
     return '%.3f %d %.3f %d %s %s "%s"' % (at, status, took, sent, method, path, upstream)

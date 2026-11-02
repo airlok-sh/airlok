@@ -56,7 +56,7 @@ function report(app, ref, d, state, ip) {
         `${d.display}: ждём DNS${d.error ? ` — ${d.error}` : ''}.`,
         'Заведите у регистратора A-запись и удалите другие A-записи этого имени:',
         `  A  ${d.display}  →  ${ip}`,
-        `airlok проверяет её сам каждую минуту, а пока она не готова, публикации идут на прежний адрес. Проверить сейчас: npx @airlok/cli domain check --app ${ref}`,
+        `Airlok проверяет её сам каждую минуту, а пока она не готова, публикации идут на прежний адрес. Проверить сейчас: npx @airlok/cli domain check --app ${ref}`,
       ]
     case 'waiting_deploy':
       return [
@@ -74,7 +74,7 @@ function explain(err) {
     case 'invalid_domain':
       throw new DomainError('Домен не подходит: нужно имя вроде shop.example.ru или магазин.рф, не просто зона вроде .ru.')
     case 'platform_domain':
-      throw new DomainError('Адреса на домене хостинга airlok выдаёт сам — укажите свой домен.')
+      throw new DomainError('Адреса на домене хостинга Airlok выдаёт сам — укажите свой домен.')
     case 'domain_taken':
       throw new DomainError('Этот домен уже у другого приложения на этом сервере.')
     case 'preview_settings':

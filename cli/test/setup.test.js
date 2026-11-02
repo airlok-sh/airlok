@@ -114,7 +114,7 @@ test('airlok setup with a token from the environment', async (t) => {
   const { home } = await fakeHome()
   await mkdir(join(home, '.codex'), { recursive: true })
   const io = { interactive: false, outLines: [], errLines: [], out: (s) => io.outLines.push(s), err: (s) => io.errLines.push(s), ask: async () => '' }
-  const env = { HOME: home, PATH: '', AIRLOK_TOKEN: TOKEN, AIRLOK_URL: dash.url }
+  const env = { HOME: home, XDG_CONFIG_HOME: home, PATH: '', AIRLOK_TOKEN: TOKEN, AIRLOK_URL: dash.url }
   assert.equal(await main(['setup'], io, env), 0, io.errLines.join('\n'))
   assert.match(io.errLines.join('\n'), /✓ Codex/)
   assert.match(await readFile(join(home, '.codex', 'config.toml'), 'utf8'), /Bearer airlok_pat_test/)
@@ -160,7 +160,7 @@ test('airlok setup logs in again instead of writing a revoked token', async (t) 
   const dash = await fakeDashboard({ me: 401 })
   t.after(dash.close)
   const home = await homeWithCodex()
-  const env = { HOME: home, PATH: '', AIRLOK_URL: dash.url }
+  const env = { HOME: home, XDG_CONFIG_HOME: home, PATH: '', AIRLOK_URL: dash.url }
   await saveSession({ url: dash.url, token: 'airlok_pat_revoked', login: 'anna' }, env)
   const io = setupIO()
   assert.equal(await main(['setup'], io, env), 0, io.errLines.join('\n'))
@@ -176,7 +176,7 @@ test('airlok setup refuses a revoked AIRLOK_TOKEN: login would not replace it', 
   t.after(dash.close)
   const home = await homeWithCodex()
   const io = setupIO()
-  assert.equal(await main(['setup'], io, { HOME: home, PATH: '', AIRLOK_URL: dash.url, AIRLOK_TOKEN: 'airlok_pat_revoked' }), 1)
+  assert.equal(await main(['setup'], io, { HOME: home, XDG_CONFIG_HOME: home, PATH: '', AIRLOK_URL: dash.url, AIRLOK_TOKEN: 'airlok_pat_revoked' }), 1)
   assert.match(io.errLines.join('\n'), /AIRLOK_TOKEN отозван/)
   await assert.rejects(readFile(join(home, '.codex', 'config.toml'), 'utf8'))
 })
@@ -185,7 +185,7 @@ test('airlok setup keeps the token when the server is failing', async (t) => {
   const dash = await fakeDashboard({ me: 500 })
   t.after(dash.close)
   const home = await homeWithCodex()
-  const env = { HOME: home, PATH: '', AIRLOK_URL: dash.url }
+  const env = { HOME: home, XDG_CONFIG_HOME: home, PATH: '', AIRLOK_URL: dash.url }
   await saveSession({ url: dash.url, token: TOKEN, login: 'anna' }, env)
   const io = setupIO()
   assert.equal(await main(['setup'], io, env), 0, io.errLines.join('\n'))

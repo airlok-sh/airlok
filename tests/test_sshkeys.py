@@ -209,6 +209,38 @@ class UserSyncTest(unittest.TestCase):
         self.assertEqual(self.read(self.root), f"{key(1)} airlok-device:{ID1}\n", "root не остался без входа")
         self.assertEqual(self.read(self.ubuntu), f"{key(1)} airlok-device:{ID1}\n")
 
+    def fp(self, seed):
+        return sshkeys.fingerprint(blob("ssh-ed25519", seed))
+
+    def test_removes_foreign_key_by_fingerprint(self):
+        self.write(self.root, f"# {key(9)} заметка\n{key(9)} ci\n{key(8)} hoster\n")
+        self.write(self.ubuntu, f'from="10.0.0.1" {key(7)} old\n{key(8)} hoster\n')
+        msg = sshkeys.sync({"user": "root", "keys": [{"id": ID1, "key": key(1)}], "remove": [
+            {"user": "root", "fingerprint": self.fp(9)}, {"user": "ubuntu", "fingerprint": self.fp(7)},
+        ]}, self.conf, self.accs)
+        self.assertIn("убрано ключей не из «Устройств»: 2", msg)
+        self.assertEqual(self.read(self.root), f"# {key(9)} заметка\n{key(8)} hoster\n{key(1)} airlok-device:{ID1}\n")
+        self.assertEqual(self.read(self.ubuntu), f"{key(8)} hoster\n", "строка с опциями тоже убрана, ключ другого отпечатка на месте")
+
+    def test_remove_keeps_device_key(self):
+        self.write(self.root, f"{key(1)} ci\n")
+        sshkeys.sync({"user": "root", "keys": [{"id": ID1, "key": key(1)}], "remove": [{"user": "root", "fingerprint": self.fp(1)}]},
+                     self.conf, self.accs)
+        self.assertEqual(self.read(self.root), f"{key(1)} airlok-device:{ID1}\n", "ключ открытого устройства не пропадает")
+
+    def test_remove_refuses_last_key(self):
+        self.write(self.ubuntu, f"{key(9)} ci\n")
+        for user in ("root", "ubuntu"):
+            with self.assertRaises(sshkeys.Failed):
+                sshkeys.sync({"user": user, "keys": [], "remove": [{"user": "ubuntu", "fingerprint": self.fp(9)}]}, self.conf, self.accs)
+        self.assertEqual(self.read(self.ubuntu), f"{key(9)} ci\n", "пользователь не остался без входа")
+
+    def test_remove_rejects_bad_request(self):
+        for remove in ("x", [{"user": "root"}], [{"user": "../x", "fingerprint": self.fp(9)}], [{"user": "root", "fingerprint": "MD5:aa"}],
+                       [{"user": "nobody", "fingerprint": self.fp(9)}]):
+            with self.assertRaises(sshkeys.Failed):
+                sshkeys.sync({"user": "root", "keys": [], "remove": remove}, self.conf, self.accs)
+
     def test_unknown_user(self):
         with self.assertRaises(sshkeys.Failed):
             sshkeys.sync({"user": "nobody", "keys": []}, self.conf, self.accs)

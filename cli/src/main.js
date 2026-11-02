@@ -320,13 +320,29 @@ function openBrowser(url) {
   }
 }
 
+// liveSession — сессия с токеном, который сервер принимает: отозванный агентам записывать нельзя.
+async function liveSession(io, env) {
+  const s = await session(env)
+  if (s.token && !(await tokenRejected(s))) return s
+  if (s.token && env.AIRLOK_TOKEN) throw new UserError('Токен из AIRLOK_TOKEN отозван или неверный: задайте действующий.')
+  if (s.token) io.err('Сохранённый вход больше не действует — войдите заново.')
+  await login(io, env)
+  return session(env)
+}
+
+// Только 401 говорит о самом токене: нет связи или сбой сервера — ещё не повод входить заново.
+async function tokenRejected(s) {
+  try {
+    await new Api(s.url, s.token).me()
+    return false
+  } catch (err) {
+    return err instanceof ApiError && err.status === 401
+  }
+}
+
 // setup — вход и подключение агентов: MCP-сервер airlok с токеном и навык airlok.
 async function setup(opts, io, env) {
-  let s = await session(env)
-  if (!s.token) {
-    await login(io, env)
-    s = await session(env)
-  }
+  const s = await liveSession(io, env)
   const home = env.HOME || env.USERPROFILE || homedir()
   const list = agents(home)
   let chosen

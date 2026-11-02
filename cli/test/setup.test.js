@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
+import { saveSession, session } from '../src/config.js'
 import { main } from '../src/main.js'
 import { agents, mergeServers, setupAgents, upsertTomlServer } from '../src/setup.js'
 
@@ -106,11 +108,13 @@ test('setupAgents reports a broken config instead of overwriting it', async () =
   assert.equal(await readFile(join(home, '.cursor', 'mcp.json'), 'utf8'), '{ oops')
 })
 
-test('airlok setup with a token from the environment', async () => {
+test('airlok setup with a token from the environment', async (t) => {
+  const dash = await fakeDashboard({ me: 200 })
+  t.after(dash.close)
   const { home } = await fakeHome()
   await mkdir(join(home, '.codex'), { recursive: true })
   const io = { interactive: false, outLines: [], errLines: [], out: (s) => io.outLines.push(s), err: (s) => io.errLines.push(s), ask: async () => '' }
-  const env = { HOME: home, PATH: '', AIRLOK_TOKEN: TOKEN, AIRLOK_URL: URL_ }
+  const env = { HOME: home, PATH: '', AIRLOK_TOKEN: TOKEN, AIRLOK_URL: dash.url }
   assert.equal(await main(['setup'], io, env), 0, io.errLines.join('\n'))
   assert.match(io.errLines.join('\n'), /✓ Codex/)
   assert.match(await readFile(join(home, '.codex', 'config.toml'), 'utf8'), /Bearer airlok_pat_test/)
@@ -122,4 +126,68 @@ test('airlok setup with a token from the environment', async () => {
   assert.equal(await main(['setup'], none, { ...env, HOME: (await fakeHome()).home }), 1)
   assert.match(none.errLines.join('\n'), /--agents/)
   assert.equal(await main(['setup', '--agents', 'vim'], none, env), 1)
+})
+
+// fakeDashboard отвечает на проверку токена кодом me и выдаёт новый токен при входе.
+async function fakeDashboard({ me }) {
+  const server = createServer((req, res) => {
+    const send = (code, data) => {
+      res.writeHead(code, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(data))
+    }
+    req.resume()
+    if (req.url === '/api/cli/v1/me') return me === 200 ? send(200, { login: 'anna' }) : send(me, { error: { code: 'x', message: 'x' } })
+    if (req.url === '/api/cli/v1/login') return send(200, { device_code: 'd', user_code: 'ABCD', url: 'http://x/cli?code=ABCD', expires_in: 60, interval: 0 })
+    if (req.url === '/api/cli/v1/login/token') return send(200, { token: 'airlok_pat_new', login: 'anna' })
+    send(404, { error: { code: 'not_found', message: req.url } })
+  })
+  await new Promise((ok) => server.listen(0, '127.0.0.1', ok))
+  return { url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((ok) => server.close(ok)) }
+}
+
+function setupIO() {
+  const io = { interactive: false, outLines: [], errLines: [], out: (s) => io.outLines.push(s), err: (s) => io.errLines.push(s), ask: async () => '' }
+  return io
+}
+
+async function homeWithCodex() {
+  const { home } = await fakeHome()
+  await mkdir(join(home, '.codex'), { recursive: true })
+  return home
+}
+
+test('airlok setup logs in again instead of writing a revoked token', async (t) => {
+  const dash = await fakeDashboard({ me: 401 })
+  t.after(dash.close)
+  const home = await homeWithCodex()
+  const env = { HOME: home, PATH: '', AIRLOK_URL: dash.url }
+  await saveSession({ url: dash.url, token: 'airlok_pat_revoked', login: 'anna' }, env)
+  const io = setupIO()
+  assert.equal(await main(['setup'], io, env), 0, io.errLines.join('\n'))
+  assert.match(io.errLines.join('\n'), /больше не действует/)
+  const config = await readFile(join(home, '.codex', 'config.toml'), 'utf8')
+  assert.match(config, /Bearer airlok_pat_new/)
+  assert.doesNotMatch(config, /airlok_pat_revoked/)
+  assert.equal((await session(env)).token, 'airlok_pat_new')
+})
+
+test('airlok setup refuses a revoked AIRLOK_TOKEN: login would not replace it', async (t) => {
+  const dash = await fakeDashboard({ me: 401 })
+  t.after(dash.close)
+  const home = await homeWithCodex()
+  const io = setupIO()
+  assert.equal(await main(['setup'], io, { HOME: home, PATH: '', AIRLOK_URL: dash.url, AIRLOK_TOKEN: 'airlok_pat_revoked' }), 1)
+  assert.match(io.errLines.join('\n'), /AIRLOK_TOKEN отозван/)
+  await assert.rejects(readFile(join(home, '.codex', 'config.toml'), 'utf8'))
+})
+
+test('airlok setup keeps the token when the server is failing', async (t) => {
+  const dash = await fakeDashboard({ me: 500 })
+  t.after(dash.close)
+  const home = await homeWithCodex()
+  const env = { HOME: home, PATH: '', AIRLOK_URL: dash.url }
+  await saveSession({ url: dash.url, token: TOKEN, login: 'anna' }, env)
+  const io = setupIO()
+  assert.equal(await main(['setup'], io, env), 0, io.errLines.join('\n'))
+  assert.match(await readFile(join(home, '.codex', 'config.toml'), 'utf8'), /Bearer airlok_pat_test/)
 })

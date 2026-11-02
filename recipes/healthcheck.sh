@@ -112,7 +112,7 @@ check_app() {
 HEARTBEAT_PY='
 import json, os, sys
 
-version, password, letsencrypt, env_key, ssh_report = sys.argv[1:6]
+version, password, letsencrypt, env_key, ssh_report, os_report = sys.argv[1:7]
 mem = {}
 with open("/proc/meminfo") as f:
     for line in f:
@@ -134,6 +134,11 @@ try:
         ssh = json.load(f)
 except (OSError, ValueError):
     ssh = {}
+try:
+    with open(os_report, encoding="utf-8") as f:
+        os_updates = json.load(f)
+except (OSError, ValueError):
+    os_updates = {}
 print(json.dumps({
     **{k: v for k, v in ssh.items() if k in ("ssh_keys", "ssh_users", "ssh_logins")},
     "agent_version": version,
@@ -148,6 +153,8 @@ print(json.dumps({
     "ssh_password_login": {"true": True, "false": False}.get(password),
     "letsencrypt": letsencrypt == "true",
     "env_key": env_key,
+    # Подсчёт не удался — поля нет, и дашборд оставит прежнее значение.
+    **({"os_updates": os_updates} if os_updates else {}),
 }))
 '
 
@@ -155,7 +162,7 @@ print(json.dumps({
 # изменениях, и без неё молчащий исправный сервер выглядел бы в дашборде пропавшим. В ней же —
 # опись SSH-ключей и новые входы: тело бывает в сотни килобайт, поэтому идёт из файла.
 heartbeat() {
-	local conf password=null le=false key="" body=$STATE_DIR/heartbeat.json ssh=$STATE_DIR/ssh-report.json code
+	local conf password=null le=false key="" body=$STATE_DIR/heartbeat.json ssh=$STATE_DIR/ssh-report.json os=$STATE_DIR/os-report.json code
 	if conf=$(sshd -T 2>/dev/null); then
 		password=false
 		grep -qxE '(passwordauthentication|kbdinteractiveauthentication) yes' <<<"$conf" && password=true
@@ -165,11 +172,12 @@ heartbeat() {
 	# В отчёте IP тех, кто входил на сервер, — файлы только для root.
 	install -m 600 /dev/null "$ssh" && install -m 600 /dev/null "$body" || return
 	timeout 60 python3 "$RECIPES_DIR/sshkeys.py" report "$STATE_DIR" >"$ssh" 2>/dev/null || echo '{}' >"$ssh"
-	python3 -c "$HEARTBEAT_PY" "$(agent_version)" "$password" "$le" "$key" "$ssh" >"$body" || return
+	timeout 120 python3 "$RECIPES_DIR/osupdates.py" report "$STATE_DIR" >"$os" 2>/dev/null || echo '{}' >"$os"
+	python3 -c "$HEARTBEAT_PY" "$(agent_version)" "$password" "$le" "$key" "$ssh" "$os" >"$body" || return
 	code=$(dashboard_call POST /agent/v1/heartbeat "@${body}") || code=000
 	# Дашборд старше описи ключей не примет большое тело: отмечаемся без неё, опись уйдёт позже.
 	if [[ $code == 413 ]]; then
-		python3 -c "$HEARTBEAT_PY" "$(agent_version)" "$password" "$le" "$key" /dev/null >"$body" || return
+		python3 -c "$HEARTBEAT_PY" "$(agent_version)" "$password" "$le" "$key" /dev/null "$os" >"$body" || return
 		code=$(dashboard_call POST /agent/v1/heartbeat "@${body}") || code=000
 	elif [[ $code == 2?? ]]; then
 		python3 "$RECIPES_DIR/sshkeys.py" report-sent "$STATE_DIR"
@@ -187,8 +195,11 @@ if [[ -r $DASHBOARD_CONF && ! -e /etc/systemd/system/airlok-logs.service ]]; the
 fi
 # Заодно досылаем в дашборд события, которые не ушли раньше: таймер и есть повтор.
 flush_events
-for dir in "$APPS_ROOT"/*/; do
-	[[ -f $dir/compose.yml ]] && check_app "$(basename "$dir")"
-done
+# Пока ставятся обновления, Docker и nginx могут перезапуститься — это не простой сайтов.
+if ! systemctl is-active --quiet airlok-os-upgrade; then
+	for dir in "$APPS_ROOT"/*/; do
+		[[ -f $dir/compose.yml ]] && check_app "$(basename "$dir")"
+	done
+fi
 # Метрики вторичны: зависший запрос к дашборду не должен задерживать следующую проверку.
 timeout 40 python3 "$RECIPES_DIR/metrics.py" || true

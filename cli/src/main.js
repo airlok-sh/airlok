@@ -12,7 +12,7 @@ import { DeviceError, deviceCommand } from './device.js'
 import { DomainError, domainCommand } from './domain.js'
 import { EnvError, envCommand } from './env.js'
 import { checkFiles, listFiles, pack, PackError } from './pack.js'
-import { serverCommand, ServerError, system } from './server.js'
+import { plural, serverCommand, ServerError, system } from './server.js'
 import { agents, detect, homePath, onPath, setupAgents, SKILLS } from './setup.js'
 
 const run = promisify(execFile)
@@ -32,6 +32,8 @@ const help = `airlok — выкатка проекта на хостинг airlo
   npx @airlok/cli domain add ДОМЕН --app <имя>  свой домен приложения на своём сервере: подключить или заменить
   npx @airlok/cli domain show|check|rm --app <имя>   что с доменом, проверить DNS сейчас, отключить
   npx @airlok/cli server connect root@IP        подключить свой сервер: поставить на него airlok по SSH
+  npx @airlok/cli server upgrade <имя>          поставить обновления системы на подключённом сервере
+  npx @airlok/cli server reboot <имя>           перезагрузить его: сайты недоступны 1–2 минуты
   npx @airlok/cli device add [--server <сервер>]   добавить SSH-ключ этого компьютера в «Устройства» и открыть ему серверы
   npx @airlok/cli device list                   устройства и серверы, к которым у них есть доступ
   npx @airlok/cli whoami            под кем выполнен вход
@@ -517,10 +519,3 @@ async function gitTitle(dir) {
 const sleep = (ms) => new Promise((ok) => setTimeout(ok, ms))
 const mb = (n) => (n < 1 << 20 ? `${Math.max(1, Math.round(n / 1024))} КБ` : `${(n / (1 << 20)).toFixed(1).replace('.', ',')} МБ`)
 
-function plural(n, one, few, many) {
-  const m10 = n % 10
-  const m100 = n % 100
-  if (m10 === 1 && m100 !== 11) return one
-  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few
-  return many
-}

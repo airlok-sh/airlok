@@ -112,6 +112,11 @@ export class Api {
     return this.request('POST', `/api/cli/v1/servers/${encodeURIComponent(id)}/token`).then((r) => r.data)
   }
 
+  // Обновления системы на сервере: action — upgrade или reboot. Выполняет агент сервера.
+  startOSUpgrade(id, action) {
+    return this.request('POST', `/api/cli/v1/servers/${encodeURIComponent(id)}/os-upgrade`, { action }).then((r) => r.data)
+  }
+
   // Устройства — открытые SSH-ключи компьютеров и серверы, на которые агент их кладёт.
   devices() {
     return this.request('GET', '/api/cli/v1/devices').then((r) => r.data)

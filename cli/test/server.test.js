@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 
 import { main } from '../src/main.js'
-import { defaultName, installCommand, parseTarget, sshFailure } from '../src/server.js'
+import { defaultName, installCommand, parseTarget, osUpdatesText, sshFailure } from '../src/server.js'
 
 test('parseTarget', () => {
   assert.deepEqual(parseTarget('1.2.3.4'), { user: 'root', host: '1.2.3.4', dest: 'root@1.2.3.4' })
@@ -48,7 +48,7 @@ function captureIO({ tty = false } = {}) {
 }
 
 async function fakeDashboard(servers = [], { devices = true } = {}) {
-  const state = { servers, created: [], rotated: [], devices: [] }
+  const state = { servers, created: [], rotated: [], devices: [], upgrades: [], osUpdates: null, afterUpgrade: { total: 0, security: 0, reboot_required: false } }
   const server = createServer(async (req, res) => {
     const chunks = []
     for await (const c of req) chunks.push(c)
@@ -70,6 +70,16 @@ async function fakeDashboard(servers = [], { devices = true } = {}) {
       state.devices.push(d)
       return send(201, d)
     }
+    const upgrade = /^\/api\/cli\/v1\/servers\/([^/]+)\/os-upgrade$/.exec(p)
+    if (upgrade) {
+      if (state.upgradeError) return send(409, { error: { code: state.upgradeError, message: 'x' } })
+      const srv = state.servers.find((s) => s.id === upgrade[1])
+      const jobId = `job-${state.upgrades.length}`
+      state.upgrades.push(body.action)
+      srv.os_upgrade = { id: jobId, action: body.action, status: state.upgradeStatus ?? 'success', message: state.upgradeMessage ?? 'Готово: поставлено обновлений: 3' }
+      srv.facts = { os_updates: body.action === 'reboot' ? { total: 0, security: 0, reboot_required: false } : state.afterUpgrade }
+      return send(202, { id: jobId })
+    }
     const rotate = /^\/api\/cli\/v1\/servers\/([^/]+)\/token$/.exec(p)
     if (rotate) {
       state.rotated.push(rotate[1])
@@ -90,7 +100,12 @@ function fakeSystem(dash, replies) {
     async run(cmd, args, { input = '', out } = {}) {
       calls.push({ cmd, args, input })
       const reply = replies.shift() ?? { code: 0, output: '' }
-      if (reply.online) for (const s of dash.state.servers) s.last_seen_at = '2026-10-28T10:00:00Z'
+      if (reply.online) {
+        for (const s of dash.state.servers) {
+          s.last_seen_at = '2026-10-28T10:00:00Z'
+          s.facts = { os_updates: dash.state.osUpdates ?? { total: 0, security: 0, reboot_required: false } }
+        }
+      }
       if (out && reply.output) out(Buffer.from(reply.output))
       return { code: reply.code, output: reply.output ?? '' }
     },
@@ -212,4 +227,114 @@ test('server connect explains a failed install and a changed host key', async (t
   const changed = captureIO()
   assert.equal(await main(['server', 'connect', '5.6.7.8'], changed, env, fakeSystem(dash, [{ code: 255, output: 'Host key verification failed.' }])), 1)
   assert.match(changed.errLines.join('\n'), /ssh-keygen -R 5\.6\.7\.8/)
+})
+
+async function connectWith(t, { osUpdates, answers = [], tty = false, args = [], ...state }) {
+  const dash = await fakeDashboard()
+  t.after(dash.close)
+  Object.assign(dash.state, { osUpdates }, state)
+  const io = captureIO({ tty })
+  const asked = []
+  io.ask = async (q) => {
+    asked.push(q)
+    return answers.shift() ?? ''
+  }
+  const sys = fakeSystem(dash, [{ code: 0 }, { code: 0, output: 'Сервер готов.', online: true }])
+  const code = await main(['server', 'connect', 'root@1.2.3.4', ...args], io, { AIRLOK_URL: dash.url, AIRLOK_TOKEN: 't', HOME: await home() }, sys)
+  return { dash, io, asked, code, err: io.errLines.join('\n') }
+}
+
+test('osUpdatesText counts in plain words', () => {
+  assert.equal(osUpdatesText({ total: 0, security: 0 }), '')
+  assert.match(osUpdatesText({ total: 1, security: 0 }), /не поставлено 1 обновление системы\.$/)
+  assert.match(osUpdatesText({ total: 3, security: 2 }), /не поставлены 3 обновления системы, из них исправлений безопасности: 2\.$/)
+  assert.match(osUpdatesText({ total: 12, security: 0 }), /не поставлено 12 обновлений/)
+  assert.match(osUpdatesText({ total: 84, security: 0 }), /не поставлены 84 обновления/)
+})
+
+test('server connect offers updates in a terminal and installs only after yes', async (t) => {
+  const { dash, asked, err, code } = await connectWith(t, { tty: true, answers: ['y'], osUpdates: { total: 3, security: 1, reboot_required: false } })
+  assert.equal(code, 0, err)
+  assert.deepEqual(dash.state.upgrades, ['upgrade'])
+  assert.equal(asked.length, 1, 'перезагрузка не нужна — о ней не спрашиваем')
+  assert.match(err, /не поставлены 3 обновления системы, из них исправлений безопасности: 1/)
+  assert.match(err, /✓ Готово: поставлено обновлений: 3/)
+})
+
+test('server connect in a terminal leaves updates alone when the answer is not yes', async (t) => {
+  for (const answer of ['', 'n', 'нет']) {
+    const { dash, code } = await connectWith(t, { tty: true, answers: [answer], osUpdates: { total: 3, security: 1, reboot_required: false } })
+    assert.equal(code, 0)
+    assert.deepEqual(dash.state.upgrades, [], `ответ «${answer}»`)
+  }
+})
+
+test('server connect asks about the reboot separately and never reboots by itself', async (t) => {
+  const needsReboot = { total: 0, security: 0, reboot_required: true }
+  const declined = await connectWith(t, { tty: true, answers: ['y', 'n'], osUpdates: { total: 3, security: 0, reboot_required: false }, afterUpgrade: needsReboot })
+  assert.deepEqual(declined.dash.state.upgrades, ['upgrade'])
+  assert.match(declined.err, /server reboot 1\.2\.3\.4/)
+
+  const agreed = await connectWith(t, { tty: true, answers: ['y', 'да'], osUpdates: { total: 3, security: 0, reboot_required: false }, afterUpgrade: needsReboot })
+  assert.deepEqual(agreed.dash.state.upgrades, ['upgrade', 'reboot'])
+
+  const onlyReboot = await connectWith(t, { tty: true, answers: ['y'], osUpdates: needsReboot })
+  assert.deepEqual(onlyReboot.dash.state.upgrades, ['reboot'])
+})
+
+test('server connect does not offer the reboot after a failed upgrade', async (t) => {
+  const { dash, asked, err, code } = await connectWith(t, {
+    tty: true, answers: ['y'], osUpdates: { total: 3, security: 0, reboot_required: false }, upgradeStatus: 'failed', upgradeMessage: 'на диске кончилось место',
+    afterUpgrade: { total: 3, security: 0, reboot_required: true },
+  })
+  assert.equal(code, 0, 'сам сервер подключён')
+  assert.equal(asked.length, 1)
+  assert.deepEqual(dash.state.upgrades, ['upgrade'])
+  assert.match(err, /✗ Не получилось: на диске кончилось место/)
+})
+
+test('server connect without a terminal only reports updates', async (t) => {
+  const { dash, io, asked, err } = await connectWith(t, { args: ['--json'], osUpdates: { total: 3, security: 1, reboot_required: true } })
+  assert.deepEqual(asked, [])
+  assert.deepEqual(dash.state.upgrades, [])
+  assert.match(err, /server upgrade 1\.2\.3\.4/)
+  assert.deepEqual(JSON.parse(io.outLines[0]).os_updates, { total: 3, security: 1, reboot_required: true })
+})
+
+test('server connect with nothing to install says so and asks nothing', async (t) => {
+  const { asked, err } = await connectWith(t, { tty: true, osUpdates: { total: 0, security: 0, reboot_required: false } })
+  assert.deepEqual(asked, [])
+  assert.match(err, /Обновления системы уже стоят/)
+})
+
+test('server upgrade reports the result and that a reboot is needed', async (t) => {
+  const dash = await fakeDashboard([{ id: 's1', name: 'prod', last_seen_at: '2026-10-28T10:00:00Z' }])
+  t.after(dash.close)
+  dash.state.afterUpgrade = { total: 0, security: 0, reboot_required: true }
+  const io = captureIO()
+  const env = { AIRLOK_URL: dash.url, AIRLOK_TOKEN: 't', HOME: await home() }
+  assert.equal(await main(['server', 'upgrade', 'prod', '--json'], io, env, fakeSystem(dash, [])), 0, io.errLines.join('\n'))
+  assert.deepEqual(dash.state.upgrades, ['upgrade'])
+  assert.equal(JSON.parse(io.outLines[0]).status, 'ok')
+  assert.match(io.errLines.join('\n'), /server reboot prod/)
+
+  dash.state.upgradeStatus = 'failed'
+  assert.equal(await main(['server', 'reboot', 'prod'], captureIO(), env, fakeSystem(dash, [])), 1)
+  assert.deepEqual(dash.state.upgrades, ['upgrade', 'reboot'])
+})
+
+test('server upgrade explains a busy or offline server and an unknown name', async (t) => {
+  const dash = await fakeDashboard([{ id: 's1', name: 'prod', last_seen_at: null }])
+  t.after(dash.close)
+  const env = { AIRLOK_URL: dash.url, AIRLOK_TOKEN: 't', HOME: await home() }
+  const run = async (name) => {
+    const io = captureIO()
+    assert.equal(await main(['server', 'upgrade', name], io, env, fakeSystem(dash, [])), 1)
+    return io.errLines.join('\n')
+  }
+  dash.state.upgradeError = 'server_offline'
+  assert.match(await run('prod'), /не на связи/)
+  dash.state.upgradeError = 'os_upgrade_pending'
+  assert.match(await run('prod'), /уже идёт/)
+  assert.match(await run('nope'), /Сервера nope нет/)
 })

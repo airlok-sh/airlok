@@ -15,6 +15,10 @@ export class ServerError extends Error {}
 export const INSTALL_URL = 'https://airlok.ru/install.sh'
 const KEY_NAME = 'airlok_ed25519'
 const ONLINE_WAIT_MS = 120_000
+// Сведения о системе приходят с первой отметкой агента: раз в минуту и после подсчёта обновлений.
+const OS_FACTS_WAIT_MS = 120_000
+// Установка упирается в таймаут агента, а за ним дашборд сам закрывает команду.
+const OS_JOB_WAIT_MS = 75 * 60_000
 const OUTPUT_TAIL = 64 << 10
 
 // Как у дашборда: email и адрес попадают в команду для оболочки сервера.
@@ -92,7 +96,8 @@ function sshArgs(key, target, opts = {}) {
 }
 
 export async function serverCommand(api, origin, sub, rest, opts, io, home, sys = system) {
-  if (sub !== 'connect') throw new ServerError('server connect [пользователь@]IP — см. npx @airlok/cli help')
+  if (sub === 'upgrade' || sub === 'reboot') return osCommand(api, origin, sub, rest, opts, io, sys)
+  if (sub !== 'connect') throw new ServerError('server connect [пользователь@]IP, server upgrade <имя>, server reboot <имя> — см. npx @airlok/cli help')
   if (rest.length > 1) throw new ServerError('Подключается один сервер за раз: server connect root@IP')
   const target = parseTarget(rest[0])
   const port = opts.port ? Number(opts.port) : 0
@@ -122,13 +127,121 @@ export async function serverCommand(api, origin, sub, rest, opts, io, home, sys 
   io.err('\nЖду, когда агент выйдет на связь…')
   const online = await waitOnline(api, server.id, sys)
   const login = `ssh${usedKey ? ` -i ${usedKey}` : ''}${port ? ` -p ${port}` : ''} ${target.dest}`
-  if (opts.json) io.out(JSON.stringify({ status: online ? 'ok' : 'pending', server: name, server_id: server.id, host: target.host, ssh: login, password_login_closed: keysOnly, device }))
   if (online) io.err(`\n✓ Сервер ${name} подключён: ${origin}/servers`)
   else io.err(`\nУстановка прошла, но агент пока не на связи. Проверьте на сервере: journalctl -u airlok-agent -n 50`)
   io.err(`Зайти на сервер: ${login}`)
   if (keysOnly) io.err('Вход по паролю закрыт: на сервер пускает только по ключу.')
   if (device) io.err(`Доступ этого компьютера — устройство «${device}»: открыть другим или закрыть можно в ${origin}/devices`)
+  const osUpdates = online ? await offerOSUpdates(api, server.id, name, opts, io, sys) : null
+  if (opts.json) io.out(JSON.stringify({ status: online ? 'ok' : 'pending', server: name, server_id: server.id, host: target.host, ssh: login, password_login_closed: keysOnly, device, os_updates: osUpdates }))
   return online ? 0 : 1
+}
+
+export function plural(n, one, few, many) {
+  const tens = n % 100
+  const ones = n % 10
+  if (tens >= 11 && tens <= 14) return many
+  if (ones === 1) return one
+  return ones >= 2 && ones <= 4 ? few : many
+}
+
+// osUpdatesText — сколько обновлений не поставлено, простыми словами; '' — ставить нечего.
+export function osUpdatesText({ total, security }) {
+  if (!total) return ''
+  const updates = `${total} ${plural(total, 'обновление', 'обновления', 'обновлений')} системы`
+  return `На сервере не ${plural(total, 'поставлено', 'поставлены', 'поставлено')} ${updates}${security ? `, из них исправлений безопасности: ${security}` : ''}.`
+}
+
+const askYes = async (io, question) => ['y', 'yes', 'д', 'да'].includes((await io.ask(question)).toLowerCase())
+
+async function waitOSFacts(api, id, sys) {
+  const deadline = Date.now() + OS_FACTS_WAIT_MS
+  for (;;) {
+    const updates = (await api.servers()).find((x) => x.id === id)?.facts?.os_updates
+    if (updates) return updates
+    if (Date.now() > deadline) return null
+    await sys.sleep(3000)
+  }
+}
+
+// offerOSUpdates — хостер часто отдаёт сервер без обновлений. В терминале спрашиваем и ставим; ИИ-агент
+// и скрипт получают сводку и команду: решает человек. null — сведений нет, агент ещё не прислал их.
+async function offerOSUpdates(api, id, name, opts, io, sys) {
+  const updates = await waitOSFacts(api, id, sys)
+  if (!updates) return null
+  const text = osUpdatesText(updates)
+  if (!text && !updates.reboot_required) {
+    io.err('✓ Обновления системы уже стоят.')
+    return updates
+  }
+  if (text) io.err(`\n${text} Хостер обычно их не ставит, а через старые версии взламывают.`)
+  if (!io.interactive || opts.json) {
+    io.err(text ? `Поставить: npx @airlok/cli server upgrade ${name} — или кнопкой в «Серверах». Сайты продолжат работать.` : osRebootHint(name))
+    return updates
+  }
+  if (text) {
+    io.err('Сайты продолжат работать, займёт несколько минут. Сервер без вашего согласия не перезагрузится.')
+    if (await askYes(io, 'Поставить сейчас? [y/N] ')) {
+      const after = await runOSJob(api, id, 'upgrade', io, sys)
+      if (after.job.status !== 'success') return after.updates ?? updates
+      return (await offerReboot(api, id, name, after.updates, io, sys)) ?? updates
+    }
+    return updates
+  }
+  return (await offerReboot(api, id, name, updates, io, sys)) ?? updates
+}
+
+async function offerReboot(api, id, name, updates, io, sys) {
+  if (!updates?.reboot_required) return updates
+  io.err('\nЧтобы обновления заработали, серверу нужна перезагрузка: сайты будут недоступны 1–2 минуты и запустятся сами.')
+  if (!(await askYes(io, 'Перезагрузить сейчас? [y/N] '))) {
+    io.err(osRebootHint(name))
+    return updates
+  }
+  return (await runOSJob(api, id, 'reboot', io, sys)).updates
+}
+
+const osRebootHint = (name) => `Перезагрузить, когда будет удобно: npx @airlok/cli server reboot ${name} — или кнопкой в «Серверах».`
+
+function osJobError(err) {
+  if (!(err instanceof ApiError)) return err
+  switch (err.code) {
+    case 'server_offline':
+      return new ServerError('Сервер не на связи: команду сейчас некому выполнить.')
+    case 'os_upgrade_pending':
+      return new ServerError('На сервере уже идёт обновление или перезагрузка: дождитесь итога.')
+    default:
+      return err
+  }
+}
+
+// runOSJob ставит команду агенту и ждёт итога: успех перезагрузки значит, что сервер вернулся.
+async function runOSJob(api, id, action, io, sys) {
+  const { id: jobId } = await api.startOSUpgrade(id, action).catch((err) => { throw osJobError(err) })
+  io.err(action === 'reboot' ? 'Перезагружаю сервер…' : 'Ставлю обновления, это несколько минут…')
+  const deadline = Date.now() + OS_JOB_WAIT_MS
+  for (;;) {
+    const s = (await api.servers()).find((x) => x.id === id)
+    const job = s?.os_upgrade
+    if (job?.id === jobId && (job.status === 'success' || job.status === 'failed')) {
+      if (job.status === 'success') io.err(`✓ ${job.message || 'Готово.'}`)
+      else io.err(`✗ Не получилось: ${job.message || 'подробности — в дашборде, в «Серверах».'}`)
+      return { job, updates: s.facts?.os_updates ?? null }
+    }
+    if (Date.now() > deadline) throw new ServerError('Сервер долго не сообщает итог: посмотрите его в дашборде, в «Серверах».')
+    await sys.sleep(3000)
+  }
+}
+
+// osCommand — server upgrade и server reboot: поставить обновления или перезагрузить подключённый сервер.
+async function osCommand(api, origin, action, rest, opts, io, sys) {
+  if (rest.length !== 1) throw new ServerError(`Укажите сервер: npx @airlok/cli server ${action} <имя>`)
+  const server = (await api.servers()).find((s) => s.name === rest[0])
+  if (!server) throw new ServerError(`Сервера ${rest[0]} нет в дашборде: ${origin}/servers`)
+  const { job, updates } = await runOSJob(api, server.id, action === 'reboot' ? 'reboot' : 'upgrade', io, sys)
+  if (job.status === 'success' && updates?.reboot_required) io.err(`Чтобы обновления заработали, серверу нужна перезагрузка: сайты будут недоступны 1–2 минуты. ${osRebootHint(server.name)}`)
+  if (opts.json) io.out(JSON.stringify({ status: job.status === 'success' ? 'ok' : 'failed', server: server.name, message: job.message, os_updates: updates }))
+  return job.status === 'success' ? 0 : 1
 }
 
 // connectDevice заводит ключ этого компьютера устройством с доступом к новому серверу: тогда этот

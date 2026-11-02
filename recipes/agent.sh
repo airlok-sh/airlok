@@ -28,6 +28,8 @@ SSHKEYS_TIMEOUT=30
 DATA_TIMEOUT=3600
 # Столько ждём, пока человек войдёт на сервер по ключу после закрытия пароля; откат — чуть позже.
 SSH_LOGIN_WAIT=300
+# Как часто во время этого ожидания спрашивать новые ключи устройств.
+SSH_LOGIN_SLICE=6
 PROGRESS_EVERY=3
 OS_UPGRADE_TIMEOUT=2700
 # За столько сервер точно ушёл в перезагрузку, если собирался: дальше — итог «не перезагрузился».
@@ -478,7 +480,8 @@ run_db_query() {
 # run_ssh_keys — ключи устройств из дашборда в authorized_keys root: дашборд присылает полный
 # список, чужие ключи на сервере sshkeys.py не трогает.
 run_ssh_keys() {
-	local id=$1 log=$STATE_DIR/command.log
+	# Свой журнал: ключи могут прийти, пока идёт закрытие пароля, а у него журнал команды занят.
+	local id=$1 log=$STATE_DIR/ssh-keys.log
 	echo "команда ${id}: ключи устройств"
 	install -m 600 /dev/null "$log"
 	if timeout --kill-after=5 "$SSHKEYS_TIMEOUT" python3 "$RECIPES_DIR/sshkeys.py" <"$KEYS_JSON" >"$log" 2>&1; then
@@ -487,6 +490,23 @@ run_ssh_keys() {
 		send_result "$id" failed "" "$log"
 	fi
 	rm -f "$KEYS_JSON"
+}
+
+# wait_key_login НАЧАЛО ЖУРНАЛ — дождаться входа по ключу устройства. Коды как у wait-login.
+# Команды агент выполняет по одной, но ключи ждать нельзя: человек открывает серверу устройство,
+# пока идёт это ожидание, и без его ключа войти ему нечем. Остальные команды подождут.
+wait_key_login() {
+	local since=$1 log=$2 deadline=$((SECONDS + SSH_LOGIN_WAIT)) keys=$RUN_DIR/next-keys.json left rc code
+	while :; do
+		code=$(dashboard_fetch GET "/agent/v1/commands/next?wait=0&only=ssh_keys" "$keys" "" 20) || code=000
+		[[ $code == 200 ]] && handle "$keys"
+		rm -f "$keys"
+		left=$((deadline - SECONDS))
+		((left > 0)) || return 2
+		python3 "$RECIPES_DIR/sshkeys.py" wait-login "$since" $((left < SSH_LOGIN_SLICE ? left : SSH_LOGIN_SLICE)) >>"$log" 2>&1
+		rc=$?
+		((rc == 2)) || return "$rc"
+	done
 }
 
 # run_ssh_password — закрыть или открыть вход по паролю по кнопке в дашборде. Закрытие
@@ -522,7 +542,7 @@ run_ssh_password() {
 		return
 	fi
 	heartbeat_now
-	python3 "$RECIPES_DIR/sshkeys.py" wait-login "$since" "$SSH_LOGIN_WAIT" >>"$log" 2>&1
+	wait_key_login "$since" "$log"
 	rc=$?
 	if ((rc == 0)); then
 		"$RECIPES_DIR/server-base.sh" confirm-ssh >>"$log" 2>&1

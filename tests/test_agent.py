@@ -169,6 +169,21 @@ class PayloadTest(unittest.TestCase):
         with open(self.stages, "a", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line in lines))
 
+    def test_apt_percent(self):
+        status = os.path.join(self.tmp.name, "status")
+        def percent(text):
+            with open(status, "w", encoding="utf-8") as f:
+                f.write(text)
+            out = subprocess.run([sys.executable, "-c", PAYLOAD_PY, "progress", "running", "", self.log, self.stages, "", status],
+                                 capture_output=True, text=True, check=True).stdout
+            return json.loads(out)["percent"]
+        self.assertEqual(percent(""), 0, "apt ещё ничего не сообщил")
+        self.assertEqual(percent("dlstatus:1:50.0:Retrieving file 1 of 2\n"), 15)
+        self.assertEqual(percent("dlstatus:2:100:done\npmstatus:curl:50.0:Unpacking curl\n"), 65)
+        self.assertEqual(percent("pmstatus:curl:100:Done\n"), 99, "конец приходит с итогом")
+        self.assertEqual(percent("pmstatus:curl:50:ok\npmerror:x:60:broken: disk\n"), 65, "чужие строки не сбивают")
+        self.assertNotIn("percent", self.payload("progress"), "у выкатки процентов нет")
+
     def payload(self, mode, status="running", message="", title=""):
         out = subprocess.run([sys.executable, "-c", PAYLOAD_PY, mode, status, message, self.log, self.stages, title],
                              capture_output=True, check=True)
@@ -346,6 +361,50 @@ class StageMarkTest(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != "AIRLOK_STAGE_FILE"}
         out = subprocess.run(["bash", "-c", 'source "$1"; stage build x; echo ok', "bash", LIB], env=env, capture_output=True, text=True)
         self.assertEqual(out.stdout, "ok\n", "без агента отметки никуда не пишутся и не роняют рецепт")
+
+
+class WaitKeyLoginTest(unittest.TestCase):
+    """Пока агент ждёт вход по ключу, новые ключи устройств должны доходить до сервера."""
+
+    def run_wait(self, logins, wait=30):
+        func = re.search(r"^wait_key_login\(\) \{.*?^\}$", SOURCE, re.S | re.M).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "sshkeys.py"), "w", encoding="utf-8") as f:
+                f.write("import os, sys\n"
+                        f"p = {os.path.join(tmp, 'rc')!r}\n"
+                        "rc = open(p).read().split()\n"
+                        "open(p, 'w').write(' '.join(rc[1:] or rc))\n"
+                        "sys.exit(int(rc[0]))\n")
+            with open(os.path.join(tmp, "rc"), "w", encoding="utf-8") as f:
+                f.write(logins)
+            script = f"""
+RECIPES_DIR={tmp} RUN_DIR={tmp} SSH_LOGIN_WAIT={wait} SSH_LOGIN_SLICE=1
+dashboard_fetch() {{ echo "$2" >>{tmp}/urls; if (($(wc -l <{tmp}/urls) == 2)); then echo x >"$3"; echo 200; else echo 204; fi; }}
+handle() {{ echo handled >>{tmp}/events; }}
+{func}
+wait_key_login 100 {tmp}/log
+echo "rc=$?"
+"""
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True, timeout=60).stdout
+            events = open(os.path.join(tmp, "events")).read().split() if os.path.exists(os.path.join(tmp, "events")) else []
+            urls = open(os.path.join(tmp, "urls")).read().split()
+            return out.strip(), events, urls
+
+    def test_keys_arrive_while_waiting(self):
+        out, events, urls = self.run_wait("2 2 2 0")
+        self.assertEqual(out, "rc=0")
+        self.assertEqual(events, ["handled"], "ключи применены, не дожидаясь конца ожидания")
+        self.assertEqual(len(urls), 4)
+        self.assertTrue(all("only=ssh_keys" in u for u in urls), "другие команды во время ожидания не берём")
+
+    def test_timeout(self):
+        out, _, _ = self.run_wait("2", wait=2)
+        self.assertEqual(out, "rc=2")
+
+    def test_nothing_to_check_stops_at_once(self):
+        out, _, urls = self.run_wait("1")
+        self.assertEqual(out, "rc=1")
+        self.assertEqual(len(urls), 1)
 
 
 if __name__ == "__main__":

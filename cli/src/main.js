@@ -19,12 +19,12 @@ const run = promisify(execFile)
 const POLL_MS = 2000
 const FOLLOW_LIMIT_MS = 30 * 60_000
 
-const help = `airlok — выкатка проекта на хостинг airlok или свой сервер из терминала
+const help = `airlok — публикация проекта на хостинге airlok или свой сервер из терминала
 
   npx @airlok/cli setup             один раз: вход и подключение ИИ-агентов (Claude Code, Codex, Antigravity, Cursor)
   npx @airlok/cli login             войти через браузер
-  npx @airlok/cli deploy [папка]    собрать и выкатить папку (по умолчанию текущую)
-  npx @airlok/cli check [папка]     что airlok сделает с проектом и что помешает выкатке — без сборки
+  npx @airlok/cli deploy [папка]    собрать и опубликовать папку (по умолчанию текущую)
+  npx @airlok/cli check [папка]     что airlok сделает с проектом и что помешает публикации — без сборки
   npx @airlok/cli env list --app <имя>          переменные окружения приложения (без значений)
   npx @airlok/cli env set ИМЯ… --app <имя>      задать: значение спросит без показа на экране или прочитает из stdin
   npx @airlok/cli env set --app <имя> --from .env   задать все переменные из файла
@@ -40,9 +40,9 @@ const help = `airlok — выкатка проекта на хостинг airlo
   npx @airlok/cli logout            забыть вход на этом компьютере
 
 Для deploy:
-  --app <имя>       выкатить в существующее приложение
-  --new <имя>       создать приложение с этим именем и выкатить
-  --title <текст>   название выкатки (по умолчанию — последний коммит)
+  --app <имя>       опубликовать в существующее приложение
+  --new <имя>       создать приложение с этим именем и опубликовать
+  --title <текст>   название публикации (по умолчанию — последний коммит)
   --no-wait         не ждать конца сборки
   --json            итог одной строкой JSON — для скриптов и ИИ-агентов
 
@@ -54,7 +54,7 @@ const help = `airlok — выкатка проекта на хостинг airlo
 Для domain:
   --app <имя>       приложение на своём сервере; если имя есть на нескольких серверах — <сервер>/<имя>
   --json            итог одной строкой JSON
-  У регистратора заводится A-запись домена на IP сервера; домен включится следующей выкаткой.
+  У регистратора заводится A-запись домена на IP сервера; домен включится следующей публикацией.
 
 Для server connect:
   --name <имя>      имя сервера в дашборде (по умолчанию — его адрес)
@@ -79,7 +79,7 @@ const help = `airlok — выкатка проекта на хостинг airlo
 
 Переменные окружения: AIRLOK_TOKEN — токен вместо входа (для CI), AIRLOK_URL — адрес дашборда.`
 
-export const stageLabel = { source: 'Код', detect: 'Стек', install: 'Зависимости', build: 'Сборка', image: 'Образ', release: 'Выкатка' }
+export const stageLabel = { source: 'Код', detect: 'Стек', install: 'Зависимости', build: 'Сборка', image: 'Образ', release: 'Публикация' }
 
 export function duration(sec) {
   const s = Math.max(0, Math.round(sec))
@@ -279,7 +279,7 @@ function errorText(err) {
     err instanceof DeviceError) return err.message
   if (err instanceof ApiError) {
     if (err.status === 401) return 'Вход устарел или токен отозван: npx @airlok/cli login'
-    if (err.code === 'read_only_token') return 'Этот токен только читает. Войдите заново (npx @airlok/cli login) или задайте токен с правом выкатывать.'
+    if (err.code === 'read_only_token') return 'Этот токен только читает. Войдите заново (npx @airlok/cli login) или задайте токен с правом публиковать.'
     if (err.code === 'check_too_large') return 'Проект после распаковки слишком большой для проверки: уберите из папки данные и результаты сборки или добавьте их в .gitignore.'
     if (err.code === 'archive_too_large') return 'Архив больше 50 МБ: уберите из папки данные и результаты сборки или добавьте их в .gitignore.'
     return err.message
@@ -394,7 +394,7 @@ async function deploy(target, opts, io, env) {
   const cmd = await api.deployArchive(app.id, archive, title)
   if (opts['no-wait']) {
     if (opts.json) io.out(JSON.stringify({ status: cmd.status, command_id: cmd.id, app: app.name }))
-    else io.err(`Выкатка поставлена в очередь. Ход сборки — в дашборде: ${s.url}/apps/${app.id}?tab=deploys`)
+    else io.err(`Публикация поставлена в очередь. Ход сборки — в дашборде: ${s.url}/apps/${app.id}?tab=deploys`)
     return 0
   }
   // С --json вывод читает ИИ-агент: ему хватает этапов, а лог целиком — при ошибке.
@@ -406,12 +406,12 @@ async function deploy(target, opts, io, env) {
   }
   if (result.status === 'success') {
     const took = result.started_at && result.finished_at ? ` за ${duration((Date.parse(result.finished_at) - Date.parse(result.started_at)) / 1000)}` : ''
-    io.err(`\n✓ Выкачено${took}${url ? `: ${url}` : ''}`)
+    io.err(`\n✓ Опубликовано${took}${url ? `: ${url}` : ''}`)
     if (!opts.json && url) io.out(url)
     return 0
   }
   if (result.status === 'canceled') {
-    io.err('\nЭту выкатку заменила более новая.')
+    io.err('\nЭту публикацию заменила более новая.')
     return 1
   }
   io.err(`\n✗ ${result.message || 'Сборка не удалась'}`)
@@ -466,7 +466,7 @@ async function chooseApp(api, dir, opts, io) {
 
 async function ask(api, apps, dir, io) {
   if (apps.length > 0) {
-    io.err('Куда выкатить эту папку?')
+    io.err('Куда опубликовать эту папку?')
     apps.forEach((a, i) => io.err(`  ${i + 1}. ${a.name}${a.domain ? `  ${a.domain}` : ''}`))
     io.err(`  ${apps.length + 1}. новое приложение`)
     const pick = Number(await io.ask(`Номер [${apps.length + 1}]: `)) || apps.length + 1

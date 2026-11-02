@@ -78,7 +78,7 @@ setup() {
 
 $(cat "${KEY}.pub")
 
-Затем выкатите: $0 deploy ${REPO}
+Затем опубликуйте: $0 deploy ${REPO}
 EOF
 }
 
@@ -177,7 +177,7 @@ deploy_trap() {
 	rm -rf "${SRC:-}"
 	# После передачи в app-deploy.sh об итоге сообщает уже он.
 	if ((code != 0 && ! HANDED_OFF)); then
-		notify "❌ ${REPO}: выкатка не началась: ${DIE_MSG:-неизвестная ошибка}"
+		notify "❌ ${REPO}: публикация не началась: ${DIE_MSG:-неизвестная ошибка}"
 	fi
 }
 
@@ -281,11 +281,11 @@ while :; do
 			echo "пропущена некорректная задача \$job"
 			continue
 		fi
-		echo "выкатка \$repo \${sha:0:12}"
+		echo "публикация \$repo \${sha:0:12}"
 		if ${RECIPES_DIR}/github-deploy.sh deploy "\$repo" "\$sha" </dev/null; then
-			echo "выкатка \$repo \${sha:0:12} завершена"
+			echo "публикация \$repo \${sha:0:12} завершена"
 		else
-			echo "выкатка \$repo \${sha:0:12} не удалась"
+			echo "публикация \$repo \${sha:0:12} не удалась"
 		fi
 	done
 done
@@ -293,7 +293,7 @@ EOF
 
 	write_if_changed /etc/systemd/system/airlok-deploy-queue.service 0644 <<'EOF' && changed=yes
 [Unit]
-Description=airlok: выкатки из очереди webhook
+Description=airlok: публикации из очереди webhook
 After=docker.service
 
 [Service]
@@ -302,7 +302,7 @@ ExecStart=/usr/local/sbin/airlok-deploy-queue
 EOF
 	write_if_changed /etc/systemd/system/airlok-deploy-queue.path 0644 <<EOF && changed=yes
 [Unit]
-Description=airlok: следить за очередью выкаток
+Description=airlok: следить за очередью публикаций
 
 [Path]
 PathExistsGlob=${QUEUE_DIR}/*.job
@@ -323,7 +323,7 @@ EOF
 		nginx -t -q || die "nginx не принял настройку webhook"
 		systemctl reload nginx
 	fi
-	ok "приёмник работает от ${HOOK_USER}, выкатки выполняет очередь от root"
+	ok "приёмник работает от ${HOOK_USER}, публикации выполняет очередь от root"
 }
 
 webhook() {
@@ -347,9 +347,9 @@ webhook() {
 	local domain
 	domain=$(grep -h '^ *server_name' /etc/nginx/sites-enabled/airlok-*.conf 2>/dev/null | awk '{gsub(";", "", $2); print $2; exit}')
 	if ! grep -qs 'airlok-webhook' /etc/nginx/sites-enabled/airlok-*.conf; then
-		note "сайт ещё не знает про webhook: выкатите приложение один раз, чтобы обновился конфиг nginx"
+		note "сайт ещё не знает про webhook: опубликуйте приложение один раз, чтобы обновился конфиг nginx"
 	fi
-	ok "push в ветку ${branch} будет выкатываться автоматически"
+	ok "push в ветку ${branch} будет публиковаться автоматически"
 	cat <<EOF
 
 Добавьте webhook в GitHub: ${REPO} → Settings → Webhooks → Add webhook.

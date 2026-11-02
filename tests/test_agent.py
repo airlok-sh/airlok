@@ -155,7 +155,7 @@ class ParseTest(unittest.TestCase):
 
 
 class PayloadTest(unittest.TestCase):
-    """Тело запросов о ходе и итоге выкатки: этапы собираются из отметок рецептов."""
+    """Тело запросов о ходе и итоге публикации: этапы собираются из отметок рецептов."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -185,7 +185,7 @@ class PayloadTest(unittest.TestCase):
         self.assertEqual(percent("dlstatus:2:100:done\npmstatus:curl:50.0:Unpacking curl\n"), 65)
         self.assertEqual(percent("pmstatus:curl:100:Done\n"), 99, "конец приходит с итогом")
         self.assertEqual(percent("pmstatus:curl:50:ok\npmerror:x:60:broken: disk\n"), 65, "чужие строки не сбивают")
-        self.assertNotIn("percent", self.payload("progress"), "у выкатки процентов нет")
+        self.assertNotIn("percent", self.payload("progress"), "у публикации процентов нет")
 
     def payload(self, mode, status="running", message="", title=""):
         out = subprocess.run([sys.executable, "-c", PAYLOAD_PY, mode, status, message, self.log, self.stages, title],
@@ -226,14 +226,14 @@ class PayloadTest(unittest.TestCase):
         self.assertEqual(got["stages"][1]["note"], "версия уже собрана")
 
     def test_result_without_marks_keeps_dashboard_stages(self):
-        self.assertNotIn("stages", self.payload("result", "failed", "в команде нет параметров выкатки"))
+        self.assertNotIn("stages", self.payload("result", "failed", "в команде нет параметров публикации"))
         out = subprocess.run([sys.executable, "-c", PAYLOAD_PY, "result", "failed", "отклонена", "", ""],
                              capture_output=True, check=True)
         self.assertEqual(json.loads(out.stdout), {"status": "failed", "message": "отклонена", "log": ""})
 
 
 class PanelDomainTest(unittest.TestCase):
-    """Свой домен из дашборда в app-deploy.sh: главнее airlok.yml и помнится для выкаток без агента."""
+    """Свой домен из дашборда в app-deploy.sh: главнее airlok.yml и помнится для публикаций без агента."""
 
     def setUp(self):
         with open(os.path.join(os.path.dirname(AGENT), "app-deploy.sh"), encoding="utf-8") as f:
@@ -257,7 +257,7 @@ class PanelDomainTest(unittest.TestCase):
         self.assertEqual(self.deploy(AIRLOK_APP_DOMAIN="shop.example.ru").stdout, "shop.example.ru\n")
         with open(self.saved) as f:
             self.assertEqual(f.read(), "shop.example.ru\n")
-        self.assertEqual(self.deploy().stdout, "shop.example.ru\n", "выкатка руками остаётся на домене из дашборда")
+        self.assertEqual(self.deploy().stdout, "shop.example.ru\n", "публикация руками остаётся на домене из дашборда")
 
     def test_removed_in_dashboard(self):
         self.deploy(AIRLOK_APP_DOMAIN="shop.example.ru")
@@ -415,7 +415,7 @@ if __name__ == "__main__":
 
 
 class HealthTest(unittest.TestCase):
-    """Когда приложение считается живым: при выкатке и при проверке сайтов."""
+    """Когда приложение считается живым: при публикации и при проверке сайтов."""
 
     def ok(self, code, path):
         r = subprocess.run(["bash", "-c", 'source "$1"; health_ok "$2" "$3"', "bash", LIB, code, path], capture_output=True)

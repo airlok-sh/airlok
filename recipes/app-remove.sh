@@ -109,7 +109,7 @@ main() {
 	APP_DIR=$APPS_ROOT/$NAME
 
 	exec 8>"/run/airlok-deploy-${NAME}.lock"
-	flock -w 60 8 || die "у ${NAME} идёт выкатка: уберите приложение после неё"
+	flock -w 60 8 || die "у ${NAME} идёт публикация: уберите приложение после неё"
 
 	local kept=""
 	step "Убираем ${NAME} с сервера"

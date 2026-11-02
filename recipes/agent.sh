@@ -181,7 +181,7 @@ if kind != "deploy":
     emit("bad", cid, "агент не умеет выполнять команду %r: обновите рецепты на сервере" % str(kind)[:40])
 d = cmd.get("deploy")
 if not isinstance(d, dict):
-    emit("bad", cid, "в команде нет параметров выкатки")
+    emit("bad", cid, "в команде нет параметров публикации")
 
 
 def text(key):
@@ -380,7 +380,7 @@ run_deploy() {
 	local id=$1 app=$2 repo=$3 sha=$4 ref=$5 root=$6 title=$7 token=$8 domain=$9 has_env=${10} git_auth=${11:-}
 	local log=$STATE_DIR/command.log stages=$STATE_DIR/command.stages subject=$STATE_DIR/command.title public=0 rc message="" streamer panel=""
 	[[ -z $token ]] && public=1
-	echo "команда ${id}: выкатка ${repo}${root:+/${root}} ${sha:0:12} «${title}» как ${app}${domain:+ на ${domain}}"
+	echo "команда ${id}: публикация ${repo}${root:+/${root}} ${sha:0:12} «${title}» как ${app}${domain:+ на ${domain}}"
 	if [[ $has_env == 1 ]]; then
 		if ! open_env "$app"; then
 			send_result "$id" failed "переменные окружения из дашборда: $(head -c 1000 "$RUN_DIR/env.err")"
@@ -406,7 +406,7 @@ run_deploy() {
 	wait "$streamer" 2>/dev/null
 	rm -f "$RUN_DIR/progress.json" "$PANEL_ENV"
 	if ((rc == 124 || rc == 137)); then
-		message="выкатка не уложилась в $((DEPLOY_TIMEOUT / 60)) минут и была остановлена"
+		message="публикация не уложилась в $((DEPLOY_TIMEOUT / 60)) минут и была остановлена"
 	fi
 	if ((rc == 0)); then
 		send_result "$id" success "$message" "$log" "$stages" "$subject"

@@ -109,11 +109,11 @@ fi
 cat <<EOF
 
 Сервер готов. Дальше:
-  выкатить проект:       sudo ${DIR}/recipes/app-deploy.sh /путь/к/проекту
+  опубликовать проект:       sudo ${DIR}/recipes/app-deploy.sh /путь/к/проекту
   или из GitHub:         sudo ${DIR}/recipes/github-deploy.sh setup владелец/репозиторий
 EOF
 if [[ -n $dashboard ]]; then
-	echo "  или кнопкой «Выкатить» в дашборде: ${dashboard}"
+	echo "  или кнопкой «Опубликовать» в дашборде: ${dashboard}"
 fi
 if ((!letsencrypt)) && ! grep -qx 'LETSENCRYPT=1' /etc/airlok/server.env 2>/dev/null; then
 	echo "  настоящий сертификат вместо самоподписанного: sudo ${DIR}/recipes/server-base.sh letsencrypt"

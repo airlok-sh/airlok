@@ -74,10 +74,10 @@ export_data() {
 import_data() {
 	local uploads=$APP_DIR/shared/uploads user=app-$NAME
 	if [[ -n ${AIRLOK_DB_URL:-} ]] && ! has_db; then
-		die "у приложения на этом сервере нет базы: включите её в airlok.yml (database) и выкатите заново"
+		die "у приложения на этом сервере нет базы: включите её в airlok.yml (database) и опубликуйте заново"
 	fi
 	if [[ -n ${AIRLOK_FILES_URL:-} && ! -d $uploads ]]; then
-		die "у приложения на этом сервере нет загрузок: включите их в airlok.yml (uploads) и выкатите заново"
+		die "у приложения на этом сервере нет загрузок: включите их в airlok.yml (uploads) и опубликуйте заново"
 	fi
 	stop_app
 	if [[ -n ${AIRLOK_DB_URL:-} ]]; then
@@ -136,9 +136,9 @@ main() {
 	NAME=${2:-}
 	[[ $NAME =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "некорректное имя приложения: ${NAME}"
 	APP_DIR=$APPS_ROOT/$NAME
-	[[ -f $APP_DIR/compose.yml ]] || die "приложение ${NAME} на этом сервере ещё не выкатывали"
+	[[ -f $APP_DIR/compose.yml ]] || die "приложение ${NAME} на этом сервере ещё не публиковали"
 	exec 8>"/run/airlok-deploy-${NAME}.lock"
-	flock -w 60 8 || die "у ${NAME} идёт выкатка: перенос данных — после неё"
+	flock -w 60 8 || die "у ${NAME} идёт публикация: перенос данных — после неё"
 	install -d -m 700 "$WORK"
 	trap on_exit EXIT
 	case $op in

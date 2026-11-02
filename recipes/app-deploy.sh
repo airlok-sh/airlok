@@ -130,7 +130,7 @@ secrets() {
 		grep -qE "^${name}=['\"]?[^'\"]" "$panel_env" "$user_env" || missing+=("$name")
 	done
 	if ((${#missing[@]})); then
-		die "не заданы обязательные переменные: ${missing[*]}. Задайте их на странице приложения в дашборде airlok или впишите в ${user_env} в виде ИМЯ=значение и выкатите снова — что в них, описано в airlok.yml или .env.example проекта"
+		die "не заданы обязательные переменные: ${missing[*]}. Задайте их на странице приложения в дашборде airlok или впишите в ${user_env} в виде ИМЯ=значение и опубликуйте снова — что в них, описано в airlok.yml или .env.example проекта"
 	fi
 
 	# Переменные сборки: NEXT_PUBLIC_*, VITE_* и отмеченные build: true в airlok.yml — их
@@ -225,7 +225,7 @@ build() {
 		local outside
 		outside=$(grep -oE "EACCES: permission denied, [a-z]+ '/[^']*'" "$log" | grep -vE "'/(app|tmp)(/|')" | head -1)
 		if [[ -n $outside ]]; then
-			die "сборка пишет за пределы папки проекта (${outside#*, }): так бывает в монорепозитории, где фронтенд собирается в каталог бэкенда. Выкатывайте каталог, в котором собирается всё приложение, или поправьте путь сборки. Полный лог: ${log}"
+			die "сборка пишет за пределы папки проекта (${outside#*, }): так бывает в монорепозитории, где фронтенд собирается в каталог бэкенда. Публикуйте каталог, в котором собирается всё приложение, или поправьте путь сборки. Полный лог: ${log}"
 		fi
 		die "сборка не удалась, полный лог: ${log}"
 	fi
@@ -457,7 +457,7 @@ cron_setup() {
 	local n
 	printf '%s\n' "$CRON_JOBS" | write_if_changed "$APP_DIR/shared/cron.json" 0600 || true
 	if ! n=$(python3 "$RECIPES_DIR/cron.py" sync "$APP_NAME"); then
-		note "задачи по расписанию не настроены — причина выше, выкатите приложение снова"
+		note "задачи по расписанию не настроены — причина выше, опубликуйте приложение снова"
 		return 0
 	fi
 	((n)) || return 0
@@ -472,8 +472,8 @@ deploy() {
 	[[ -L $APP_DIR/current ]] && prev=$(readlink -f "$APP_DIR/current")
 
 	if ((DB_ENABLED)) && [[ -n $prev ]]; then
-		/usr/local/sbin/airlok-backup "$APP_NAME" || die "бэкап базы перед выкаткой не удался, деплой остановлен"
-		ok "бэкап базы перед выкаткой"
+		/usr/local/sbin/airlok-backup "$APP_NAME" || die "бэкап базы перед публикацией не удался, деплой остановлен"
+		ok "бэкап базы перед публикацией"
 	fi
 
 	[[ $APP_STACK == static ]] && static_conf
@@ -500,7 +500,7 @@ deploy() {
 			die "новая версия не запустилась, вернули предыдущую (${ROLLED_BACK})"
 		fi
 		if ((crashed)) || [[ $APP_KIND == worker ]]; then
-			die "приложение падает при запуске — причина в логе выше. Если ему не хватает переменных окружения, задайте их на странице приложения в дашборде airlok или впишите в ${APP_DIR}/shared/user.env и выкатите снова"
+			die "приложение падает при запуске — причина в логе выше. Если ему не хватает переменных окружения, задайте их на странице приложения в дашборде airlok или впишите в ${APP_DIR}/shared/user.env и опубликуйте снова"
 		fi
 		local path
 		path=$(release_health "$RELEASE")
@@ -672,7 +672,7 @@ issue_certificate() {
 		"${contact[@]}" --deploy-hook "systemctl reload nginx" >"$log" 2>&1; then
 		note "Let's Encrypt не выдал сертификат для ${APP_DOMAIN}, сайт работает с самоподписанным."
 		note "$(le_hint "$log")"
-		note "Следующая выкатка попробует снова. Подробности: ${log}"
+		note "Следующая публикация попробует снова. Подробности: ${log}"
 		return 0
 	fi
 	ok "сертификат Let's Encrypt выпущен, продлевается сам (certbot.timer)"
@@ -703,16 +703,16 @@ deploy_finished() {
 	if ((code == 0)); then
 		status=success
 		domain=$APP_DOMAIN
-		notify "✅ ${APP_NAME}: выкачена ${what} за ${took} с.${APP_DOMAIN:+ https://${APP_DOMAIN}}"
+		notify "✅ ${APP_NAME}: опубликована ${what} за ${took} с.${APP_DOMAIN:+ https://${APP_DOMAIN}}"
 	elif [[ -n ${ROLLED_BACK:-} ]]; then
 		status=rolled_back
 		notify "⚠️ ${APP_NAME}: ${what} не поднялась, вернули предыдущую (${ROLLED_BACK}). Сайт работает на ней. Логи: ${APP_DIR}/shared/deploy.log"
 	elif [[ -L $APP_DIR/current ]]; then
 		status=failed
-		notify "❌ ${APP_NAME}: выкатка ${what} не удалась: ${DIE_MSG:-неизвестная ошибка}. Сайт остался на прежней версии."
+		notify "❌ ${APP_NAME}: публикация ${what} не удалась: ${DIE_MSG:-неизвестная ошибка}. Сайт остался на прежней версии."
 	else
 		status=failed
-		notify "❌ ${APP_NAME}: первая выкатка не удалась: ${DIE_MSG:-неизвестная ошибка}."
+		notify "❌ ${APP_NAME}: первая публикация не удалась: ${DIE_MSG:-неизвестная ошибка}."
 	fi
 	# Выкатка, упавшая до создания релиза (например, уже идёт другая), id ещё не имеет. Домен —
 	# только у успешной: после неудачи nginx остался на прежнем адресе.
@@ -793,7 +793,7 @@ main() {
 	# Блокировка: две выкатки одного приложения не идут одновременно, а проверка
 	# доступности не принимает перезапуск во время выкатки за простой.
 	exec 8>"/run/airlok-deploy-${APP_NAME}.lock"
-	flock -n 8 || die "выкатка ${APP_NAME} уже идёт"
+	flock -n 8 || die "публикация ${APP_NAME} уже идёт"
 	STARTED=$SECONDS
 	RELEASE=""
 	trap 'deploy_finished $?' EXIT

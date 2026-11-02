@@ -45,7 +45,7 @@ install_agent() {
 	local changed=no
 	write_if_changed /etc/systemd/system/airlok-agent.service 0644 <<EOF && changed=yes
 [Unit]
-Description=airlok: команды из дашборда (выкатка коммитов из GitHub)
+Description=airlok: команды из дашборда (публикация коммитов из GitHub)
 Wants=network-online.target
 After=network-online.target docker.service
 
@@ -68,7 +68,7 @@ EOF
 	else
 		systemctl start airlok-agent.service
 	fi
-	ok "агент ждёт команды из дашборда: выкатить коммит из GitHub"
+	ok "агент ждёт команды из дашборда: опубликовать коммит из GitHub"
 }
 
 # Вывод приложений в дашборд. В отличие от агента, службу можно перезапускать в любой момент:
@@ -130,7 +130,7 @@ EOF
 	printf 'TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_CHAT_ID=%s\n' "$token" "$chat" | write_if_changed "$TELEGRAM_CONF" 0600 || true
 	ok "бот подключён, настройки в ${TELEGRAM_CONF} (права 600)"
 	install_healthcheck
-	notify "🔔 airlok подключён к серверу $(hostname). Сюда будут приходить выкатки, откаты и сообщения о том, что сайт не отвечает."
+	notify "🔔 airlok подключён к серверу $(hostname). Сюда будут приходить публикации, откаты и сообщения о том, что сайт не отвечает."
 	ok "отправили пробное сообщение — проверьте Telegram"
 }
 
@@ -163,7 +163,7 @@ dashboard() {
 	install_healthcheck
 	install_agent
 	install_logs
-	ok "сервер подключён к ${url}: выкатки и доступность сайтов будут видны в дашборде"
+	ok "сервер подключён к ${url}: публикации и доступность сайтов будут видны в дашборде"
 }
 
 case ${1:-} in

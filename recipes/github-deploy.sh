@@ -181,6 +181,11 @@ deploy_trap() {
 	fi
 }
 
+# in_branch КОММИТ — входит ли коммит в ветку самого репозитория.
+in_branch() {
+	[[ -n $(git --git-dir="$GIT_DIR_PATH" for-each-ref --count=1 --contains "$1" refs/heads/ 2>/dev/null) ]]
+}
+
 deploy() {
 	need_root
 	parse_repo "$1"
@@ -196,14 +201,22 @@ deploy() {
 			die "некорректный каталог в репозитории: ${root}"
 	fi
 	stage source "${REPO} · ${ref:0:7}"
+	# В строгом режиме разрешён только этот репозиторий, а GitHub по хешу отдаёт и коммиты из его
+	# форков: подставив хеш, дашборд запустил бы чужой код. Поэтому забираем все ветки и не берём по хешу.
+	local strict=0
+	strict_mode && strict=1
+	((strict)) && branch=""
 	fetch "$branch"
 	# Коммит мог уйти из ветки (force push) или быть в другой — GitHub отдаёт его и по хешу.
-	if https_mode && [[ $ref =~ ^[0-9a-f]{40}$ ]] &&
+	if ((!strict)) && https_mode && [[ $ref =~ ^[0-9a-f]{40}$ ]] &&
 		! git --git-dir="$GIT_DIR_PATH" cat-file -e "${ref}^{commit}" 2>/dev/null; then
 		local err
 		err=$(git --git-dir="$GIT_DIR_PATH" fetch -q "$FETCH_URL" "$ref" 2>&1) || fetch_failed "$err"
 	fi
 	resolve "$ref"
+	if ((strict)) && ! in_branch "$SHA"; then
+		die "строгий режим: коммита ${SHA:0:12} нет ни в одной ветке ${REPO}, публиковать его нельзя"
+	fi
 	SRC=$(mktemp -d /tmp/airlok-src.XXXXXX)
 	local src=$SRC tree=$SHA
 	if [[ -n $root ]]; then

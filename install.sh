@@ -8,6 +8,12 @@
 # Опции:
 #   --letsencrypt [EMAIL]  выпускать для сайтов сертификаты Let's Encrypt; email — для писем о продлении
 #   --ssh-keys-only        в конце закрыть вход по паролю (только если на сервере уже есть SSH-ключ)
+#   --strict               строгий режим: дашборд не получит доступа к серверу (recipes/strict.py)
+#   --allow-repo РЕПОЗИТОРИЙ  что можно публиковать в строгом режиме: владелец/имя или https://хост/путь.git
+#
+# Для строгого режима лучше не запускать скрипт из сети, а прочитать код и поставить именно его:
+#   git clone https://github.com/airlok-sh/airlok /opt/airlok && git -C /opt/airlok checkout КОММИТ
+#   echo "ТОКЕН" | sudo /opt/airlok/install.sh https://app.airlok.ru --strict --allow-repo владелец/имя
 #
 # Токен приходит через stdin, а не аргументом: аргументы видны в ps и остаются в истории.
 # Сам скрипт поэтому передаётся через bash -c, а не через конвейер в bash.
@@ -51,7 +57,8 @@ if [[ -n ${1:-} && ${1:-} != --* ]]; then
 	dashboard=$1
 	shift
 fi
-letsencrypt=0 le_email="" keys_only=0
+letsencrypt=0 le_email="" keys_only=0 strict=0 allow=()
+grep -qx 'AIRLOK_MODE=strict' /etc/airlok/policy.env 2>/dev/null && strict=1
 while (($#)); do
 	case $1 in
 	--letsencrypt)
@@ -62,10 +69,17 @@ while (($#)); do
 		fi
 		;;
 	--ssh-keys-only) keys_only=1 ;;
+	--strict) strict=1 ;;
+	--allow-repo)
+		[[ -n ${2:-} ]] || die "после --allow-repo нужен репозиторий"
+		allow+=(--allow-repo "$2")
+		shift
+		;;
 	*) die "неизвестная опция: $1" ;;
 	esac
 	shift
 done
+((strict || !${#allow[@]})) || die "--allow-repo работает только вместе с --strict"
 # Проверяем до установки: опечатка в email не должна обнаружиться через десять минут.
 if [[ -n $le_email && ! $le_email =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
 	die "это не похоже на email: ${le_email}"
@@ -88,7 +102,9 @@ if ! command -v git >/dev/null; then
 	install_git
 fi
 
-if [[ -d $DIR/.git ]]; then
+if [[ -d $DIR/.git ]] && ((strict)); then
+	echo "→ Рецепты остаются на коммите $(git -C "$DIR" rev-parse --short HEAD): строгий режим обновляется только вручную"
+elif [[ -d $DIR/.git ]]; then
 	echo "→ Обновляем рецепты в ${DIR}"
 	git -C "$DIR" pull -q --ff-only || die "не удалось обновить ${DIR}: есть локальные правки? git -C ${DIR} status"
 else
@@ -97,6 +113,11 @@ else
 fi
 
 "$DIR/recipes/server-base.sh" --skip-ssh
+
+# До подключения к дашборду: агент не должен успеть выполнить ни одной лишней команды.
+if ((strict)); then
+	python3 "$DIR/recipes/strict.py" enable "${allow[@]}"
+fi
 
 if ((letsencrypt)); then
 	"$DIR/recipes/server-base.sh" letsencrypt ${le_email:+"$le_email"}
@@ -114,6 +135,9 @@ cat <<EOF
 EOF
 if [[ -n $dashboard ]]; then
 	echo "  или кнопкой «Опубликовать» в дашборде: ${dashboard}"
+fi
+if ((strict)); then
+	echo "  строгий режим: настройки — sudo ${DIR}/recipes/strict.py show, журнал команд — /var/log/airlok-commands.log"
 fi
 if ((!letsencrypt)) && ! grep -qx 'LETSENCRYPT=1' /etc/airlok/server.env 2>/dev/null; then
 	echo "  настоящий сертификат вместо самоподписанного: sudo ${DIR}/recipes/server-base.sh letsencrypt"

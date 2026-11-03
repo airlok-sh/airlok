@@ -112,7 +112,7 @@ check_app() {
 HEARTBEAT_PY='
 import json, os, sys
 
-version, password, letsencrypt, env_key, ssh_report, os_report = sys.argv[1:7]
+version, password, letsencrypt, env_key, ssh_report, os_report, strict = sys.argv[1:8]
 mem = {}
 with open("/proc/meminfo") as f:
     for line in f:
@@ -153,6 +153,7 @@ print(json.dumps({
     "ssh_password_login": {"true": True, "false": False}.get(password),
     "letsencrypt": letsencrypt == "true",
     "env_key": env_key,
+    "strict": strict == "1",
     # Подсчёт не удался — поля нет, и дашборд оставит прежнее значение.
     **({"os_updates": os_updates} if os_updates else {}),
 }))
@@ -162,24 +163,30 @@ print(json.dumps({
 # изменениях, и без неё молчащий исправный сервер выглядел бы в дашборде пропавшим. В ней же —
 # опись SSH-ключей и новые входы: тело бывает в сотни килобайт, поэтому идёт из файла.
 heartbeat() {
-	local conf password=null le=false key="" body=$STATE_DIR/heartbeat.json ssh=$STATE_DIR/ssh-report.json os=$STATE_DIR/os-report.json code
+	local conf password=null le=false key="" strict=0 body=$STATE_DIR/heartbeat.json ssh=$STATE_DIR/ssh-report.json os=$STATE_DIR/os-report.json code
+	strict_mode && strict=1
 	if conf=$(sshd -T 2>/dev/null); then
 		password=false
 		grep -qxE '(passwordauthentication|kbdinteractiveauthentication) yes' <<<"$conf" && password=true
 	fi
 	[[ $(conf_value "$SERVER_CONF" LETSENCRYPT) == 1 ]] && le=true
-	ensure_env_key && key=$(env_key_public)
+	# В строгом режиме дашборду незачем шифровать переменные: сервер их всё равно не примет.
+	((strict)) || { ensure_env_key && key=$(env_key_public); }
 	# В отчёте IP тех, кто входил на сервер, — файлы только для root.
 	install -m 600 /dev/null "$ssh" && install -m 600 /dev/null "$body" || return
-	timeout 60 python3 "$RECIPES_DIR/sshkeys.py" report "$STATE_DIR" >"$ssh" 2>/dev/null || echo '{}' >"$ssh"
+	if ((strict)); then
+		echo '{}' >"$ssh"
+	else
+		timeout 60 python3 "$RECIPES_DIR/sshkeys.py" report "$STATE_DIR" >"$ssh" 2>/dev/null || echo '{}' >"$ssh"
+	fi
 	timeout 120 python3 "$RECIPES_DIR/osupdates.py" report "$STATE_DIR" >"$os" 2>/dev/null || echo '{}' >"$os"
-	python3 -c "$HEARTBEAT_PY" "$(agent_version)" "$password" "$le" "$key" "$ssh" "$os" >"$body" || return
+	python3 -c "$HEARTBEAT_PY" "$(agent_version)" "$password" "$le" "$key" "$ssh" "$os" "$strict" >"$body" || return
 	code=$(dashboard_call POST /agent/v1/heartbeat "@${body}") || code=000
 	# Дашборд старше описи ключей не примет большое тело: отмечаемся без неё, опись уйдёт позже.
 	if [[ $code == 413 ]]; then
-		python3 -c "$HEARTBEAT_PY" "$(agent_version)" "$password" "$le" "$key" /dev/null "$os" >"$body" || return
+		python3 -c "$HEARTBEAT_PY" "$(agent_version)" "$password" "$le" "$key" /dev/null "$os" "$strict" >"$body" || return
 		code=$(dashboard_call POST /agent/v1/heartbeat "@${body}") || code=000
-	elif [[ $code == 2?? ]]; then
+	elif [[ $code == 2?? ]] && ! ((strict)); then
 		python3 "$RECIPES_DIR/sshkeys.py" report-sent "$STATE_DIR"
 	fi
 	# Дашборд старой версии heartbeat не знает — отмечаемся, как раньше.

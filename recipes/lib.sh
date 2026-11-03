@@ -37,12 +37,16 @@ DASHBOARD_CONF=/etc/airlok/dashboard.env
 AGENT_RESTART_FLAG=/run/airlok-agent/restart
 # Настройки сервера, выбранные при установке: Let's Encrypt и т. п.
 SERVER_CONF=/etc/airlok/server.env
+# Строгий режим (strict.py): файл меняет только человек на сервере, дашборду он недоступен.
+POLICY_CONF=/etc/airlok/policy.env
 # Закрытый ключ для переменных окружения из дашборда (envkey.py): сервер он не покидает.
 ENV_KEY=/etc/airlok/env.key
 
 # conf_value ФАЙЛ КЛЮЧ — значение из файла вида KEY=value. Файл читается, а не
 # подключается через source: так его содержимое не может выполниться как код.
 conf_value() { [[ -r $1 ]] || return 0; sed -n "s/^$2=//p" "$1" | tail -1; }
+
+strict_mode() { [[ $(conf_value "$POLICY_CONF" AIRLOK_MODE) == strict ]]; }
 
 # conf_set ФАЙЛ КЛЮЧ ЗНАЧЕНИЕ — заменить или добавить KEY=value, остальное не трогать.
 # Значение проверяет вызывающий: переводов строк и мусора в файле быть не должно.

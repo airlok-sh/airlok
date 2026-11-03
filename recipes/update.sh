@@ -12,7 +12,29 @@ dir=$(dirname "$RECIPES_DIR")
 
 step "Агент и рецепты"
 before=$(agent_version)
-git -C "$dir" pull -q --ff-only || die "не удалось обновить ${dir}: есть локальные правки? git -C ${dir} status"
+if strict_mode; then
+	# Новый код приходит, только когда человек посмотрел его и назвал коммит: в этом смысл режима.
+	git -C "$dir" fetch -q origin main || die "не удалось получить новую версию из GitHub"
+	if [[ ${1:-} != --to || ! ${2:-} =~ ^[0-9a-f]{7,40}$ ]]; then
+		new=$(git -C "$dir" rev-parse --short FETCH_HEAD)
+		if [[ $(git -C "$dir" rev-parse HEAD) == $(git -C "$dir" rev-parse FETCH_HEAD) ]]; then
+			echo "Строгий режим: уже последняя версия ${before}"
+			exit 0
+		fi
+		git -C "$dir" log --oneline HEAD..FETCH_HEAD | head -30
+		git -C "$dir" diff --stat HEAD FETCH_HEAD | tail -15
+		cat <<EOF
+
+Строгий режим: сервер обновляется только вручную, ничего не изменилось.
+  посмотреть изменения:  git -C ${dir} diff HEAD ${new}
+  поставить эту версию:  sudo ${RECIPES_DIR}/update.sh --to ${new}
+EOF
+		exit 0
+	fi
+	git -C "$dir" merge -q --ff-only "$2" || die "коммит ${2} не продолжает текущую версию ${dir}"
+else
+	git -C "$dir" pull -q --ff-only || die "не удалось обновить ${dir}: есть локальные правки? git -C ${dir} status"
+fi
 after=$(agent_version)
 if [[ $before == "$after" ]]; then
 	ok "уже последняя версия ${after}"

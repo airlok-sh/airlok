@@ -11,6 +11,10 @@
 # произвольную команду дашборд прислать не может, а каждое поле команды проверяется здесь
 # заново — значения доходят до команд от root.
 # Сервер сам ходит в дашборд, входящих соединений агент не принимает.
+#
+# Обновление и ключи SSH всё же дают взломанному дашборду полный доступ к серверу. Строгий режим
+# (strict.py) это закрывает: что дашборду нельзя, решает файл на сервере, а каждая команда пишется в
+# журнал AUDIT_LOG, который дашборд не читает и стереть не может.
 
 source "$(dirname "$0")/lib.sh"
 set +e
@@ -48,6 +52,8 @@ PANEL_ENV=$RUN_DIR/panel.env
 # Запрос к базе из команды: в нём бывают данные из базы, поэтому тоже только tmpfs.
 DBQ_JSON=$RUN_DIR/dbquery.json
 KEYS_JSON=$RUN_DIR/sshkeys.json
+AUDIT_LOG=/var/log/airlok-commands.log
+AUDIT_MAX_BYTES=$((5 * 1024 * 1024))
 
 SELF=$(readlink -f "$0")
 SELF_INODE=$(stat -c %i "$SELF" 2>/dev/null)
@@ -699,8 +705,30 @@ run_update() {
 	exec "$SELF"
 }
 
+# audit РЕШЕНИЕ ID ВИД [ПОДРОБНОСТИ] — строка в журнал команд, без токенов и ссылок на хранилище.
+audit() {
+	local size
+	size=$(stat -c %s "$AUDIT_LOG" 2>/dev/null) || install -m 640 /dev/null "$AUDIT_LOG"
+	((${size:-0} < AUDIT_MAX_BYTES)) || { mv -f "$AUDIT_LOG" "$AUDIT_LOG.1"; install -m 640 /dev/null "$AUDIT_LOG"; }
+	printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >>"$AUDIT_LOG"
+}
+
+# refuse ID ВИД ПРИЧИНА — ответить дашборду, что команду сервер не выполнит. Запрос к базе ждёт
+# ответа на своей ручке: человек смотрит на открытую страницу.
+refuse() {
+	local id=$1 kind=$2 why=$3 out=$RUN_DIR/dbquery.out
+	echo "команда ${id} (${kind}) не выполнена: ${why}"
+	if [[ $kind == db_query ]]; then
+		python3 -c 'import json, sys; json.dump({"error": {"kind": "failed", "message": sys.argv[1]}}, sys.stdout)' "$why" >"$out"
+		dashboard_fetch POST "/agent/v1/db-queries/${id}/result" /dev/null "@${out}" >/dev/null
+		rm -f "$out"
+		return
+	fi
+	send_result "$id" failed "$why"
+}
+
 handle() {
-	local f=()
+	local f=() why details
 	rm -f "$ENV_JSON" "$DBQ_JSON" "$KEYS_JSON"
 	mapfile -d '' -t f < <(python3 -c "$PARSE_PY" "$ENV_JSON" "$DBQ_JSON" "$KEYS_JSON" <"$1")
 	rm -f "$1"
@@ -708,6 +736,32 @@ handle() {
 		echo "команда ${f[1]:-без id} отклонена: ${f[2]:-ответ дашборда не разобрать}"
 		[[ -n ${f[1]:-} ]] && send_result "${f[1]}" failed "${f[2]:-}"
 		return
+	fi
+	case ${f[2]:-} in
+	deploy) details="app=${f[3]} repo=${f[4]} sha=${f[5]} domain=${f[10]}" ;;
+	restart) details="app=${f[3]}" ;;
+	remove) details="app=${f[3]} with_data=${f[4]}" ;;
+	data_move) details="op=${f[3]} app=${f[4]}" ;;
+	ssh_password) details="login=${f[3]} user=${f[4]}" ;;
+	os_upgrade) details="action=${f[3]}" ;;
+	*) details="" ;;
+	esac
+	# Сбой проверки — тоже отказ: в строгом режиме лучше не выполнить команду, чем выполнить лишнюю.
+	if ! why=$(python3 "$RECIPES_DIR/strict.py" check "${f[2]}" "${f[3]:-}" "${f[4]:-}" 2>&1); then
+		audit refused "${f[1]}" "${f[2]}" "$details"
+		refuse "${f[1]}" "${f[2]}" "${why:-не удалось проверить настройки строгого режима}"
+		rm -f "$ENV_JSON" "$DBQ_JSON" "$KEYS_JSON"
+		return
+	fi
+	audit accepted "${f[1]}" "${f[2]}" "$details"
+	# Переменные из дашборда могут увести данные приложения на чужой сервер, а ключ для них публичный:
+	# в строгом режиме значения задаются только на сервере, в shared/user.env.
+	if strict_mode; then
+		rm -f "$ENV_JSON"
+		case ${f[2]} in
+		deploy) f[11]=0 ;;
+		restart) f[4]=0 ;;
+		esac
 	fi
 	case ${f[2]:-} in
 	update) run_update "${f[1]}" ;;

@@ -75,6 +75,10 @@ EOF
 # прочитанное она досылает при остановке, а место в каждом контейнере помнит на диске.
 # Перезапуск всегда — так обновлённый logs.py начинает работать сразу.
 install_logs() {
+	if strict_mode; then
+		note "строгий режим: вывод приложений в дашборд не уходит"
+		return 0
+	fi
 	write_if_changed /etc/systemd/system/airlok-logs.service 0644 <<EOF && systemctl daemon-reload
 [Unit]
 Description=airlok: вывод приложений в дашборд

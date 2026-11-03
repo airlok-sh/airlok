@@ -84,6 +84,7 @@ export async function envCommand(api, sub, names, opts, io) {
       if (names.length !== 1) throw new EnvError('Удаляется одна переменная: env rm ИМЯ --app <имя>')
       await (app.hosted ? api.deleteEnv(app.id, names[0]) : api.deleteServerEnv(app.id, names[0])).catch((err) => {
         if (err instanceof ApiError && err.status === 404) throw new EnvError(`У ${app.name} нет переменной ${names[0]}`)
+        if (err instanceof ApiError && err.code === 'server_strict') throw new EnvError(strictHint(app))
         throw err
       })
       json({ deleted: names[0] })
@@ -93,6 +94,9 @@ export async function envCommand(api, sub, names, opts, io) {
       throw new EnvError('env list | set | rm — см. npx @airlok/cli help')
   }
 }
+
+const strictHint = (app) =>
+  `На сервере ${app.server_name} строгий режим: переменные задаются только там, в /srv/apps/${app.name}/shared/user.env.`
 
 async function listHosted(api, app, io, json, asJSON) {
   const vars = await api.env(app.id)
@@ -107,6 +111,10 @@ async function listServer(api, app, io, json, asJSON) {
   json({ key_id: id, vars: st.vars })
   if (asJSON) return 0
   for (const v of st.vars) io.out(v.stale ? `${v.name}  (под прежним ключом — задайте заново)` : v.name)
+  if (st.strict) {
+    io.err(strictHint(app))
+    return 0
+  }
   io.err(id ? `Ключ сервера ${app.server_name}: ${id}` : `Агент сервера ${app.server_name} ещё не прислал ключ.`)
   io.err(`Значения не видны никому, кроме сервера. Вписанное прямо в /srv/apps/${app.name}/shared/user.env здесь не показывается.`)
   return 0
@@ -119,6 +127,7 @@ async function setHosted(api, app, vars) {
 
 async function setServer(api, app, vars, io) {
   const st = await api.serverEnv(app.id)
+  if (st.strict) throw new EnvError(strictHint(app))
   if (!st.key) {
     throw new EnvError(`Агент сервера ${app.server_name} ещё не прислал ключ для переменных: обновите агента в дашборде (Серверы → Обновить агента) и повторите.`)
   }

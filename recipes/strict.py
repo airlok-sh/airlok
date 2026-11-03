@@ -30,7 +30,7 @@ REFUSED = {
     "ssh_keys": "SSH-ключи из дашборда",
     "ssh_password": "вход по паролю из дашборда",
     "os_upgrade": "обновления системы из дашборда",
-    "data_move": "выгрузка и загрузка данных через хранилище Airlok",
+    "data_move": "перенос данных через хранилище Airlok",
 }
 HINT = "Настройки строгого режима меняются только на самом сервере: sudo /opt/airlok/recipes/strict.py show"
 
@@ -88,7 +88,7 @@ def refusal(strict, repos, kind, first="", second=""):
     if not strict:
         return None
     if kind in REFUSED:
-        return f"строгий режим: {REFUSED[kind]} запрещено на этом сервере. {HINT}"
+        return f"строгий режим запрещает {REFUSED[kind]} на этом сервере. {HINT}"
     if kind == "remove" and second == "1":
         return f"строгий режим: удалять приложение вместе с данными из дашборда нельзя. {HINT}"
     if kind == "deploy":

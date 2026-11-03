@@ -43,6 +43,7 @@ class RefusalTest(unittest.TestCase):
     def test_access_to_the_server_is_closed(self):
         for kind in ("update", "ssh_keys", "ssh_password", "db_query", "data_move", "os_upgrade"):
             self.assertIn("строгий режим", self.refuse(kind), kind)
+        self.assertIn("строгий режим запрещает запросы к базе из дашборда на этом сервере.", self.refuse("db_query"))
 
     def test_empty_repo_is_refused(self):
         self.assertIsNotNone(self.refuse("deploy", "shop", ""))

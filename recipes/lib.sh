@@ -244,8 +244,15 @@ write_if_changed() {
 # Next.js с заголовком RSC). В нём есть IP и браузер, но metrics.py раз в минуту превращает
 # их в обезличенный хэш с солью суток и сразу стирает прочитанное: в дашборд уходят только
 # хэши и счётчики.
+#
+# Здесь же $airlok_connection для WebSocket: map есть только на уровне http, а сайт без него
+# nginx не примет.
 ensure_log_format() {
 	write_if_changed /etc/nginx/conf.d/airlok-log.conf 0644 <<'EOF'
+map $http_upgrade $airlok_connection {
+    default upgrade;
+    '' close;
+}
 log_format airlok '$msec $status $request_time $body_bytes_sent $request_method $uri "$upstream_response_time"';
 map "$request_method:$http_accept:$http_rsc" $airlok_visit {
     default 0;

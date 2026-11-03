@@ -620,10 +620,18 @@ ${uploads_block}
 
     location / {
         proxy_pass http://127.0.0.1:${APP_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$airlok_connection;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        # WebSocket, поток (SSE) и долгий ответ работают сразу. Сервер принадлежит самому
+        # человеку, поэтому 60 секунд, как на хостинге, здесь ограничивать незачем.
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
     }
 }
 EOF

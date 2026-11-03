@@ -152,11 +152,13 @@ if kind == "data_move":
     app = m.get("app")
     if not isinstance(app, str) or not NAME.match(app):
         emit("bad", cid, "некорректное имя приложения")
-    urls = [m.get(k) or "" for k in ("db_url", "files_url")]
+    urls = [m.get(k) or "" for k in ("db_url", "files_url", "data_url")]
     if not all(isinstance(u, str) and (u == "" or STORE_URL.fullmatch(u)) for u in urls):
         emit("bad", cid, "некорректная ссылка на хранилище")
-    if m["op"] in ("backup", "restore") and not urls[0]:
+    if m["op"] == "backup" and not urls[0]:
         emit("bad", cid, "нет ссылки на копию базы в хранилище")
+    if m["op"] == "restore" and not urls[0] and not urls[2]:
+        emit("bad", cid, "нет ссылки на копию в хранилище")
     emit("ok", cid, "data_move", m["op"], app, *urls)
 if kind == "restart":
     r = cmd.get("restart")
@@ -564,10 +566,10 @@ run_ssh_password() {
 # run_data_move — данные приложения: выгрузить и загрузить при переезде, запустить остановленное
 # снова, сделать копию базы или восстановить её. Ссылки на хранилище — только в окружении app-data.sh.
 run_data_move() {
-	local id=$1 op=$2 app=$3 db_url=$4 files_url=$5 log=$STATE_DIR/command.log rc message=""
+	local id=$1 op=$2 app=$3 db_url=$4 files_url=$5 data_url=$6 log=$STATE_DIR/command.log rc message=""
 	echo "команда ${id}: данные ${app} — ${op}"
 	install -m 600 /dev/null "$log"
-	AIRLOK_DB_URL=$db_url AIRLOK_FILES_URL=$files_url timeout --kill-after=60 "$DATA_TIMEOUT" \
+	AIRLOK_DB_URL=$db_url AIRLOK_FILES_URL=$files_url AIRLOK_DATA_URL=$data_url timeout --kill-after=60 "$DATA_TIMEOUT" \
 		"$RECIPES_DIR/app-data.sh" "$op" "$app" </dev/null >"$log" 2>&1
 	rc=$?
 	if ((rc == 124 || rc == 137)); then
@@ -714,7 +716,7 @@ handle() {
 	db_query) run_db_query "${f[1]}" ;;
 	ssh_keys) run_ssh_keys "${f[1]}" ;;
 	ssh_password) run_ssh_password "${f[1]}" "${f[3]}" "${f[4]}" ;;
-	data_move) run_data_move "${f[1]}" "${f[3]}" "${f[4]}" "${f[5]}" "${f[6]}" ;;
+	data_move) run_data_move "${f[1]}" "${f[3]}" "${f[4]}" "${f[5]}" "${f[6]}" "${f[7]}" ;;
 	os_upgrade)
 		if [[ ${f[3]} == reboot ]]; then
 			run_os_reboot "${f[1]}"

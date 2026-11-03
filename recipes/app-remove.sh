@@ -45,6 +45,9 @@ stop_containers() {
 	mapfile -t ids < <(docker ps -aq --filter "label=com.docker.compose.project=${NAME}")
 	((${#ids[@]} == 0)) || docker rm -f "${ids[@]}" >/dev/null || die "не удалось удалить контейнеры приложения"
 	docker network rm "${NAME}_default" >/dev/null 2>&1 || true
+	# Образы, собранные по Dockerfile проекта: без приложения они только занимают диск.
+	mapfile -t ids < <(docker images -q "airlok-${NAME}" | sort -u)
+	((${#ids[@]} == 0)) || docker image rm -f "${ids[@]}" >/dev/null 2>&1 || true
 	if ((WITH_DATA)); then
 		mapfile -t ids < <(docker volume ls -q --filter "label=com.docker.compose.project=${NAME}")
 		((${#ids[@]} == 0)) || docker volume rm "${ids[@]}" >/dev/null || die "не удалось удалить том базы"
@@ -79,21 +82,23 @@ remove_files() {
 		rm -rf --one-file-system "$APP_DIR/compose.yml" "$APP_DIR/current" "$APP_DIR/releases"
 		return
 	fi
-	local unit
-	unit=$(systemd-escape --path --suffix=mount "$APP_DIR/shared/uploads")
-	if [[ -e /etc/systemd/system/$unit ]]; then
-		systemctl disable --now "$unit" >/dev/null 2>&1 || true
-		rm -f "/etc/systemd/system/$unit"
-		systemctl daemon-reload
-	fi
-	findmnt -n "$APP_DIR/shared/uploads" >/dev/null && die "загрузки ${APP_DIR}/shared/uploads не отмонтировались"
+	local unit dir
+	for dir in "$APP_DIR/shared/uploads" "$APP_DIR/shared/data"; do
+		unit=$(systemd-escape --path --suffix=mount "$dir")
+		if [[ -e /etc/systemd/system/$unit ]]; then
+			systemctl disable --now "$unit" >/dev/null 2>&1 || true
+			rm -f "/etc/systemd/system/$unit"
+			systemctl daemon-reload
+		fi
+		findmnt -n "$dir" >/dev/null && die "папка ${dir} не отмонтировалась"
+	done
 	rm -rf --one-file-system "$APP_DIR"
 	# Пользователя оставляем, пока целы загрузки: его uid система отдала бы следующему
 	# приложению вместе с чужими файлами.
 	if id "app-${NAME}" >/dev/null 2>&1; then
 		userdel "app-${NAME}" || note "пользователь app-${NAME} не удалился"
 	fi
-	ok "код, база, бэкапы, загрузки и секреты удалены"
+	ok "код, база, постоянная папка, бэкапы, загрузки и секреты удалены"
 }
 
 main() {

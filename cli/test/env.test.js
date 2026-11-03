@@ -63,7 +63,7 @@ async function fakeDashboard(key) {
     const p = new URL(req.url, 'http://x').pathname
     if (p === '/api/cli/v1/apps') return send(200, { apps })
     if (p === '/api/cli/v1/apps/s1/server-env' || p === '/api/cli/v1/apps/s2/server-env') {
-      if (req.method === 'GET') return send(200, { key: state.key, vars: [{ name: 'OLD', stale: true }] })
+      if (req.method === 'GET') return send(200, { key: state.key, strict: state.strict, vars: [{ name: 'OLD', stale: true }] })
       state.put = { app: p.split('/')[5], ...body }
       return send(204)
     }
@@ -164,4 +164,21 @@ test('env set refuses a key that does not match its fingerprint', { timeout: 30_
   const nokey = captureIO({ stdin: 'v' })
   assert.equal(await main(['env', 'set', 'A', '--app', 'blog'], nokey, dash.env), 1)
   assert.match(nokey.errLines.join('\n'), /ещё не прислал ключ/)
+})
+
+test('env on a strict server points to the file on the server', { timeout: 30_000 }, async (t) => {
+  const dash = await fakeDashboard(await agentKey())
+  t.after(dash.close)
+  dash.state.key = null
+  dash.state.strict = true
+  const set = captureIO({ stdin: 'v' })
+  assert.equal(await main(['env', 'set', 'A', '--app', 'blog'], set, dash.env), 1)
+  assert.match(set.errLines.join('\n'), /строгий режим.*shared\/user\.env/)
+  assert.doesNotMatch(set.errLines.join('\n'), /обновите агента/)
+  assert.equal(dash.state.put, null)
+
+  const list = captureIO()
+  assert.equal(await main(['env', 'list', '--app', 'blog'], list, dash.env), 0)
+  assert.match(list.errLines.join('\n'), /строгий режим/)
+  assert.doesNotMatch(list.errLines.join('\n'), /не прислал ключ/)
 })

@@ -18,12 +18,14 @@ import yaml
 
 from cron import CronError, parse_jobs
 from detect import STACKS, DetectError, detect, subprojects
+from dockerfile import DockerfileError, find_source
 
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 DOMAIN = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 EXT = re.compile(r"^[a-z0-9]{1,8}$")
 ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
-RESERVED_ENV = {"DATABASE_URL", "UPLOAD_DIR", "UPLOAD_MAX_BYTES", "PORT", "HOSTNAME", "NODE_ENV", "HOME"}
+ENV_NAME_ANY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+RESERVED_ENV = {"DATABASE_URL", "UPLOAD_DIR", "UPLOAD_MAX_BYTES", "DATA_DIR", "PORT", "HOSTNAME", "NODE_ENV", "HOME"}
 # Переменные, которые проект описывает сам. Правила те же, что у сборщика хостинга airlok
 # (internal/builder/env.go): дашборд и рецепт должны спрашивать одно и то же.
 EXAMPLE_FILES = (".env.example", ".env.sample", ".env.template")
@@ -38,6 +40,7 @@ EXAMPLE_RESERVED = {"PORT", "HOST", "HOSTNAME", "HOME", "NODE_ENV"}
 # Путь проверки: от корня сайта, без пробелов и фрагмента — так же, как на хостинге.
 HEALTH = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/?-]{0,199}$")
 OUTPUT = re.compile(r"^(\.|(\.vitepress/)?[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*)$")
+DOCKERFILE = re.compile(r"^(\./)?[A-Za-z0-9_][A-Za-z0-9_./-]*$")
 
 
 class ManifestError(Exception):
@@ -179,13 +182,16 @@ def parse(data, root):
     domain = str(app.get("domain", "")).lower()
     if domain and not DOMAIN.match(domain):
         raise ManifestError("app.domain: домен вида app.example.ru")
-    stack = choice(app, "stack", STACKS, "app.stack")
+    stack = choice(app, "stack", STACKS + ("docker",), "app.stack")
     kind = choice(app, "type", ("web", "worker"), "app.type")
 
     build = section(data, "build")
     output = command(build, "output", "build.output")
     if output and not OUTPUT.match(output):
         raise ManifestError("build.output: каталог внутри проекта, например dist")
+    dockerfile = str(build.get("dockerfile", ""))
+    if dockerfile and (not DOCKERFILE.match(dockerfile) or ".." in dockerfile.split("/")):
+        raise ManifestError("build.dockerfile: путь внутри проекта, например docker/Dockerfile.prod")
     run = section(data, "run")
     release = command(run, "release", "run.release")
     health = command(run, "health", "run.health")
@@ -193,9 +199,15 @@ def parse(data, root):
         raise ManifestError("run.health: путь на сайте приложения, например /healthz")
     runtime = section(data, "runtime")
     versions = {k: str(runtime.get(k, "")) for k in ("node", "python", "go")}
+    run_command = command(run, "command", "run.command")
+    docker = docker_source(root, stack, dockerfile)
     try:
-        plan = detect(root, stack=stack, kind=kind, build_command=command(build, "command", "build.command"),
-                      build_output=output, run_command=command(run, "command", "run.command"), **versions)
+        if docker:
+            plan = {"stack": "docker", "kind": kind or "web", "framework": docker_label(docker), "node": "", "python": "",
+                    "go": "", "bun": False, "install": "", "build": "", "output": "", "start": run_command}
+        else:
+            plan = detect(root, stack=stack, kind=kind, build_command=command(build, "command", "build.command"),
+                          build_output=output, run_command=run_command, **versions)
     except DetectError as e:
         found = subprojects(root)
         if found and not stack:
@@ -205,6 +217,8 @@ def parse(data, root):
 
     caps = section(data, "capabilities")
     db = section(caps, "database")
+    db_enabled = flag(db, "enabled") or bool(docker and docker["database"])
+    data_enabled = flag(section(caps, "data"), "enabled")
     uploads = section(caps, "uploads")
     exts = uploads.get("allowed", [])
     if not isinstance(exts, list) or not all(isinstance(e, str) and EXT.match(e) for e in exts):
@@ -212,7 +226,7 @@ def parse(data, root):
     uploads_enabled = flag(uploads, "enabled")
     if uploads_enabled and not exts:
         raise ManifestError("capabilities.uploads.allowed: перечислите разрешённые расширения")
-    if plan["stack"] == "static" and (uploads_enabled or flag(db, "enabled")):
+    if plan["stack"] == "static" and (uploads_enabled or db_enabled or data_enabled):
         raise ManifestError("у статического сайта нет своего кода на сервере: база и загрузки ему недоступны")
     if plan["kind"] == "worker" and uploads_enabled and flag(uploads, "public", True):
         raise ManifestError("у фонового приложения нет сайта: загрузки только с public: false")
@@ -236,8 +250,9 @@ def parse(data, root):
     if clash:
         raise ManifestError(f"env: {', '.join(sorted(clash))} задаёт сам рецепт, уберите из списка")
     # Что задаёт рецепт, спрашивать незачем; DATABASE_URL — только когда базу заводит он сам.
-    provided = RESERVED_ENV - ({"DATABASE_URL"} if not flag(db, "enabled") else set())
-    env = [v["name"] for v in merge_env(declared, parse_env_example(read_example(root)))
+    provided = RESERVED_ENV - ({"DATABASE_URL"} if not db_enabled else set())
+    from_compose = [{"name": n, "required": True} for n in docker["env"]] if docker else []
+    env = [v["name"] for v in merge_env(declared, from_compose, parse_env_example(read_example(root)))
            if v["required"] and v["name"] not in provided]
 
     resources = section(data, "resources")
@@ -258,7 +273,8 @@ def parse(data, root):
         "RELEASE_CMD": release,
         "CRON_JOBS": json.dumps(cron, ensure_ascii=False),
         "HEALTH_PATH": health,
-        "DB_ENABLED": int(flag(db, "enabled")),
+        "DB_ENABLED": int(db_enabled),
+        "DATA_ENABLED": int(data_enabled),
         "UPLOADS_ENABLED": int(uploads_enabled),
         "UPLOADS_PUBLIC": int(flag(uploads, "public", True)),
         "UPLOAD_MAX_MB": number(uploads, "max_size_mb", 10, 1, 512),
@@ -268,10 +284,55 @@ def parse(data, root):
         "ENV_BUILD": " ".join(v["name"] for v in declared if v["build"] is True),
         "ENV_NO_BUILD": " ".join(v["name"] for v in declared if v["build"] is False),
         "MEMORY_MB": number(resources, "memory_mb", 512, 128, 8192),
+        "DOCKER_CONTEXT": docker["context"] if docker else "",
+        "DOCKER_FILE": docker["dockerfile"] if docker else "",
+        "DOCKER_TARGET": docker["target"] if docker else "",
+        "DOCKER_PORT": number(run, "port", 0, 0, 65535) or (docker["port"] if docker else 0),
+        "DOCKER_ARGS": "\n".join(f"{k}={v}" for k, v in literal_args(docker).items()),
+        "DOCKER_DEFAULTS": "\n".join(f"{k}={v}" for k, v in sorted(docker["defaults"].items()) if "\n" not in v) if docker else "",
+        "DOCKER_WARNINGS": "\n".join(docker["warnings"]) if docker else "",
     }
 
 
+def docker_source(root, stack, dockerfile):
+    """Что собирать по Dockerfile. Явный стек его отменяет, как на хостинге. Приложение, которое уже
+    собирается по файлам, само способ не меняет (AIRLOK_KEEP_BUILD): Dockerfile мог лежать в проекте
+    давно и не быть рабочим. Для него нужен явный build.dockerfile или app.stack: docker."""
+    if stack not in ("", "docker"):
+        return None
+    if not stack and not dockerfile and os.environ.get("AIRLOK_KEEP_BUILD"):
+        return None
+    try:
+        source = find_source(root, dockerfile)
+    except DockerfileError as e:
+        raise ManifestError(str(e)) from None
+    if stack == "docker" and source is None:
+        raise ManifestError("app.stack: docker, но в проекте нет Dockerfile: положите его в каталог проекта или укажите build.dockerfile")
+    return source
+
+
+def docker_label(source):
+    return f"{source['dockerfile']}, сервис {source['service']} из compose" if source["service"] else source["dockerfile"]
+
+
+def literal_args(source):
+    """Аргументы сборки из compose.yml: значение известно только у готовых строк. Переменные приложения
+    доходят до сборки отдельно, по правилам переменных сборки."""
+    if not source:
+        return {}
+    return {k: v for k, v in source["args"].items() if ENV_NAME_ANY.match(k) and "$" not in v and "\n" not in v}
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "name":
+        # Имя нужно рецепту раньше настроек: от него зависит, менять ли способ сборки.
+        try:
+            with open(os.path.join(sys.argv[2], "airlok.yml"), encoding="utf-8") as f:
+                name = str(section(yaml.safe_load(f) or {}, "app").get("name", ""))
+        except (OSError, yaml.YAMLError, ManifestError, AttributeError):
+            return
+        print(name if NAME.match(name) else "")
+        return
     if len(sys.argv) != 2 or not os.path.isdir(sys.argv[1]):
         sys.exit("использование: manifest.py КАТАЛОГ_ПРОЕКТА")
     root = sys.argv[1]

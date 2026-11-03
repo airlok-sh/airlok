@@ -101,6 +101,14 @@ class AddLineTest(unittest.TestCase):
             m = minutes[str(MINUTE)]
             self.assertEqual((m["ms"], m["routes"]["POST /"]["ms"]), ([want], [want]), upstream)
 
+    def test_long_connections_are_not_latency(self):
+        minutes = {}
+        metrics.add_line(minutes, line(101, "/ws", took=1800.0, upstream="1800.000"))
+        metrics.add_line(minutes, line(200, "/events", took=3600.0, upstream="3600.000"))
+        metrics.add_line(minutes, line(200, "/slow", took=59.0, upstream="59.000"))
+        m = minutes[str(MINUTE)]
+        self.assertEqual((m["requests"], m["ms"]), (3, [59000]))
+
     def test_path_before_app_time(self):
         minutes = {}
         metrics.add_line(minutes, line(200, "/say \\x22hi\\x22", took=0.5, upstream="0.003"))

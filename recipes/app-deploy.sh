@@ -42,7 +42,7 @@ mount_noexec() {
 	unit=$(systemd-escape --path --suffix=mount "$dir")
 	if write_if_changed "/etc/systemd/system/${unit}" 0644 <<EOF; then
 [Unit]
-Description=noexec для загрузок ${APP_NAME}
+Description=noexec для данных ${APP_NAME}
 Before=docker.service
 
 [Mount]
@@ -70,6 +70,13 @@ layout() {
 		install -d -m 2750 -o "$APP_USER" -g www-data "$APP_DIR/shared/uploads"
 		mount_noexec "$APP_DIR/shared/uploads"
 		ok "загрузки в ${APP_DIR}/shared/uploads: единственное место с записью, noexec"
+	fi
+	if ((DATA_ENABLED)); then
+		install -d -m 750 -o "$APP_USER" -g "$APP_USER" "$APP_DIR/shared/data"
+		mount_noexec "$APP_DIR/shared/data"
+		ok "постоянная папка ${APP_DIR}/shared/data, в приложении — /data, noexec"
+	elif [[ -d $APP_DIR/shared/data ]]; then
+		note "постоянная папка больше не подключена, данные остались в ${APP_DIR}/shared/data"
 	fi
 }
 
@@ -113,7 +120,14 @@ secrets() {
 			echo "UPLOAD_DIR=/data/uploads"
 			echo "UPLOAD_MAX_BYTES=$((UPLOAD_MAX_MB * 1024 * 1024))"
 		fi
+		if ((DATA_ENABLED)); then echo "DATA_DIR=/data"; fi
 	} | write_if_changed "$APP_DIR/shared/app.env" 0600 || true
+	# Значения из compose.yml проекта слабее всех остальных: файл стоит первым в env_file.
+	if [[ -n $DOCKER_DEFAULTS ]]; then
+		printf '%s\n' "$DOCKER_DEFAULTS" | write_if_changed "$APP_DIR/shared/defaults.env" 0600 || true
+	else
+		rm -f "$APP_DIR/shared/defaults.env"
+	fi
 	[[ -f $user_env ]] || install -m 600 /dev/null "$user_env"
 	# Переменные из дашборда агент расшифровал перед выкаткой; файл заменяется целиком, так
 	# что удалённая в дашборде переменная пропадёт. Выкатка без агента его не трогает.
@@ -149,13 +163,14 @@ prepare_release() {
 	[[ $id =~ ^[A-Za-z0-9-]+$ ]] || die "некорректный id релиза: ${id}"
 	RELEASE=$APP_DIR/releases/$id
 	RELEASE_ID=$id
+	[[ $APP_STACK == docker ]] && RUN_IMAGE=$(release_image "$id")
 	# Адрес проверки — у каждого релиза свой: при откате проверяется то, что было в его airlok.yml.
 	printf '%s' "$HEALTH_PATH" >"${RELEASE}.health"
 	# Релиз из GitHub однозначно задан коммитом и переменными сборки (их отпечаток лежит в
 	# .built), поэтому уже собранный можно взять как есть: откат занимает секунды, а не новую сборку.
 	REUSED=0
 	if [[ -n ${AIRLOK_RELEASE_ID:-} && -f ${RELEASE}.built && -d $RELEASE ]]; then
-		if [[ $(<"${RELEASE}.built") == "$BUILD_ENV_SUM" ]]; then
+		if [[ $(<"${RELEASE}.built") == "$BUILD_ENV_SUM" ]] && { [[ $APP_STACK != docker ]] || docker image inspect "$RUN_IMAGE" >/dev/null 2>&1; }; then
 			REUSED=1
 			ok "релиз ${id} уже собран, используем его"
 			return
@@ -173,7 +188,11 @@ prepare_release() {
 	ok "релиз ${id}"
 }
 
-# Образы сборки и запуска: версии только из списка, который проверил detect.py.
+# release_image РЕЛИЗ — образ приложения, собранный по его Dockerfile.
+release_image() { echo "airlok-${APP_NAME}:$1"; }
+
+# Образы сборки и запуска: версии только из списка, который проверил detect.py. Образ по
+# Dockerfile появится при сборке.
 images() {
 	case $APP_STACK in
 	python) BUILD_IMAGE=python:${PYTHON_VERSION}-slim-bookworm RUN_IMAGE=$BUILD_IMAGE ;;
@@ -181,6 +200,7 @@ images() {
 	# сертификаты для HTTPS и та же glibc, с которой собиралась программа с cgo.
 	go) BUILD_IMAGE=golang:${GO_VERSION}-bookworm RUN_IMAGE=$BUILD_IMAGE ;;
 	static) BUILD_IMAGE=node:${NODE_VERSION}-bookworm-slim RUN_IMAGE=$STATIC_IMAGE ;;
+	docker) BUILD_IMAGE="" RUN_IMAGE="" ;;
 	*) BUILD_IMAGE=node:${NODE_VERSION}-bookworm-slim RUN_IMAGE=$BUILD_IMAGE ;;
 	esac
 }
@@ -207,6 +227,24 @@ build_container() {
 	fi
 }
 
+# build_image ЛОГ — сборка образа по Dockerfile проекта. Значения переменных сборки docker берёт из
+# окружения: в ps их не видно. Шаги RUN идут в обычном контейнере сборки, а не на самом сервере.
+build_image() {
+	local args=(--progress plain) pair line
+	docker buildx version >/dev/null 2>&1 || args=()
+	for pair in "${BUILD_ENV[@]}"; do args+=(--build-arg "${pair%%=*}"); done
+	while IFS= read -r line; do
+		[[ -n $line ]] && args+=(--build-arg "$line")
+	done <<<"$DOCKER_ARGS"
+	[[ -n $DOCKER_TARGET ]] && args+=(--target "$DOCKER_TARGET")
+	local run=(env "${BUILD_ENV[@]}" docker build "${args[@]}" -t "$RUN_IMAGE" -f "${RELEASE}/${DOCKER_FILE}" "${RELEASE}/${DOCKER_CONTEXT}")
+	if [[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]]; then
+		"${run[@]}" 2>&1 | tee "$1"
+	else
+		"${run[@]}" >"$1" 2>&1
+	fi
+}
+
 build() {
 	if ((REUSED)); then
 		stage_skip build "версия уже собрана"
@@ -214,9 +252,23 @@ build() {
 	fi
 	step "Сборка: ${APP_FRAMEWORK}"
 	stage build "$APP_FRAMEWORK"
-	local log=${RELEASE}.build.log script pair names=()
+	local log=${RELEASE}.build.log script pair names=() line
 	for pair in "${BUILD_ENV[@]}"; do names+=("${pair%%=*}"); done
 	((${#names[@]})) && note "переменные сборки: ${names[*]}"
+	if [[ $APP_STACK == docker ]]; then
+		while IFS= read -r line; do
+			[[ -n $line ]] && note "внимание: $line"
+		done <<<"$DOCKER_WARNINGS"
+		if ! build_image "$log"; then
+			[[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]] || tail -30 "$log" >&2
+			die "сборка по ${DOCKER_FILE} не удалась, полный лог: ${log}"
+		fi
+		chown -R root:root "$RELEASE"
+		chmod -R u+rwX,go+rX,go-w "$RELEASE"
+		printf '%s' "$BUILD_ENV_SUM" >"${RELEASE}.built"
+		ok "образ ${RUN_IMAGE} собран по ${DOCKER_FILE}"
+		return 0
+	fi
 	script=$BUILD_INSTALL
 	[[ -n $script && -n $BUILD_CMD ]] && script+=" && "
 	script+=$BUILD_CMD
@@ -281,8 +333,15 @@ name: ${APP_NAME}
 services:
   app:
     image: ${RUN_IMAGE}
-    working_dir: /app
-    command: $(compose_command)
+EOF
+		if [[ $APP_STACK != docker ]]; then
+			echo "    working_dir: /app"
+			echo "    command: $(compose_command)"
+		elif [[ -n $RUN_CMD ]]; then
+			echo "    entrypoint: []"
+			echo "    command: $(compose_command)"
+		fi
+		cat <<EOF
     user: "${APP_UID}:${APP_GID}"
     read_only: true
     cap_drop: [ALL]
@@ -309,19 +368,30 @@ EOF
       PATH: /app/.airlok/bun/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
 		fi
+		if [[ $APP_STACK == docker && $APP_KIND == web ]]; then
+			cat <<EOF
+    environment:
+      PORT: "${LISTEN_PORT}"
+EOF
+		fi
+		echo "    env_file:"
+		if [[ -f $APP_DIR/shared/defaults.env ]]; then
+			echo "      - path: shared/defaults.env"
+			echo "        required: false"
+		fi
 		cat <<EOF
-    env_file:
       - path: shared/app.env
       - path: shared/user.env
         required: false
       - path: shared/panel.env
         required: false
-    volumes:
-      - ${RELEASE}:/app:ro
 EOF
+		if [[ $APP_STACK != docker ]] || ((UPLOADS_ENABLED || DATA_ENABLED)); then echo "    volumes:"; fi
+		if [[ $APP_STACK != docker ]]; then echo "      - ${RELEASE}:/app:ro"; fi
 		if [[ $APP_STACK == static ]]; then echo "      - ${APP_DIR}/shared/static.conf:/etc/nginx/conf.d/default.conf:ro"; fi
+		if ((DATA_ENABLED)); then echo "      - ${APP_DIR}/shared/data:/data"; fi
 		if ((UPLOADS_ENABLED)); then echo "      - ${APP_DIR}/shared/uploads:/data/uploads"; fi
-		if [[ $APP_KIND == web ]]; then echo "    ports: [\"127.0.0.1:${APP_PORT}:${CONTAINER_PORT}\"]"; fi
+		if [[ $APP_KIND == web ]]; then echo "    ports: [\"127.0.0.1:${APP_PORT}:${LISTEN_PORT}\"]"; fi
 		cat <<EOF
     mem_limit: ${MEMORY_MB}m
     pids_limit: 200
@@ -354,23 +424,37 @@ EOF
 compose() { docker compose -f "$APP_DIR/compose.yml" --project-directory "$APP_DIR" "$@" </dev/null; }
 
 backup_setup() {
-	((DB_ENABLED)) || return 0
+	((DB_ENABLED || DATA_ENABLED)) || return 0
 	step "Бэкапы"
 	write_if_changed /usr/local/sbin/airlok-backup 0755 <<'EOF' || true
 #!/usr/bin/env bash
-# Дамп базы приложения: airlok-backup ИМЯ. Хранит 7 последних копий.
+# Копия данных приложения: airlok-backup ИМЯ — дамп базы и архив постоянной папки /data.
+# Хранит по 7 последних копий каждого.
 set -euo pipefail
 dir=/srv/apps/$1
-out=$dir/shared/backups/$(date +%Y%m%d-%H%M%S).sql.gz
+stamp=$(date +%Y%m%d-%H%M%S)
+compose=(docker compose -f "$dir/compose.yml" --project-directory "$dir")
 umask 077
-docker compose -f "$dir/compose.yml" --project-directory "$dir" exec -T db pg_dump -U app app </dev/null | gzip >"$out.tmp"
-mv "$out.tmp" "$out"
-ls -1t "$dir"/shared/backups/*.sql.gz | tail -n +8 | xargs -r rm -f
+if grep -q '^  db:' "$dir/compose.yml"; then
+	out=$dir/shared/backups/$stamp.sql.gz
+	"${compose[@]}" exec -T db pg_dump -U app app </dev/null | gzip >"$out.tmp"
+	mv "$out.tmp" "$out"
+	ls -1t "$dir"/shared/backups/*.sql.gz | tail -n +8 | xargs -r rm -f
+fi
+if grep -q '/shared/data:/data' "$dir/compose.yml"; then
+	out=$dir/shared/backups/$stamp.data.tar.gz
+	# На время архива приложение замирает: иначе файл SQLite попал бы в копию посреди записи.
+	"${compose[@]}" pause app </dev/null >/dev/null 2>&1 || true
+	trap '"${compose[@]}" unpause app </dev/null >/dev/null 2>&1 || true' EXIT
+	tar -czf "$out.tmp" -C "$dir/shared/data" .
+	mv "$out.tmp" "$out"
+	ls -1t "$dir"/shared/backups/*.data.tar.gz | tail -n +8 | xargs -r rm -f
+fi
 EOF
 	local changed=no
 	write_if_changed /etc/systemd/system/airlok-backup@.service 0644 <<'EOF' && changed=yes
 [Unit]
-Description=Бэкап базы %i
+Description=Копия данных %i
 After=docker.service
 
 [Service]
@@ -379,7 +463,7 @@ ExecStart=/usr/local/sbin/airlok-backup %i
 EOF
 	write_if_changed /etc/systemd/system/airlok-backup@.timer 0644 <<'EOF' && changed=yes
 [Unit]
-Description=Ежедневный бэкап базы %i
+Description=Ежедневная копия данных %i
 
 [Timer]
 OnCalendar=*-*-* 03:30
@@ -391,7 +475,7 @@ WantedBy=timers.target
 EOF
 	[[ $changed == yes ]] && systemctl daemon-reload
 	systemctl enable --now "airlok-backup@${APP_NAME}.timer" >/dev/null 2>&1
-	ok "ежедневный дамп в ${APP_DIR}/shared/backups, хранится 7 копий"
+	ok "ежедневная копия в ${APP_DIR}/shared/backups, хранится 7 копий"
 	note "копии лежат на этом же сервере: если пропадёт сервер, пропадут и они"
 }
 
@@ -428,6 +512,27 @@ wait_healthy() {
 	return 1
 }
 
+# save_compose и restore_compose — откат возвращает прежний compose.yml как есть: новая версия могла
+# собираться иначе, и по её настройкам прежнюю уже не запустить.
+save_compose() { [[ ! -f $APP_DIR/compose.yml ]] || cp -p "$APP_DIR/compose.yml" "$APP_DIR/shared/compose.prev.yml"; }
+restore_compose() { cp -p "$APP_DIR/shared/compose.prev.yml" "$APP_DIR/compose.yml"; }
+
+# listen_port — порт приложения внутри контейнера. Образ из Dockerfile сам решает, где слушать.
+listen_port() {
+	LISTEN_PORT=$CONTAINER_PORT
+	[[ $APP_STACK == docker ]] || return 0
+	LISTEN_PORT=$DOCKER_PORT
+	((LISTEN_PORT)) || LISTEN_PORT=$(docker image inspect -f '{{json .Config}}' "$RUN_IMAGE" | python3 "$RECIPES_DIR/dockerfile.py" guess-port)
+	[[ $APP_KIND == web ]] && note "приложение слушает порт ${LISTEN_PORT}"
+	# Такой том docker создаст сам, и данные в нём не попадут ни в копии, ни в перенос.
+	local volumes
+	volumes=$(docker image inspect -f '{{json .Config.Volumes}}' "$RUN_IMAGE")
+	if ((!DATA_ENABLED)) && [[ $volumes != null ]]; then
+		note "внимание: образ объявляет VOLUME ${volumes}, но эти данные не копируются. Включите capabilities.data и храните их в /data"
+	fi
+	return 0
+}
+
 # release_command ПРЕДЫДУЩИЙ_РЕЛИЗ — run.release из airlok.yml (миграции базы): после бэкапа базы
 # и до запуска новой версии, один раз на сборку, как на хостинге. Повторная выкатка того же
 # собранного релиза её не повторяет. Если команда не прошла, прежняя версия продолжает работать.
@@ -444,7 +549,7 @@ release_command() {
 		# compose.yml уже указывает на новую версию: перезапуск из дашборда поднял бы именно её.
 		if [[ -n $prev ]]; then
 			RELEASE=$prev
-			write_compose
+			restore_compose
 		fi
 		die "команда перед запуском (run.release) не прошла — новая версия не запущена${prev:+, работает прежняя}. Причина в выводе выше"
 	fi
@@ -471,12 +576,14 @@ deploy() {
 	local prev="" log=$APP_DIR/shared/deploy.log
 	[[ -L $APP_DIR/current ]] && prev=$(readlink -f "$APP_DIR/current")
 
-	if ((DB_ENABLED)) && [[ -n $prev ]]; then
-		/usr/local/sbin/airlok-backup "$APP_NAME" || die "бэкап базы перед публикацией не удался, деплой остановлен"
-		ok "бэкап базы перед публикацией"
+	if ((DB_ENABLED || DATA_ENABLED)) && [[ -n $prev ]]; then
+		/usr/local/sbin/airlok-backup "$APP_NAME" || die "копия данных перед публикацией не удалась, деплой остановлен"
+		ok "копия данных перед публикацией"
 	fi
 
 	[[ $APP_STACK == static ]] && static_conf
+	listen_port
+	save_compose
 	write_compose
 	if ((DB_ENABLED)); then
 		compose up -d --wait db >"$log" 2>&1 || die "база не запустилась, лог: ${log}"
@@ -493,7 +600,7 @@ deploy() {
 		if [[ -n $prev && $prev != "$RELEASE" ]]; then
 			RELEASE=$prev
 			[[ $APP_STACK == static ]] && static_conf
-			write_compose
+			restore_compose
 			compose up -d --force-recreate --no-deps app >>"$log" 2>&1 || true
 			ROLLED_BACK=$(basename "$prev")
 			((crashed)) && die "новая версия падает при запуске (причина в логе выше), вернули предыдущую (${ROLLED_BACK})"
@@ -520,7 +627,10 @@ deploy() {
 	for old in $(ls -1dt "$APP_DIR"/releases/*/ | tail -n +$((KEEP_RELEASES + 1))); do
 		[[ ${old%/} == "$(readlink -f "$APP_DIR/current")" ]] && continue
 		rm -rf "$old" "${old%/}.build.log" "${old%/}.built" "${old%/}.health"
+		docker image rm "$(release_image "$(basename "$old")")" >/dev/null 2>&1 || true
 	done
+	# Кэш сборок по Dockerfile быстро занял бы небольшой диск.
+	[[ $APP_STACK != docker ]] || docker builder prune -f --filter until=168h >/dev/null 2>&1 || true
 }
 
 le_enabled() { [[ $(conf_value "$SERVER_CONF" LETSENCRYPT) == 1 ]]; }
@@ -620,10 +730,18 @@ ${uploads_block}
 
     location / {
         proxy_pass http://127.0.0.1:${APP_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$airlok_connection;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        # WebSocket, поток (SSE) и долгий ответ работают сразу. Сервер принадлежит самому
+        # человеку, поэтому 60 секунд, как на хостинге, здесь ограничивать незачем.
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
     }
 }
 EOF
@@ -773,15 +891,22 @@ main() {
 	local src=${1:-}
 	[[ -d $src ]] || die "использование: $0 /путь/к/проекту"
 	src=$(cd "$src" && pwd)
-	load_manifest "$src"
 	# Агент разворачивает под именем из дашборда: в монорепозитории у фронтенда и бэкенда
 	# свои манифесты, но имена приложений на сервере не должны совпасть.
 	if [[ -n ${AIRLOK_APP_NAME:-} ]]; then
 		[[ $AIRLOK_APP_NAME =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "некорректное имя приложения: ${AIRLOK_APP_NAME}"
 		APP_NAME=$AIRLOK_APP_NAME
+	else
+		APP_NAME=$(python3 "$RECIPES_DIR/manifest.py" name "$src")
+		[[ -n $APP_NAME ]] || APP_NAME=$(default_name "$src")
 	fi
-	[[ -n $APP_NAME ]] || APP_NAME=$(default_name "$src")
 	APP_DIR=$APPS_ROOT/$APP_NAME
+	local name=$APP_NAME
+	if [[ -f $APP_DIR/compose.yml ]] && ! grep -q '^    image: airlok-' "$APP_DIR/compose.yml"; then
+		export AIRLOK_KEEP_BUILD=1
+	fi
+	load_manifest "$src"
+	APP_NAME=$name
 	panel_domain
 	if [[ $APP_KIND == web && -z $APP_DOMAIN ]]; then
 		APP_DOMAIN=$(default_domain)

@@ -181,13 +181,18 @@ def route_key(routes, method, path, status):
     return key
 
 
+# Дольше этого идёт не ответ, а поток (SSE): nginx его больше не обрывает через минуту. Как и
+# WebSocket (101), это длительность соединения, и в задержках она была бы ложным всплеском.
+MAX_RESPONSE_SEC = 60
+
+
 def count(m, status, took, limit):
     m["requests"] += 1
     if 400 <= status < 500:
         m["status_4xx"] += 1
     elif status >= 500:
         m["status_5xx"] += 1
-    if len(m["ms"]) < limit:
+    if len(m["ms"]) < limit and status != 101 and took <= MAX_RESPONSE_SEC:
         m["ms"].append(round(took * 1000))
 
 

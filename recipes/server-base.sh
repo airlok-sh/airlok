@@ -55,7 +55,7 @@ apt_install() {
 
 packages() {
 	step "Пакеты и обновления"
-	apt_install пакеты docker.io docker-compose-v2 nginx ufw fail2ban \
+	apt_install пакеты docker.io docker-compose-v2 docker-buildx nginx ufw fail2ban \
 		unattended-upgrades python3-yaml openssl rsync
 	ok "docker, nginx, ufw, fail2ban установлены"
 

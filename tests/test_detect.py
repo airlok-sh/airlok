@@ -11,6 +11,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "recipes"))
 
 from detect import BUN_SETUP, DEFAULT_GO, DEFAULT_NODE, DEFAULT_PYTHON, NPM_INSTALL, DetectError, detect, static_output  # noqa: E402
+from dockerfile import guess_port  # noqa: E402
 from manifest import ManifestError, parse  # noqa: E402
 
 
@@ -169,7 +170,105 @@ class DetectTest(unittest.TestCase):
             static_output(root, "build", True)
 
 
+class DockerfileTest(unittest.TestCase):
+    GO = {"go.mod": "module x\n", "main.go": "package main\n"}
+
+    def setUp(self):
+        os.environ.pop("AIRLOK_KEEP_BUILD", None)
+        self.addCleanup(os.environ.pop, "AIRLOK_KEEP_BUILD", None)
+
+    def test_dockerfile_wins_over_files(self):
+        values = parse(None, project({**self.GO, "Dockerfile": "FROM scratch\n"}))
+        self.assertEqual((values["APP_STACK"], values["APP_KIND"], values["DOCKER_FILE"], values["DOCKER_CONTEXT"]),
+                         ("docker", "web", "Dockerfile", ""))
+
+    def test_explicit_stack_cancels_dockerfile(self):
+        values = parse({"version": 1, "app": {"stack": "go"}}, project({**self.GO, "Dockerfile": "FROM scratch\n"}))
+        self.assertEqual(values["APP_STACK"], "go")
+
+    def test_running_app_keeps_its_build(self):
+        os.environ["AIRLOK_KEEP_BUILD"] = "1"
+        root = project({**self.GO, "Dockerfile": "FROM scratch\n"})
+        self.assertEqual(parse(None, root)["APP_STACK"], "go", "Dockerfile мог лежать в проекте давно и не быть рабочим")
+        values = parse({"version": 1, "build": {"dockerfile": "Dockerfile"}}, root)
+        self.assertEqual(values["APP_STACK"], "docker", "явная просьба важнее")
+        self.assertEqual(parse({"version": 1, "app": {"stack": "docker"}}, root)["APP_STACK"], "docker")
+
+    def test_stack_docker_needs_dockerfile(self):
+        with self.assertRaisesRegex(ManifestError, "нет Dockerfile"):
+            parse({"version": 1, "app": {"stack": "docker"}}, project(self.GO))
+        with self.assertRaisesRegex(ManifestError, "нет файла docker/x"):
+            parse({"version": 1, "build": {"dockerfile": "docker/x"}}, project(self.GO))
+        with self.assertRaisesRegex(ManifestError, "путь внутри проекта"):
+            parse({"version": 1, "build": {"dockerfile": "../x"}}, project({**self.GO, "Dockerfile": "FROM scratch\n"}))
+
+    def test_compose_service(self):
+        compose = """
+services:
+  bot:
+    build:
+      context: ./srv
+      dockerfile: docker/App
+      target: prod
+      args: {FLAVOR: full, FROM_ENV: "${FROM_ENV}"}
+    ports: ["127.0.0.1:9000:3000"]
+    environment:
+      DATABASE_URL: postgres://x
+      REQUIRED_KEY: ${REQUIRED_KEY:?нужен ключ}
+      LOG_LEVEL: info
+      WITH_DEFAULT: ${WITH_DEFAULT:-yes}
+      OTHER: ${SOMETHING}
+  db: {image: "postgres:16"}
+  cache: {image: "redis:7"}
+"""
+        values = parse(None, project({"compose.yml": compose, "srv/docker/App": "FROM scratch\n", "srv/x": "1"}))
+        self.assertEqual((values["DOCKER_CONTEXT"], values["DOCKER_FILE"], values["DOCKER_TARGET"], values["DOCKER_PORT"]),
+                         ("srv", "srv/docker/App", "prod", 3000))
+        self.assertEqual(values["DB_ENABLED"], 1, "Postgres из compose.yml — это база приложения")
+        self.assertEqual(values["DOCKER_ARGS"], "FLAVOR=full", "значение из окружения в манифесте неизвестно")
+        self.assertEqual(values["DOCKER_DEFAULTS"], "LOG_LEVEL=info\nWITH_DEFAULT=yes")
+        self.assertIn("REQUIRED_KEY", values["ENV_NAMES"].split())
+        self.assertNotIn("DATABASE_URL", values["ENV_NAMES"].split())
+        self.assertIn("cache", values["DOCKER_WARNINGS"])
+
+    def test_compose_with_two_builds(self):
+        compose = "services:\n  a: {build: ./a}\n  b: {build: ./b}\n"
+        with self.assertRaisesRegex(ManifestError, "несколько собираемых сервисов"):
+            parse(None, project({"compose.yml": compose, "a/Dockerfile": "FROM scratch\n", "b/Dockerfile": "FROM scratch\n"}))
+        same = "services:\n  migrate: {build: .}\n  web: {build: ., ports: ['8000:8000']}\n"
+        values = parse(None, project({"compose.yml": same, "Dockerfile": "FROM scratch\n"}))
+        self.assertEqual(values["DOCKER_PORT"], 8000, "одна сборка у двух сервисов: берём сервис с портом")
+
+    def test_compose_outside_project(self):
+        for build in ("../x", "/etc", "https://github.com/a/b.git"):
+            with self.assertRaises(ManifestError, msg=build):
+                parse(None, project({"compose.yml": f"services:\n  a: {{build: '{build}'}}\n", "Dockerfile": "FROM scratch\n"}))
+
+    def test_broken_compose_is_skipped(self):
+        values = parse(None, project({"compose.yml": "services: [\n", **self.GO}))
+        self.assertEqual(values["APP_STACK"], "go")
+
+    def test_run_port(self):
+        values = parse({"version": 1, "run": {"port": 5000}}, project({"Dockerfile": "FROM scratch\n"}))
+        self.assertEqual(values["DOCKER_PORT"], 5000)
+
+    def test_guess_port(self):
+        cases = [({"ExposedPorts": {"3000/tcp": {}}}, 3000), ({"ExposedPorts": {"53/udp": {}}}, 8080),
+                 ({"Cmd": ["uvicorn", "app:app"]}, 8000), ({"Cmd": ["uvicorn", "app:app", "--port", "9000"]}, 9000),
+                 ({"Entrypoint": ["gunicorn", "--bind", "0.0.0.0:7000"]}, 7000), ({}, 8080),
+                 ({"ExposedPorts": {"80/tcp": {}, "443/tcp": {}}}, 80)]
+        for config, want in cases:
+            self.assertEqual(guess_port(config), want, config)
+
+
 class ManifestTest(unittest.TestCase):
+    def test_data_folder(self):
+        values = parse({"version": 1, "capabilities": {"data": {"enabled": True}}}, project({"go.mod": "module x\n", "main.go": "package main\n"}))
+        self.assertEqual(values["DATA_ENABLED"], 1)
+        self.assertEqual(parse(None, project({"go.mod": "module x\n", "main.go": "package main\n"}))["DATA_ENABLED"], 0)
+        with self.assertRaisesRegex(ManifestError, "у статического сайта"):
+            parse({"version": 1, "capabilities": {"data": {"enabled": True}}}, project({"index.html": "<html>"}))
+
     def test_without_manifest(self):
         values = parse(None, project({"requirements.txt": "flask\n", "app.py": "app = Flask(__name__)\n"}))
         self.assertEqual(values["APP_STACK"], "python")

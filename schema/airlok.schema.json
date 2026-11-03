@@ -24,7 +24,7 @@
         },
         "stack": {
           "enum": ["static", "nextjs", "node", "python", "go", "php", "docker"],
-          "description": "Стек, если он определился по файлам не так. php (Laravel, Symfony, обычный PHP) и docker — сборка по Dockerfile — только на хостинге."
+          "description": "Стек, если он определился по файлам не так. docker — сборка по Dockerfile. php (Laravel, Symfony, обычный PHP) — только на хостинге."
         },
         "type": {
           "enum": ["web", "worker"],
@@ -39,7 +39,7 @@
       "properties": {
         "command": { "$ref": "#/definitions/command", "description": "Команда сборки вместо определённой по стеку, например npm run build:prod." },
         "output": { "type": "string", "pattern": "^/?[A-Za-z0-9_.][A-Za-z0-9_./-]*/?$", "description": "Каталог готового статического сайта внутри проекта, например dist." },
-        "dockerfile": { "type": "string", "pattern": "^(\\./)?[A-Za-z0-9_][A-Za-z0-9_./-]*$", "description": "Только на хостинге: по какому Dockerfile собирать, например docker/Dockerfile.prod." }
+        "dockerfile": { "type": "string", "pattern": "^(\\./)?[A-Za-z0-9_][A-Za-z0-9_./-]*$", "description": "По какому Dockerfile собирать, например docker/Dockerfile.prod. На своём сервере так приложение, которое уже собиралось по файлам, переходит на сборку по Dockerfile." }
       }
     },
     "run": {
@@ -75,6 +75,13 @@
           "additionalProperties": false,
           "properties": {
             "enabled": { "type": "boolean", "description": "PostgreSQL для приложения: адрес — в переменной DATABASE_URL." }
+          }
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "description": "Только для своего сервера: постоянная папка /data, путь — в переменной DATA_DIR. Для файлов, которые нельзя перенести в PostgreSQL, например SQLite. На хостинге публикация остановится." }
           }
         },
         "uploads": {

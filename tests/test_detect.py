@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "recipes"))
 
-from detect import BUN_SETUP, DEFAULT_GO, DEFAULT_NODE, DEFAULT_PYTHON, NPM_INSTALL, DetectError, detect, static_output  # noqa: E402
+from detect import BUN_SETUP, DEFAULT_GO, DEFAULT_NODE, DEFAULT_PYTHON, NPM_INSTALL, DetectError, detect, shell_exec, static_output  # noqa: E402
 from dockerfile import guess_port  # noqa: E402
 from manifest import ManifestError, parse  # noqa: E402
 
@@ -39,10 +39,10 @@ class DetectTest(unittest.TestCase):
         self.check({"package.json": '{"dependencies":{"next":"15"},"engines":{"node":">=24"}}'},
                    stack="nextjs", node="24", build="npm run build")
         self.check({"package.json": '{"scripts":{"start":"node server.js"},"dependencies":{"express":"5"}}'},
-                   stack="node", framework="Express", node=DEFAULT_NODE, start="npm start", kind="web")
+                   stack="node", framework="Express", node=DEFAULT_NODE, start="node server.js", kind="web")
         self.check({"package.json": '{"scripts":{"build":"nest build","start":"nest start","start:prod":"node dist/main"},'
                                     '"dependencies":{"@nestjs/core":"11"}}'},
-                   framework="NestJS", build="npm run build", start="npm run start:prod")
+                   framework="NestJS", build="npm run build", start="node dist/main")
         self.check({"package.json": '{"main":"bot.js","dependencies":{"telegraf":"4"}}', "bot.js": ""},
                    stack="node", kind="worker", start="node bot.js")
 
@@ -109,7 +109,7 @@ class DetectTest(unittest.TestCase):
                    stack="static", framework="Nuxt", output=".output/public")
         self.check({"package.json": '{"scripts":{"build":"vite build","start":"node .output/server/index.mjs"},'
                                     '"dependencies":{"@tanstack/react-start":"1"}}'},
-                   stack="node", framework="TanStack Start", start="npm start")
+                   stack="node", framework="TanStack Start", start="node .output/server/index.mjs")
         self.check({"package.json": '{"scripts":{"build":"vite build"},"dependencies":{"@tanstack/react-start":"1","nitro":"3"}}'},
                    stack="node", framework="TanStack Start", start="node .output/server/index.mjs")
         self.check({"package.json": '{"scripts":{"build":"react-router build"},"devDependencies":{"@react-router/dev":"7"}}',
@@ -141,7 +141,7 @@ class DetectTest(unittest.TestCase):
         self.check({"bun.lock": "{}", "index.ts": "", "package.json": "{}"}, stack="node", start="bun run index.ts")
         self.check({"src/index.ts": "", "package.json": '{"dependencies":{"elysia":"1"}}'},
                    framework="Elysia", start="bun run src/index.ts", install=BUN_SETUP + " && bun install")
-        self.check({"package.json": '{"scripts":{"start":"bun run server.ts"}}'}, bun=True, start="npm start")
+        self.check({"package.json": '{"scripts":{"start":"bun run server.ts"}}'}, bun=True, start="bun run server.ts")
         self.check({"package.json": '{"scripts":{"start":"node bun/server.js"}}'}, bun=False)
 
     def test_errors(self):
@@ -283,7 +283,7 @@ class ManifestTest(unittest.TestCase):
                         "run": {"command": "node dist/server.js"}, "runtime": {"node": "20"}},
                        project({"package.json": "{}"}))
         self.assertEqual((values["APP_DOMAIN"], values["RUN_CMD"], values["NODE_VERSION"]),
-                         ("shop.example.ru", "node dist/server.js", "20"))
+                         ("shop.example.ru", "exec node dist/server.js", "20"))
 
     def test_env_from_example(self):
         # Как .env.example у PonchesDev/favicon-uploader; правила те же, что у сборщика хостинга.
@@ -351,6 +351,55 @@ class ManifestTest(unittest.TestCase):
                      {"version": 1, "capabilities": {"database": {"enabled": True}}}):
             with self.assertRaises(ManifestError, msg=data):
                 parse(data, root)
+
+
+class ShellExecTest(unittest.TestCase):
+    def test_simple_commands(self):
+        for command, want in {
+            "node server.js": "exec node server.js",
+            "/app/server": "exec /app/server",
+            "./bin/run --x=1": "exec ./bin/run --x=1",
+            "npm start": "exec npm start",
+            "  node server.js": "  exec node server.js",
+            "PROTOCOL_HEADER=x-forwarded-proto node build": "PROTOCOL_HEADER=x-forwarded-proto exec node build",
+            """A=1 B="x y" C='p;q' node build""": """A=1 B="x y" C='p;q' exec node build""",
+            "FOO=$BAR node build": "FOO=$BAR exec node build",
+            "uvicorn main:app --forwarded-allow-ips '*'": "exec uvicorn main:app --forwarded-allow-ips '*'",
+            "streamlit run app.py --server.port ${PORT:-1}": "exec streamlit run app.py --server.port ${PORT:-1}",
+            'node -e "a(); b && c | d"': 'exec node -e "a(); b && c | d"',
+            "node x\\;y": "exec node x\\;y",
+            "node server.js 2>&1": "exec node server.js 2>&1",
+            "node server.js > /tmp/log": "exec node server.js > /tmp/log",
+        }.items():
+            self.assertEqual(shell_exec(command), want, command)
+
+    def test_left_as_is(self):
+        for command in (
+            "", "   ", "FOO=1", "FOO=1 BAR=2 ",
+            "exec node server.js", "FOO=1 exec node server.js",
+            "a && b", "a || b", "a; b", "a | b", "a &", "(a)", "{ a; }", "a\nb",
+            "mkdir -p x && exec frankenphp php-server",
+            "node $(cat file)", "node `cat file`", 'node "$(cat file)"', "FOO=$(cat f) node x",
+            'node "unclosed', "node 'unclosed", "$BIN --flag", '"my app" --flag',
+            "2>&1 node x", "> log node x", "a &> log",
+            "cd sub", ". ./env", "export A=1", "ulimit -n 100", "time node x", "if", "! a", "[[ a ]]",
+        ):
+            self.assertIsNone(shell_exec(command), command)
+
+    def test_start_script(self):
+        pkg = lambda scripts: '{"scripts":{%s}}' % scripts  # noqa: E731
+        for files, want in (
+            ({"package.json": pkg('"start":"node server.js"')}, "node server.js"),
+            ({"package.json": pkg('"start":"NODE_OPTIONS=--max-old-space-size=256 node server.js"')},
+             "NODE_OPTIONS=--max-old-space-size=256 node server.js"),
+            ({"package.json": pkg('"start":"prisma migrate deploy && node server.js"')}, "npm start"),
+            ({"package.json": pkg('"prestart":"node gen.js","start":"node server.js"')}, "npm start"),
+            ({"package.json": pkg('"poststart":"node gen.js","start":"node server.js"')}, "npm start"),
+            ({"package.json": pkg('"start":"node server.js --v=$npm_package_version"')}, "npm start"),
+            ({"package.json": pkg('"start":"node server.js"'), "server.js": "console.log(process.env.npm_package_version)\n"}, "npm start"),
+            ({"package.json": pkg('"start":"node server.js"'), "node_modules/x/i.js": "process.env.npm_package_version\n"}, "node server.js"),
+        ):
+            self.assertEqual(detect(project(files))["start"], want, files)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,19 @@ BUN_SETUP = f"npm install --no-audit --no-fund --prefix .airlok/bun bun@1 && exp
 # Сервер, который собирает Nitro (Nuxt, TanStack Start).
 NITRO_SERVER = "node .output/server/index.mjs"
 
+# Первые слова, перед которыми exec не поставить: синтаксис и встроенные команды оболочки.
+SHELL_KEYWORDS = frozenset((
+    "!", "{", "[[", ".", ":", "alias", "bg", "break", "case", "cd", "command", "continue", "eval", "exec", "exit", "export", "fg", "for",
+    "function", "getopts", "hash", "if", "jobs", "local", "read", "readonly", "return", "select", "set", "shift", "source", "time", "times",
+    "trap", "type", "ulimit", "umask", "unalias", "unset", "until", "wait", "while",
+))
+SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+SHELL_PROGRAM = re.compile(r"[\w./+@%:~-]+", re.ASCII)
+NPM_VARIABLE = re.compile(r"npm_(package|lifecycle|config)_")
+SOURCE_DIRS_SKIPPED = {"node_modules", ".git", ".venv", "venv", "__pycache__", "vendor", ".next", "dist", "build", ".airlok"}
+SOURCE_EXTS = {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"}
+MAX_SOURCE_SIZE = 256 << 10
+
 # Статические сайты: зависимость сборщика → куда он кладёт готовый сайт.
 STATIC_BUILDERS = [
     ("astro", "dist", "Astro"),
@@ -272,6 +285,75 @@ def plan_static(root, pkg, build_command, build_output, plan):
     return plan
 
 
+def shell_words(command):
+    """Где начинаются слова команды. None — в ней несколько процессов, подстановка команды или
+    незакрытая кавычка. Перенаправления ввода-вывода такой команде не мешают."""
+    starts, quote, in_word, i = [], "", False, 0
+    while i < len(command):
+        ch = command[i]
+        if quote == "'":
+            quote = "" if ch == "'" else quote
+        elif ch == "`" or command.startswith("$(", i):
+            return None
+        elif ch == "\\":
+            if not in_word:
+                starts.append(i)
+                in_word = True
+            i += 1
+        elif quote == '"':
+            quote = "" if ch == '"' else quote
+        elif ch in ";|()\n\r" or ch == "&" and command[i - 1 : i] not in (">", "<"):
+            return None
+        elif ch in " \t":
+            in_word = False
+        else:
+            if ch in "'\"":
+                quote = ch
+            if not in_word:
+                starts.append(i)
+                in_word = True
+        i += 1
+    return None if quote else starts
+
+
+def shell_exec(command):
+    """Та же команда с exec перед программой: иначе главным процессом останется sh, и приложение
+    не получит SIGTERM. Переменные впереди остаются: FOO=1 exec node передаёт их программе в dash,
+    bash и busybox. None — exec сюда не поставить."""
+    starts = shell_words(command)
+    for i, start in enumerate(starts or []):
+        word = command[start : starts[i + 1] if i + 1 < len(starts) else None].rstrip(" \t")
+        if SHELL_ASSIGNMENT.match(word):
+            continue
+        if not SHELL_PROGRAM.fullmatch(word) or word in SHELL_KEYWORDS:
+            return None
+        return command[:start] + "exec " + command[start:]
+    return None
+
+
+def mentions_npm_variable(root):
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SOURCE_DIRS_SKIPPED]
+        for name in files:
+            path = os.path.join(folder, name)
+            if os.path.splitext(name)[1] not in SOURCE_EXTS or os.path.islink(path) or os.path.getsize(path) > MAX_SOURCE_SIZE:
+                continue
+            with open(path, errors="replace") as f:
+                if NPM_VARIABLE.search(f.read()):
+                    return True
+    return False
+
+
+def start_script(root, pkg, name, via_npm):
+    """Чем запустить скрипт package.json: им самим, если он простой. npm завершается по SIGTERM, не
+    дождавшись приложения. npm остаётся, если нужны его хуки или переменные, которые задаёт только он."""
+    script = pkg.scripts[name].strip()
+    hooks = "pre" + name in pkg.scripts or "post" + name in pkg.scripts
+    if hooks or not shell_exec(script) or NPM_VARIABLE.search(script) or mentions_npm_variable(root):
+        return via_npm
+    return script
+
+
 def plan_node(root, pkg, build_command, run_command, plan):
     if pkg is None:
         raise DetectError("для Node-приложения нужен package.json")
@@ -286,9 +368,9 @@ def plan_node(root, pkg, build_command, run_command, plan):
             start = app_start
         elif pkg.scripts.get("start:prod"):
             # NestJS: start — через CLI из devDependencies, а нужен собранный код.
-            start = "npm run start:prod"
+            start = start_script(root, pkg, "start:prod", "npm run start:prod")
         elif pkg.scripts.get("start"):
-            start = "npm start"
+            start = start_script(root, pkg, "start", "npm start")
         elif plan["bun"] and bun_entry(root, pkg):
             start = "bun run " + bun_entry(root, pkg)
         elif pkg.main and exists(root, pkg.main):

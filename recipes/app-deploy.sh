@@ -337,6 +337,9 @@ EOF
 		if [[ $APP_STACK != docker ]]; then
 			echo "    working_dir: /app"
 			echo "    command: $(compose_command)"
+			# Приложение без обработчика SIGTERM с PID 1 сигнал не замечает, и сайт лежал бы все
+			# 10 секунд до SIGKILL. В образах из Dockerfile PID 1 может быть нужен им самим.
+			if command -v docker-init >/dev/null; then echo "    init: true"; fi
 		elif [[ -n $RUN_CMD ]]; then
 			echo "    entrypoint: []"
 			echo "    command: $(compose_command)"
@@ -362,10 +365,13 @@ EOF
       GRADIO_SERVER_PORT: "${CONTAINER_PORT}"
 EOF
 		fi
-		if [[ $APP_STACK == node ]] && ((APP_BUN)); then
+		if [[ $APP_STACK == node ]]; then
+			# node_modules/.bin — как у npm: скрипт из package.json запускается без него.
+			local bun_path=""
+			((APP_BUN)) && bun_path=/app/.airlok/bun/node_modules/.bin:
 			cat <<EOF
     environment:
-      PATH: /app/.airlok/bun/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PATH: ${bun_path}/app/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
 		fi
 		if [[ $APP_STACK == docker && $APP_KIND == web ]]; then

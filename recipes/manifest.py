@@ -17,7 +17,7 @@ import sys
 import yaml
 
 from cron import CronError, parse_jobs
-from detect import STACKS, DetectError, detect, subprojects
+from detect import STACKS, DetectError, detect, shell_exec, subprojects
 from dockerfile import DockerfileError, find_source
 
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
@@ -269,7 +269,7 @@ def parse(data, root):
         "BUILD_INSTALL": plan["install"],
         "BUILD_CMD": plan["build"],
         "BUILD_OUTPUT": plan["output"],
-        "RUN_CMD": plan["start"],
+        "RUN_CMD": shell_exec(plan["start"]) or plan["start"],
         "RELEASE_CMD": release,
         "CRON_JOBS": json.dumps(cron, ensure_ascii=False),
         "HEALTH_PATH": health,

@@ -734,7 +734,11 @@ ${tls_listen}
     include snippets/airlok-webhook*.conf;
 ${uploads_block}
 
+    # Сниппет замера скорости пишет speed.py, когда замер включён в дашборде; [f] делает путь
+    # шаблоном, и без файла include ничего не добавляет. Ту же строку speed.py дописывает в
+    # сайты, опубликованные раньше.
     location / {
+        include snippets/airlok-speed.${APP_NAME}.con[f];
         proxy_pass http://127.0.0.1:${APP_PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;

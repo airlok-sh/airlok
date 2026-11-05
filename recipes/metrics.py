@@ -17,6 +17,10 @@ lib.sh: «$msec $status $request_time $body_bytes_sent $request_method $uri
 (формат airlok_visit, JSON): те же правила, что у edge хостинга (internal/edge/visits.go в
 backend). IP и браузер превращаются в хэш с солью московских суток, страна — по базе из
 дашборда (internal/geoip). Прочитанный лог посещений сразу стирается: IP на сервере не копятся.
+
+Замеры скорости у посетителей (Web Vitals) — из третьего лога, маячков скрипта: см. speed.py.
+Какие приложения замерять, дашборд отвечает на отправку метрик, поэтому она идёт каждую минуту,
+даже если отправлять нечего.
 """
 import calendar
 import fcntl
@@ -33,6 +37,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import speed  # noqa: E402
 
 LOG_GLOB = "/var/log/nginx/airlok-*.access.log"
 LOG_NAME = re.compile(r"^airlok-([a-z][a-z0-9-]{1,30})\.access\.log$")
@@ -81,6 +88,9 @@ MAX_PAGE_LEN, MAX_SOURCE_LEN = 200, 100
 VISIT_OTHER = "<other>"
 MSK = 3 * 3600
 GEOIP_EVERY = 86400
+# Маячков больше, чем пишется за минуту при лимите nginx, — поток со многих адресов: такой лог
+# не читаем, а стираем.
+MAX_SPEED_READ = 4 << 20
 BOT = re.compile(
     r"bot|crawl|spider|slurp|preview|scan|monitor|uptime|lighthouse|headless|phantom|facebookexternalhit|whatsapp|"
     r"vkshare|yandex|curl|wget|python|go-http|java/|okhttp|axios|node-fetch|httpclient|libwww|ahrefs|semrush",
@@ -423,15 +433,28 @@ def add_visit(minutes, line, app, salts, geo):
     vs["countries"][country] = vs["countries"].get(country, 0) + 1
 
 
-def read_visits(path, s, minutes, app, salts, geo):
-    """Дочитывает лог посещений и стирает прочитанное, если nginx за это время ничего не дописал."""
+def add_beacon(minutes, line):
+    b = speed.parse_line(line, BOT.search)
+    if b is None:
+        return
+    ts, page, dev, values = b
+    m = minutes.setdefault(str(int(ts) // 60 * 60), new_minute())
+    speed.add(m.setdefault("speed", speed.new_minute()), page, dev, values)
+
+
+def read_drained(path, s, key, minutes, add, limit=None):
+    """Дочитывает лог посещений или маячков и стирает прочитанное, если nginx за это время
+    ничего не дописал. Лог больше limit стирается непрочитанным."""
     try:
         st = os.stat(path)
     except OSError:
         return
-    inode, offset = s.get("visits_inode"), s.get("visits_offset", 0)
-    add = lambda mins, line: add_visit(mins, line, app, salts, geo)  # noqa: E731
+    inode, offset = s.get(key + "_inode"), s.get(key + "_offset", 0)
     try:
+        if limit is not None and st.st_size - offset > limit:
+            os.truncate(path, 0)
+            s[key + "_inode"], s[key + "_offset"] = st.st_ino, 0
+            return
         if inode is not None and inode != st.st_ino:
             rotated = path + ".1"
             if os.path.exists(rotated) and os.stat(rotated).st_ino == inode:
@@ -445,7 +468,7 @@ def read_visits(path, s, minutes, app, salts, geo):
             offset = 0
     except OSError:
         return
-    s["visits_inode"], s["visits_offset"] = st.st_ino, offset
+    s[key + "_inode"], s[key + "_offset"] = st.st_ino, offset
 
 
 def visits_bucket(vs):
@@ -501,14 +524,16 @@ def collect(state, now, salts=None, geo=None):
         except OSError:
             continue
         s["inode"], s["offset"] = st.st_ino, offset
-        read_visits(path[:-len(".access.log")] + ".visits.log", s, minutes, app, salts, geo)
+        base = path[:-len(".access.log")]
+        read_drained(base + ".visits.log", s, "visits", minutes, lambda mins, line: add_visit(mins, line, app, salts, geo))
+        read_drained(base + ".speed.log", s, "speed", minutes, add_beacon, MAX_SPEED_READ)
         last = s.get("last_sent", 0)
         still_open = {}
         for key, m in minutes.items():
             minute = int(key)
             if minute >= current:
                 still_open[key] = m
-            elif minute > last and m["requests"] > 0:
+            elif minute > last and (m["requests"] > 0 or m.get("speed", {}).get("samples")):
                 ms = sorted(m["ms"])
                 routes = []
                 for key, r in m.get("routes", {}).items():
@@ -532,6 +557,8 @@ def collect(state, now, salts=None, geo=None):
                 }
                 if m.get("visits", {}).get("views"):
                     bucket["visits"] = visits_bucket(m["visits"])
+                if m.get("speed", {}).get("samples"):
+                    bucket["speed"] = speed.buckets(m["speed"])
                 done.append(bucket)
                 s["last_sent"] = max(s.get("last_sent", 0), minute)
             # Запоздавшие строки уже отправленной минуты отбрасываем: повтор минуты
@@ -544,10 +571,11 @@ def collect(state, now, salts=None, geo=None):
 
 
 def send(buckets):
+    """Код ответа дашборда и тело; код None — дашборд не настроен, 0 — недоступен."""
     url = conf_value(DASHBOARD_CONF, "AIRLOK_API_URL").rstrip("/")
     token = conf_value(DASHBOARD_CONF, "AIRLOK_AGENT_TOKEN")
     if not url or not token:
-        return None
+        return None, b""
     req = urllib.request.Request(
         url + "/agent/v1/metrics",
         data=json.dumps({"buckets": buckets}).encode(),
@@ -556,11 +584,22 @@ def send(buckets):
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status
+            return resp.status, resp.read(1 << 20)
     except urllib.error.HTTPError as e:
-        return e.code
+        return e.code, b""
     except (urllib.error.URLError, OSError):
-        return 0
+        return 0, b""
+
+
+def speed_apps(body):
+    """Приложения с замером скорости из ответа дашборда; None — дашборд о замере не знает."""
+    try:
+        apps = json.loads(body).get("speed")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(apps, list):
+        return None
+    return {a for a in apps if isinstance(a, str) and LOG_NAME.match("airlok-%s.access.log" % a)}
 
 
 def next_batch(pending):
@@ -603,19 +642,29 @@ def main():
         save_json(STATE_FILE, state)
         if not os.path.exists(DASHBOARD_CONF):
             return
-        while pending:
+        apps = None
+        # Пустая отправка тоже нужна: в ответе — у каких приложений включён замер скорости.
+        while True:
             n = next_batch(pending)
-            code = send(pending[:n])
+            code, body = send(pending[:n])
             if code is None:
                 break
+            if 200 <= code < 300:
+                apps = speed_apps(body)
             if 200 <= code < 300 or code in (400, 413):
                 # 400/413 — дашборд отверг сами данные: повтор не поможет, а очередь вставать не должна.
                 if code in (400, 413):
                     print("дашборд не принял метрики (код %d), пачка отброшена" % code, file=sys.stderr)
                 pending = pending[n:]
                 save_json(PENDING_FILE, pending)
-                continue
+                if pending:
+                    continue
             break
+        if apps is not None:
+            try:
+                speed.apply(apps)
+            except OSError as e:
+                print("speed: не удалось настроить nginx для замера скорости: %s" % e, file=sys.stderr)
 
 
 if __name__ == "__main__":

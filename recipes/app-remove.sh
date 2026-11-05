@@ -61,7 +61,7 @@ remove_site() {
 		[[ -f $conf ]] && domain=$(awk '$1=="server_name"{gsub(";", "", $2); print $2; exit}' "$conf") && break
 	done
 	if [[ -e $enabled || -L $enabled || -e $available ]]; then
-		rm -f "$enabled" "$available"
+		rm -f "$enabled" "$available" "/etc/nginx/snippets/airlok-speed.${NAME}.conf" "/var/log/nginx/airlok-${NAME}.speed.log"
 		nginx -t -q || die "nginx не принял конфиг без сайта ${NAME}: сайт снят с диска, но nginx его ещё отдаёт — исправьте ошибку из nginx -t и перезагрузите nginx"
 		systemctl reload nginx
 		ok "сайт ${domain:-$NAME} снят"

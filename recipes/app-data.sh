@@ -116,8 +116,10 @@ load_dump() {
 		printf 'SET client_min_messages = warning;\nBEGIN;\n'
 		wipe_sql
 		# Дамп с хостинга сделан pg_dump 17: настройки transaction_timeout 16-й Postgres не знает, а
-		# \restrict — psql из старого образа postgres:16, который мог остаться на сервере.
-		gunzip -c "$1" | grep -v -e '^SET transaction_timeout' -e '^\\restrict ' -e '^\\unrestrict ' &&
+		# \restrict — psql из старого образа postgres:16, который мог остаться на сервере. Свой COMMIT дампа
+		# после больших объектов зафиксировал бы загрузку до индексов и ограничений.
+		gunzip -c "$1" | grep -v -e '^SET transaction_timeout' -e '^\\restrict ' -e '^\\unrestrict ' |
+			sed '/^SELECT pg_catalog\.lo_close(/{n;n;/^COMMIT;$/d}' &&
 			printf 'COMMIT;\n'
 	} | psql_in >/dev/null
 }

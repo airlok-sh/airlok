@@ -93,6 +93,35 @@ export_data() {
 	printf 'Готово: данные выгружены, приложение остановлено — дальше оно работает на новом месте\n'
 }
 
+# wipe_sql очищает базу перед загрузкой: дамп создаёт заново всё. Схемы — все, а не только public:
+# например, Drizzle держит миграции в схеме drizzle. Большие объекты не лежат ни в какой схеме.
+wipe_sql() {
+	cat <<'SQL'
+DO $$
+DECLARE s name;
+BEGIN
+	FOR s IN SELECT nspname FROM pg_namespace WHERE nspname !~ '^pg_' AND nspname <> 'information_schema' LOOP
+		EXECUTE format('DROP SCHEMA %I CASCADE', s);
+	END LOOP;
+	PERFORM lo_unlink(oid) FROM pg_largeobject_metadata;
+END $$;
+CREATE SCHEMA public;
+SQL
+}
+
+# load_dump ФАЙЛ — заменить базу дампом. Одна транзакция: если дамп не загрузится или оборвётся, база
+# останется прежней. Без COMMIT psql на конце входа откатит её сам.
+load_dump() {
+	{
+		printf 'SET client_min_messages = warning;\nBEGIN;\n'
+		wipe_sql
+		# Дамп с хостинга сделан pg_dump 17: настройки transaction_timeout 16-й Postgres не знает, а
+		# \restrict — psql из старого образа postgres:16, который мог остаться на сервере.
+		gunzip -c "$1" | grep -v -e '^SET transaction_timeout' -e '^\\restrict ' -e '^\\unrestrict ' &&
+			printf 'COMMIT;\n'
+	} | psql_in >/dev/null
+}
+
 import_data() {
 	local uploads=$APP_DIR/shared/uploads
 	if [[ -n ${AIRLOK_DATA_URL:-} ]] && ! has_data; then
@@ -108,11 +137,7 @@ import_data() {
 	if [[ -n ${AIRLOK_DB_URL:-} ]]; then
 		step "Загрузка базы"
 		get "$AIRLOK_DB_URL" "$WORK/db.sql.gz"
-		compose exec -T db psql -U app -d app -q -v ON_ERROR_STOP=1 -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;' >/dev/null
-		# Дамп с хостинга сделан pg_dump 17: настройки transaction_timeout 16-й Postgres не знает, а
-		# \restrict — psql из старого образа postgres:16, который мог остаться на сервере.
-		gunzip -c "$WORK/db.sql.gz" | grep -v -e '^SET transaction_timeout' -e '^\\restrict ' -e '^\\unrestrict ' |
-			psql_in >/dev/null || die "дамп базы не загрузился"
+		load_dump "$WORK/db.sql.gz" || die "дамп базы не загрузился, база осталась прежней"
 		ok "база заменена данными из хранилища"
 	fi
 	if [[ -n ${AIRLOK_FILES_URL:-} ]]; then

@@ -1,13 +1,40 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { gunzipSync } from 'node:zlib'
 
-import { appLimitText, duration, logUpdate, main, stageUpdates, suggestName } from '../src/main.js'
+import { ApiError } from '../src/api.js'
+import { agentToken, appLimitText, duration, errorText, logUpdate, main, projectFiles, stageUpdates, suggestName } from '../src/main.js'
 import { untar } from './untar.js'
+
+test('errorText explains what a token from the dashboard cannot do', () => {
+  const text = errorText(new ApiError(403, 'cli_login_required', 'this action needs a CLI login'))
+  assert.match(text, /npx @airlok\/cli login/)
+  assert.match(text, /AIRLOK_TOKEN/)
+})
+
+test('agentToken gives AI agents their own token, not the CLI login', async () => {
+  const io = captureIO()
+  const fake = (result) => ({
+    token: 'airlok_pat_login',
+    createAgentToken: async (client) => {
+      if (result instanceof Error) throw result
+      return { name: `ИИ-агенты ${client}`, token: result }
+    },
+  })
+  assert.equal(await agentToken(fake('airlok_pat_agents'), 'mac', io), 'airlok_pat_agents')
+  assert.equal(await agentToken(fake(new ApiError(403, 'cli_login_required', 'нет')), 'mac', io), 'airlok_pat_login',
+    'AIRLOK_TOKEN уже токен для агентов — его и пишем')
+  assert.deepEqual(io.errLines, [])
+  assert.equal(await agentToken(fake(new ApiError(404, 'not_found', 'нет')), 'mac', io), 'airlok_pat_login', 'старый дашборд')
+  assert.match(io.errLines.join('\n'), /записываю им вход CLI/)
+  await assert.rejects(agentToken(fake(new ApiError(0, 'network', 'нет связи')), 'mac', io), /нет связи/)
+})
 
 test('duration reads like the dashboard', () => {
   assert.equal(duration(0.3), '<1 с')
@@ -184,4 +211,80 @@ test('login, then deploy a folder into a new app and follow the build', { timeou
 test('appLimitText tells a missing plan from a full one', () => {
   assert.match(appLimitText('the current plan has no hosting: trial is not available: link Yandex ID to start the trial'), /settings\?tab=plan/)
   assert.match(appLimitText('hosting allows up to 3 apps per user'), /максимум приложений/)
+})
+
+test('projectFiles takes data files only with consent and refuses the home folder', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'airlok-data-'))
+  await writeFile(join(dir, 'index.html'), '<h1>hi</h1>')
+  await writeFile(join(dir, 'app.db'), 'd')
+  await writeFile(join(dir, 'server.key'), 'k')
+  const env = { HOME: await mkdtemp(join(tmpdir(), 'airlok-home-')) }
+  const paths = (r) => r.files.map((f) => f.path)
+
+  const quiet = captureIO()
+  const r = await projectFiles(dir, {}, quiet, env)
+  assert.deepEqual(paths(r), ['index.html'])
+  assert.deepEqual(r.excluded, { secrets: ['server.key'], data: ['app.db'] })
+  assert.match(quiet.errLines.join('\n'), /Не загружаю базы.*app\.db.*--include-data/)
+
+  const flagged = await projectFiles(dir, { 'include-data': true }, captureIO(), env)
+  assert.deepEqual(paths(flagged), ['index.html', 'app.db'])
+  assert.deepEqual(flagged.excluded, { secrets: ['server.key'], data: [] })
+
+  assert.deepEqual(paths(await projectFiles(dir, {}, captureIO(['да']), env)), ['index.html', 'app.db'], 'человек согласился')
+  assert.deepEqual(paths(await projectFiles(dir, {}, captureIO(['n']), env)), ['index.html'])
+  assert.deepEqual(paths(await projectFiles(dir, { json: true }, captureIO(['да']), env)), ['index.html'], 'с --json не спрашиваем')
+
+  await assert.rejects(projectFiles(dir, {}, captureIO(), { HOME: dir }), /домашняя/)
+  await assert.rejects(projectFiles(join(dir, '..'), {}, captureIO(), { HOME: dir }), /домашняя/)
+})
+
+test('deploy --new creates no app for a folder it cannot publish', { timeout: 30_000 }, async (t) => {
+  const dash = await fakeDashboard()
+  t.after(dash.close)
+  const env = { XDG_CONFIG_HOME: await mkdtemp(join(tmpdir(), 'airlok-home-')), AIRLOK_URL: dash.state.base, AIRLOK_TOKEN: 'airlok_pat_test' }
+  const linked = async (dir) => Boolean(await stat(join(dir, '.airlok', 'project.json')).catch(() => null))
+
+  const empty = await mkdtemp(join(tmpdir(), 'airlok-empty-'))
+  const io = captureIO()
+  assert.equal(await main(['deploy', empty, '--new', 'mysite'], io, env), 1)
+  assert.match(io.errLines.join('\n'), /нет файлов проекта/)
+
+  const heavy = await mkdtemp(join(tmpdir(), 'airlok-heavy-'))
+  await writeFile(join(heavy, 'video.bin'), randomBytes(51 << 20))
+  const big = captureIO()
+  assert.equal(await main(['deploy', heavy, '--new', 'mysite'], big, env), 1)
+  assert.match(big.errLines.join('\n'), /больше 50 МБ/)
+
+  assert.deepEqual(dash.state.created, [], 'приложение не создано')
+  assert.equal(await linked(empty), false)
+  assert.equal(await linked(heavy), false)
+})
+
+test('deploy --new publishes a build folder from .gitignore and then points to the linked app', { timeout: 30_000 }, async (t) => {
+  const dash = await fakeDashboard()
+  t.after(dash.close)
+  dash.state.commandPolls = 2
+  const env = { XDG_CONFIG_HOME: await mkdtemp(join(tmpdir(), 'airlok-home-')), AIRLOK_URL: dash.state.base, AIRLOK_TOKEN: 'airlok_pat_test' }
+  const repo = await mkdtemp(join(tmpdir(), 'airlok-repo-'))
+  await writeFile(join(repo, '.gitignore'), 'dist\n')
+  await mkdir(join(repo, 'dist', 'assets'), { recursive: true })
+  await writeFile(join(repo, 'dist', 'index.html'), '<h1>hi</h1>')
+  await writeFile(join(repo, 'dist', 'assets', 'app.js'), 'x')
+  execFileSync('git', ['init', '-q'], { cwd: repo })
+  const dist = join(repo, 'dist')
+
+  const io = captureIO()
+  assert.equal(await main(['deploy', dist, '--new', 'mysite', '--json'], io, env), 0)
+  assert.match(io.errLines.join('\n'), /dist в \.gitignore/)
+  assert.deepEqual(untar(gunzipSync(dash.state.archive)).map((e) => e.path), ['src/assets/app.js', 'src/index.html'])
+  assert.equal(dash.state.created.length, 1)
+
+  const again = captureIO()
+  assert.equal(await main(['deploy', dist, '--new', 'mysite'], again, env), 1)
+  assert.match(again.errLines.join('\n'), /mysite уже создано и привязано к этой папке/)
+  const other = captureIO()
+  assert.equal(await main(['deploy', repo, '--new', 'shop'], other, env), 1)
+  assert.match(other.errLines.join('\n'), /--app shop/)
+  assert.equal(dash.state.created.length, 1, 'повтор с --new не создаёт приложение')
 })

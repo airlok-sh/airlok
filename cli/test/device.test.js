@@ -31,9 +31,11 @@ async function fakeDashboard() {
     for await (const c of req) chunks.push(c)
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : null
     const p = new URL(req.url, 'http://x').pathname
+    if (p === '/api/cli/v1/token' && state.scopes) return send(res, 200, { scope: state.scopes[req.headers.authorization] })
     if (p === '/api/cli/v1/servers') return send(res, 200, { servers: state.servers })
     if (p === '/api/cli/v1/devices' && req.method === 'GET') return send(res, 200, { devices: state.devices, access: [] })
     if (p === '/api/cli/v1/devices' && req.method === 'POST') {
+      state.addedWith = [...(state.addedWith ?? []), req.headers.authorization]
       if (state.devices.some((d) => d.public_key === body.public_key)) return send(res, 409, { error: { code: 'key_taken', message: 'key' } })
       if (state.devices.some((d) => d.name === body.name)) return send(res, 409, { error: { code: 'name_taken', message: 'name' } })
       const d = { id: `d${state.devices.length + 1}`, name: body.name, key_type: 'ssh-ed25519', fingerprint: 'SHA256:x', public_key: body.public_key, disabled: false, server_ids: body.server_ids }
@@ -116,4 +118,20 @@ test('device add refuses what is not a public key', async (t) => {
   assert.equal(await main(['device', 'add', '--server', 'prod,dev'], unknown, { ...env, HOME: home }), 1)
   assert.match(unknown.errLines.join('\n'), /Нет таких серверов: dev\. Есть: prod, stage/)
   assert.deepEqual(dash.state.devices, [])
+})
+
+test('device add uses the saved CLI login when AIRLOK_TOKEN is a dashboard token', async (t) => {
+  const dash = await fakeDashboard()
+  t.after(dash.close)
+  const config = await mkdtemp(join(tmpdir(), 'airlok-config-'))
+  await mkdir(join(config, 'airlok'))
+  await writeFile(join(config, 'airlok', 'config.json'), JSON.stringify({ url: dash.url, token: 'airlok_pat_login', login: 'dmitry' }))
+  dash.state.scopes = { 'Bearer airlok_pat_ai': 'mcp', 'Bearer airlok_pat_login': 'cli' }
+  const env = { AIRLOK_URL: dash.url, AIRLOK_TOKEN: 'airlok_pat_ai', HOME: await homeWithKey(), XDG_CONFIG_HOME: config }
+  const io = captureIO()
+  assert.equal(await main(['device', 'add', '--server', 'prod'], io, env), 0, io.errLines.join('\n'))
+  assert.deepEqual(dash.state.addedWith, ['Bearer airlok_pat_login'])
+
+  const list = captureIO()
+  assert.equal(await main(['device', 'list'], list, env), 0, 'список читает и токен из настроек')
 })

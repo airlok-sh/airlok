@@ -3,8 +3,8 @@
 
 import { execFile } from 'node:child_process'
 import { createReadStream } from 'node:fs'
-import { lstat, readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { lstat, readdir, readFile } from 'node:fs/promises'
+import { isAbsolute, join, parse, relative, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { createGzip } from 'node:zlib'
 
@@ -37,21 +37,129 @@ export function skipped(path) {
   return /^\.env(\..+)?$/.test(name) && !/\.(example|sample|template)$/.test(name)
 }
 
+// Ключи и учётные данные в архив не идут никогда, а базы и выгрузки — только с согласия
+// человека: сборке они бывают нужны. Те же правила у дашборда (web/src/folder.ts), а сборщик
+// статики и edge не отдают такие файлы с сайта (cluster.PrivateFile).
+const privateDirs = new Set(['.ssh', '.aws', '.gnupg'])
+const secretNames = new Set(['.pypirc', '.netrc', '.git-credentials', '.envrc', '.dev.vars', 'secrets.toml'])
+const secretExts = ['.pem', '.key', '.p12', '.pfx', '.kdbx']
+const sshKeys = ['id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519']
+const cloudKeys = ['client_secret', 'service-account', 'service_account']
+const dataNames = new Set(['credentials.json', 'token.json'])
+const dataExts = ['.sqlite', '.sqlite3', '.db', '.dump']
+// .sql — чаще код проекта (миграции, схема, начальные данные), чем выгрузка базы. Выгрузку
+// узнаём по имени или размеру, а в каталогах миграций .sql всегда код.
+const sqlCodeDirs = new Set(['migrations', 'migration', 'prisma', 'supabase', 'drizzle'])
+const SQL_DUMP_SIZE = 1 << 20
+// .pem и .key с одними сертификатами (CA базы вроде global-bundle.pem) открыты и нужны приложению;
+// больше такого размера сертификаты не бывают — такой файл не читаем и считаем ключом.
+export const CERT_READ_LIMIT = 1 << 20
+
+// privateKind — 'secret' для ключа или учётных данных, 'data' для базы или выгрузки, иначе ''.
+// size нужен для .sql: большой файл — выгрузка.
+export function privateKind(path, size = 0) {
+  const parts = path.toLowerCase().split('/')
+  const name = parts[parts.length - 1]
+  const dirs = parts.slice(0, -1)
+  if (dirs.some((p) => privateDirs.has(p))) return 'secret'
+  if (secretNames.has(name) || secretExts.some((e) => name.endsWith(e))) return 'secret'
+  if (sshKeys.some((k) => name.startsWith(k))) return name.endsWith('.pub') ? '' : 'secret'
+  if (name.endsWith('.json') && cloudKeys.some((k) => name.startsWith(k))) return 'secret'
+  if (dataNames.has(name) || dataExts.some((e) => name.endsWith(e))) return 'data'
+  if (name.endsWith('.sql') && !dirs.some((p) => sqlCodeDirs.has(p)) && (/dump|backup/.test(name) || size > SQL_DUMP_SIZE)) return 'data'
+  return ''
+}
+
+// certCheck — .pem или .key, по содержимому которого видно, ключ это или сертификат.
+export function certCheck(path) {
+  const parts = path.toLowerCase().split('/')
+  return /\.(pem|key)$/.test(parts[parts.length - 1]) && !parts.slice(0, -1).some((p) => privateDirs.has(p))
+}
+
+// certOnly — в файле одни сертификаты и нет закрытого ключа. Неизвестное содержимое (DER,
+// пустой файл) — не сертификат: лучше не загрузить лишнее, чем выложить ключ.
+export function certOnly(text) {
+  return /-----BEGIN (?:TRUSTED )?CERTIFICATE-----/.test(text) && !/PRIVATE KEY/.test(text)
+}
+
+// npmrcSecret — в .npmrc записан сам токен реестра. Без токена .npmrc нужен сборке
+// (legacy-peer-deps, адрес реестра), а ссылка на переменную ${NPM_TOKEN} секрета не содержит.
+export function npmrcSecret(text) {
+  return /^\s*(?:\/\/\S*?:)?(?:_authToken|_auth|_password|password)\s*=\s*(?!["']?\$\{)\S/im.test(text)
+}
+
+// secretShown — как показать скрытый файл: из каталога с ключами — сам каталог.
+function secretShown(path) {
+  const parts = path.split('/')
+  const i = parts.findIndex((p, j) => j < parts.length - 1 && privateDirs.has(p.toLowerCase()))
+  return i < 0 ? path : `${parts.slice(0, i + 1).join('/')}/`
+}
+
+// homeProblem — dir (без ссылок) — корень диска, домашняя папка или папка над ней: там ключи
+// и личные файлы, а не проект.
+export function homeProblem(dir, home) {
+  const rel = relative(dir, home)
+  if (dir !== parse(dir).root && (rel.split(sep)[0] === '..' || isAbsolute(rel))) return ''
+  return `Папка ${dir} — домашняя или выше неё: в ней ключи и личные файлы. Перейдите в папку самого проекта и публикуйте её.`
+}
+
 // listFiles — файлы проекта с путями через «/». В git-репозитории список даёт git, и
-// .gitignore учитывается точно; иначе обходим папку сами.
+// .gitignore учитывается точно; иначе обходим папку сами. Папку из .gitignore (dist, build)
+// git не перечислит, а публикуют её как раз целиком — тогда тоже обходим сами, ignored = true.
+// allIgnored — сама папка не в .gitignore, но git не дал из неё ни одного файла (в ней свой
+// .gitignore с «*»): её тоже обходим сами, а человеку об этом сообщаем.
+// secrets — пропущенные ключи и учётные данные, data — базы и выгрузки: в files их нет,
+// взять их решает вызывающий.
 export async function listFiles(dir) {
   const fromGit = await gitFiles(dir)
-  const paths = fromGit ?? (await walk(dir, ''))
+  const ignored = fromGit !== null && (await gitIgnored(dir))
+  const useGit = fromGit !== null && fromGit.length > 0 && !ignored
+  const paths = useGit ? fromGit : await walk(dir, '')
+  const allIgnored = fromGit !== null && !useGit && !ignored && paths.length > 0
   const files = []
+  const data = []
+  const secrets = new Set()
   for (const path of paths) {
+    if (path.endsWith('/')) {
+      secrets.add(path)
+      continue
+    }
     if (skipped(path)) continue
-    const st = await lstat(join(dir, ...path.split('/'))).catch(() => null)
+    const full = join(dir, ...path.split('/'))
+    const st = await lstat(full).catch(() => null)
     // Ссылки не берём: сборщик их всё равно пропускает, а ссылка могла бы увести за пределы проекта.
     if (!st?.isFile()) continue
-    files.push({ path, size: st.size, mode: st.mode & 0o111 ? 0o755 : 0o644 })
+    let kind = privateKind(path, st.size)
+    if (!kind && path.split('/').pop() === '.npmrc' && npmrcSecret(await readFile(full, 'utf8').catch(() => ''))) kind = 'secret'
+    if (kind === 'secret' && certCheck(path) && st.size <= CERT_READ_LIMIT && certOnly(await readFile(full, 'latin1').catch(() => ''))) kind = ''
+    if (kind === 'secret') {
+      secrets.add(secretShown(path))
+      continue
+    }
+    const entry = { path, size: st.size, mode: st.mode & 0o111 ? 0o755 : 0o644 }
+    if (kind === 'data') data.push(entry)
+    else files.push(entry)
   }
-  files.sort((a, b) => (a.path < b.path ? -1 : 1))
-  return { files, git: fromGit !== null }
+  const byPath = (a, b) => (a.path < b.path ? -1 : 1)
+  files.sort(byPath)
+  data.sort(byPath)
+  return { files, git: useGit, ignored, allIgnored, secrets: [...secrets].sort(), data }
+}
+
+// gitIgnored — папка сама или через родительскую в .gitignore. Путь проверяем от корня
+// репозитория и без «/» в конце: «.» git превращает в «папка/», а с ним совпадает шаблон
+// «папка/*», который игнорирует содержимое, но не саму папку.
+async function gitIgnored(dir) {
+  try {
+    const { stdout } = await run('git', ['rev-parse', '--show-toplevel', '--show-prefix'], { cwd: dir })
+    const [top, prefix = ''] = stdout.split('\n')
+    const path = prefix.replace(/\/$/, '')
+    if (!path) return false
+    await run('git', ['check-ignore', '-q', '--', path], { cwd: top })
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function gitFiles(dir) {
@@ -68,7 +176,9 @@ async function walk(root, prefix) {
   for (const e of await readdir(join(root, prefix), { withFileTypes: true })) {
     const path = prefix ? `${prefix}/${e.name}` : e.name
     if (e.isDirectory()) {
-      if (!skipDirs.has(e.name)) out.push(...(await walk(root, path)))
+      // В каталог с ключами не заходим: его покажем целиком.
+      if (privateDirs.has(e.name.toLowerCase())) out.push(`${path}/`)
+      else if (!skipDirs.has(e.name)) out.push(...(await walk(root, path)))
     } else if (e.isFile()) {
       out.push(path)
     }
@@ -119,8 +229,8 @@ export function tarHeader(path, size, mode, mtime) {
 
 // pack собирает tar.gz из файлов папки dir. Размер файла берётся из списка: если файл
 // успел вырасти, лишнее отрезается, если уменьшиться — дополняется нулями, иначе архив
-// разошёлся бы с заголовками.
-export async function pack(dir, files, top = 'src') {
+// разошёлся бы с заголовками. gitignore — список дал git, и совет про .gitignore поможет.
+export async function pack(dir, files, { top = 'src', gitignore = false } = {}) {
   const gz = createGzip({ level: 6 })
   const chunks = []
   let total = 0
@@ -151,7 +261,8 @@ export async function pack(dir, files, top = 'src') {
   gz.end()
   await done
   if (total > MAX_ARCHIVE) {
-    throw new PackError(`Архив больше 50 МБ. Уберите из папки тяжёлые файлы (видео, архивы, выгрузки базы) или добавьте их в .gitignore.`)
+    const hint = gitignore ? ' или добавьте их в .gitignore' : ''
+    throw new PackError(`Архив больше 50 МБ. Уберите из папки тяжёлые файлы (видео, архивы, выгрузки базы)${hint}.`)
   }
   return Buffer.concat(chunks)
 }

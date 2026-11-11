@@ -154,6 +154,9 @@ print(json.dumps({
     "letsencrypt": letsencrypt == "true",
     "env_key": env_key,
     "strict": strict == "1",
+    # Что умеет агент. release_links — ссылки за пределы проекта не доходят до сборки: без этого
+    # дашборд не даёт участникам проекта публиковать на сервер.
+    "caps": ["release_links"],
     # Подсчёт не удался — поля нет, и дашборд оставит прежнее значение.
     **({"os_updates": os_updates} if os_updates else {}),
 }))

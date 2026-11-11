@@ -12,13 +12,37 @@ const SERVER = 'airlok'
 
 const exists = (p) => access(p).then(() => true, () => false)
 
-// onPath — есть ли программа в PATH: так находим агентов, у которых нет своей папки в домашнем каталоге.
-export async function onPath(cmd, env = process.env) {
-  const exts = process.platform === 'win32' ? ['.cmd', '.exe', ''] : ['']
+// onPath — путь к программе в PATH или '': так находим агентов, у которых нет своей папки в домашнем каталоге.
+// Путь нужен на Windows, чтобы отличить claude.exe от npm-обёртки claude.cmd.
+export async function onPath(cmd, env = process.env, platform = process.platform) {
+  const exts = platform === 'win32' ? ['.exe', '.cmd', ''] : ['']
   for (const dir of (env.PATH ?? '').split(delimiter).filter(Boolean)) {
-    for (const ext of exts) if (await exists(join(dir, cmd + ext))) return true
+    for (const ext of exts) {
+      const p = join(dir, cmd + ext)
+      if (await exists(p)) return p
+    }
   }
-  return false
+  return ''
+}
+
+const cmdSafeURL = /^https?:\/\/[A-Za-z0-9.:/_~-]+$/
+const cmdSafeAuth = /^Bearer [A-Za-z0-9_-]+$/
+
+// claudeCommand — как вызвать claude, чтобы добавить сервер. Без shell Node сам экранирует аргументы,
+// но .cmd на Windows запускается только через cmd.exe, а там Node склеивает аргументы как есть и кавычки
+// внутри JSON теряются. Для claude.cmd берём add без JSON, с кавычками вокруг заголовка; если в адресе
+// или токене есть символы, которые cmd.exe понимает по-своему, — null, и сервер пишем в файл.
+export function claudeCommand(platform, bin, entry) {
+  const addJSON = ['mcp', 'add-json', SERVER, JSON.stringify(entry), '--scope', 'user']
+  if (platform !== 'win32') return { cmd: 'claude', args: addJSON, shell: false }
+  if (typeof bin === 'string' && /\.exe$/i.test(bin)) return { cmd: bin, args: addJSON, shell: false }
+  const auth = entry.headers?.Authorization ?? ''
+  if (!cmdSafeURL.test(entry.url) || !cmdSafeAuth.test(auth)) return null
+  return {
+    cmd: 'claude',
+    args: ['mcp', 'add', '--transport', 'http', '--scope', 'user', SERVER, entry.url, '--header', `"Authorization: ${auth}"`],
+    shell: true,
+  }
 }
 
 // mergeServers вписывает сервер в JSON-конфиг с ключом mcpServers, не трогая остальное.
@@ -65,16 +89,23 @@ export function agents(home) {
     {
       id: 'claude', label: 'Claude Code', bin: 'claude', dir: join(home, '.claude'),
       skills: [join(home, '.claude', 'skills')],
-      async mcp({ url, token, run, hasBin }) {
+      async mcp({ url, token, run, hasBin, platform }) {
         const entry = { type: 'http', url, headers: { Authorization: `Bearer ${token}` } }
-        // Claude держит ~/.claude.json открытым и может перезаписать правку: надёжнее его собственная команда.
-        if (hasBin) {
-          await run('claude', ['mcp', 'remove', SERVER, '--scope', 'user']).catch(() => {})
-          await run('claude', ['mcp', 'add-json', SERVER, JSON.stringify(entry), '--scope', 'user'])
-          return 'claude mcp add-json --scope user'
-        }
         const file = join(home, '.claude.json')
+        // Claude держит ~/.claude.json открытым и может перезаписать правку: надёжнее его собственная команда.
+        const c = hasBin ? claudeCommand(platform, hasBin, entry) : null
+        if (c) {
+          await run(c.cmd, ['mcp', 'remove', SERVER, '--scope', 'user'], { shell: c.shell }).catch(() => {})
+          try {
+            await run(c.cmd, c.args, { shell: c.shell })
+            return `claude mcp ${c.args[1]} --scope user`
+          } catch (err) {
+            // На Windows команда может не понять аргументы (старый Claude Code, обёртки) — тогда пишем файл сами.
+            if (platform !== 'win32') throw err
+          }
+        }
         await writeConfig(file, (t) => mergeServers(t, entry, file))
+        if (hasBin) return { where: file, note: 'Если Claude Code был открыт, закройте его и запустите setup ещё раз.' }
         return file
       },
     },
@@ -151,14 +182,16 @@ export async function detect(list, env = process.env) {
 const execAsync = promisify(execFile)
 
 // setupAgents настраивает выбранных агентов и возвращает по строке отчёта на каждого.
-export async function setupAgents({ chosen, url, token, run, skills }) {
+export async function setupAgents({ chosen, url, token, run, skills, platform = process.platform }) {
   const sources = skills ?? (await skillSources())
-  const exec = run ?? ((cmd, args) => execAsync(cmd, args, { shell: process.platform === 'win32' }))
+  // Строку для cmd.exe склеиваем сами: execFile с аргументами и shell предупреждает DEP0190 на каждом запуске.
+  const exec = run ?? ((cmd, args, { shell = false } = {}) => (shell ? execAsync([cmd, ...args].join(' '), [], { shell }) : execAsync(cmd, args)))
   const done = new Set()
   const report = []
   for (const a of chosen) {
     try {
-      const where = await a.mcp({ url: `${url}/mcp`, token, run: exec, hasBin: a.hasBin })
+      const res = await a.mcp({ url: `${url}/mcp`, token, run: exec, hasBin: a.hasBin, platform })
+      const { where, note } = typeof res === 'string' ? { where: res } : res
       const skills = []
       for (const dir of a.skills) {
         // Каталог CLI Antigravity — только если он уже есть: CLI может быть не установлен.
@@ -172,7 +205,7 @@ export async function setupAgents({ chosen, url, token, run, skills }) {
         }
         skills.push(dir)
       }
-      report.push({ agent: a.label, ok: true, mcp: where, skills })
+      report.push({ agent: a.label, ok: true, mcp: where, skills, ...(note && { note }) })
     } catch (err) {
       report.push({ agent: a.label, ok: false, error: err.stderr?.toString().trim() || err.message })
     }

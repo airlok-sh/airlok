@@ -52,17 +52,40 @@ async function values(names, opts, io) {
     const absent = Object.keys(picked).filter((n) => picked[n] === undefined)
     if (absent.length) throw new EnvError(`В ${opts.from} нет ${absent.join(', ')}`)
     if (Object.keys(picked).length === 0) throw new EnvError(`В ${opts.from} нет переменных`)
+    const empty = Object.keys(picked).filter((n) => picked[n] === '')
+    if (empty.length && !opts['allow-empty']) {
+      throw new EnvError(`В ${opts.from} пустые: ${empty.join(', ')}. Впишите значения или уберите эти строки; задать пустыми намеренно — --allow-empty.`)
+    }
     return picked
   }
   if (names.length === 0) throw new EnvError('Укажите имена переменных или файл: env set ИМЯ --app <имя> или env set --app <имя> --from .env')
   if (!io.stdinIsTTY) {
     if (names.length > 1) throw new EnvError('Из stdin читается одно значение: задайте переменные по одной или из файла (--from .env)')
-    return { [names[0]]: (await io.readStdin()).replace(/\r?\n$/, '') }
+    const value = (await io.readStdin()).replace(/\r?\n$/, '')
+    if (value === '' && !opts['allow-empty']) throw emptyValue(names[0], 'stdin пуст')
+    return { [names[0]]: value }
   }
   const out = {}
-  for (const name of names) out[name] = await io.askSecret(`${name}: `)
+  for (const name of names) {
+    out[name] = await io.askSecret(`${name}: `)
+    if (out[name] === '' && !opts['allow-empty']) throw emptyValue(name, 'ничего не введено')
+  }
   return out
 }
+
+// Пустой stdin у ИИ-агентов и в CI — обычное дело (/dev/null), и без этой проверки рабочий
+// секрет молча заменялся бы пустой строкой: сервер пустые значения принимает.
+const emptyValue = (name, why) =>
+  new EnvError(
+    `Значение ${name} пустое (${why}), ничего не задано. Передайте его через heredoc:\n` +
+      `  npx @airlok/cli env set ${name} --app <имя> <<'AIRLOK_EOF'\n  <значение>\n  AIRLOK_EOF\n` +
+      `или из файла (--from .env). Удалить переменную — env rm ${name}; задать пустой намеренно — --allow-empty.`,
+  )
+
+const PLACEHOLDER = /^(?:your[_-].*|.*[_-]here|change[_-]?me|x{3,}|todo|placeholder|<[^>]+>)$/i
+
+// placeholders — значения, похожие на заглушки из примеров: задать их можно, но лучше переспросить.
+export const placeholders = (vars) => Object.keys(vars).filter((n) => PLACEHOLDER.test(vars[n].trim()))
 
 export async function envCommand(api, sub, names, opts, io) {
   if (!opts.app) throw new EnvError('Укажите приложение: --app <имя> или --app <сервер>/<имя>')
@@ -75,6 +98,8 @@ export async function envCommand(api, sub, names, opts, io) {
       const vars = await values(names, opts, io)
       const big = Object.keys(vars).filter((n) => Buffer.byteLength(vars[n]) > MAX_VALUE)
       if (big.length) throw new EnvError(`Значение больше 32 КБ: ${big.join(', ')}`)
+      const stubs = placeholders(vars)
+      if (stubs.length) io.err(`Похоже на заглушку, а не на настоящее значение: ${stubs.join(', ')}. Проверьте и при необходимости задайте заново.`)
       const set = app.hosted ? await setHosted(api, app, vars) : await setServer(api, app, vars, io)
       json({ set })
       io.err(`✓ Заданы: ${set.join(', ')}. ${app.hosted ? 'Применятся со следующего запроса к сайту.' : 'Попадут на сервер при следующей публикации.'}`)

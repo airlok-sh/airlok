@@ -1,5 +1,5 @@
 import { execFile, spawn } from 'node:child_process'
-import { readFile, stat } from 'node:fs/promises'
+import { readFile, realpath, stat } from 'node:fs/promises'
 import { homedir, hostname } from 'node:os'
 import { basename, resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
@@ -11,7 +11,7 @@ import { formatReport, normalize } from './check.js'
 import { DeviceError, deviceCommand } from './device.js'
 import { DomainError, domainCommand } from './domain.js'
 import { EnvError, envCommand } from './env.js'
-import { checkFiles, listFiles, pack, PackError } from './pack.js'
+import { checkFiles, homeProblem, listFiles, pack, PackError } from './pack.js'
 import { plural, serverCommand, ServerError, system } from './server.js'
 import { agents, detect, homePath, onPath, setupAgents, SKILLS } from './setup.js'
 
@@ -44,11 +44,18 @@ const help = `Airlok — публикация проекта на хостинг
   --new <имя>       создать приложение с этим именем и опубликовать
   --title <текст>   название публикации (по умолчанию — последний коммит)
   --no-wait         не ждать конца сборки
+  --include-data    взять и файлы баз и выгрузок (*.db, *.sqlite, dump.sql, credentials.json…): без флага CLI спросит или пропустит их
   --json            итог одной строкой JSON — для скриптов и ИИ-агентов
+  Ключи и доступы (закрытые ключи *.pem и *.key, id_rsa, .npmrc с токеном, .ssh…) не загружаются никогда.
 
 Для env:
   --app <имя>       приложение; если имя есть на нескольких серверах — <сервер>/<имя>
   --from <файл>     взять значения из .env-файла (с именами — только эти)
+  --allow-empty     разрешить пустое значение: без флага пустой stdin, ответ или строка ИМЯ= в .env — ошибка
+  Из скрипта или ИИ-агента значение передаётся через stdin:
+    npx @airlok/cli env set ИМЯ --app <имя> <<'AIRLOK_EOF'
+    <значение>
+    AIRLOK_EOF
   У приложения на своём сервере значения шифруются здесь, под ключ агента сервера: дашборд их не видит.
 
 Для domain:
@@ -194,9 +201,9 @@ export async function main(argv, io = makeIO(), env = process.env, sys = system)
       allowPositionals: true,
       options: {
         app: { type: 'string' }, new: { type: 'string' }, title: { type: 'string' }, agents: { type: 'string' }, yes: { type: 'boolean', short: 'y' },
-        from: { type: 'string' }, name: { type: 'string' }, port: { type: 'string' }, email: { type: 'string' },
+        from: { type: 'string' }, 'allow-empty': { type: 'boolean' }, name: { type: 'string' }, port: { type: 'string' }, email: { type: 'string' },
         letsencrypt: { type: 'boolean' }, 'ssh-keys-only': { type: 'boolean' }, key: { type: 'string' }, server: { type: 'string' },
-        'no-wait': { type: 'boolean' }, json: { type: 'boolean' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
+        'no-wait': { type: 'boolean' }, 'include-data': { type: 'boolean' }, json: { type: 'boolean' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       },
     })
   } catch (err) {
@@ -252,12 +259,14 @@ export async function main(argv, io = makeIO(), env = process.env, sys = system)
           await login(io, env)
           s = await session(env)
         }
+        if (positionals[1] === 'connect') s = await cliLoginSession(s, io, env)
         const home = env.HOME || env.USERPROFILE || homedir()
         return await serverCommand(new Api(s.url, s.token), s.url, positionals[1], positionals.slice(2), opts, io, home, sys)
       }
       case 'device': {
-        const s = await session(env)
+        let s = await session(env)
         if (!s.token) throw new UserError('Вы не вошли: npx @airlok/cli login (или задайте AIRLOK_TOKEN)')
+        if (positionals[1] === 'add') s = await cliLoginSession(s, io, env)
         const home = env.HOME || env.USERPROFILE || homedir()
         return await deviceCommand(new Api(s.url, s.token), s.url, positionals[1], positionals.slice(2), opts, io, home, sys)
       }
@@ -274,11 +283,12 @@ export async function main(argv, io = makeIO(), env = process.env, sys = system)
 
 class UserError extends Error {}
 
-function errorText(err) {
+export function errorText(err) {
   if (err instanceof UserError || err instanceof PackError || err instanceof EnvError || err instanceof DomainError || err instanceof ServerError ||
     err instanceof DeviceError) return err.message
   if (err instanceof ApiError) {
     if (err.status === 401) return 'Вход устарел или токен отозван: npx @airlok/cli login'
+    if (err.code === 'cli_login_required') return CLI_LOGIN_REQUIRED
     if (err.code === 'read_only_token') return 'Этот токен только читает. Войдите заново (npx @airlok/cli login) или задайте токен с правом публиковать.'
     if (err.code === 'check_too_large') return 'Проект после распаковки слишком большой для проверки: уберите из папки данные и результаты сборки или добавьте их в .gitignore.'
     if (err.code === 'archive_too_large') return 'Архив больше 50 МБ: уберите из папки данные и результаты сборки или добавьте их в .gitignore.'
@@ -330,6 +340,35 @@ async function liveSession(io, env) {
   return session(env)
 }
 
+const CLI_LOGIN_REQUIRED = 'Этот токен — для ИИ-агентов и CI: подключать серверы, класть SSH-ключи устройств и перевыпускать токен агента можно только со входом CLI. ' +
+  'Войдите: npx @airlok/cli login — дальше CLI возьмёт этот вход сам, даже если задан AIRLOK_TOKEN.'
+
+// cliLoginSession — сессия для server connect и device add: серверы и SSH-ключи открывает только вход CLI.
+// Токен из настроек дашборда часто лежит в AIRLOK_TOKEN для Codex и Cursor и перекрывает вход: тогда
+// берём сохранённый вход. Проверка — до SSH-шагов, чтобы не класть ключ на сервер впустую.
+async function cliLoginSession(s, io, env) {
+  if (!env.AIRLOK_TOKEN || (await new Api(s.url, s.token).tokenScope()) !== 'mcp') return s
+  const own = { ...env, AIRLOK_TOKEN: '' }
+  const saved = await session(own)
+  if (saved.token && (await isCLILogin(saved))) {
+    io.err(`AIRLOK_TOKEN — токен для ИИ-агентов, серверы и SSH-ключи он не открывает: беру вход ${saved.login || 'этого компьютера'}.`)
+    return saved
+  }
+  if (!io.interactive) throw new UserError(CLI_LOGIN_REQUIRED)
+  io.err('AIRLOK_TOKEN — токен для ИИ-агентов, серверы и SSH-ключи он не открывает. Войдите в Airlok CLI:')
+  await login(io, own)
+  return session(own)
+}
+
+async function isCLILogin(s) {
+  try {
+    return (await new Api(s.url, s.token).tokenScope()) === 'cli'
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 401) return false
+    throw err
+  }
+}
+
 // Только 401 говорит о самом токене: нет связи или сбой сервера — ещё не повод входить заново.
 async function tokenRejected(s) {
   try {
@@ -363,13 +402,32 @@ async function setup(opts, io, env) {
     const answer = (await io.ask('Продолжить? [Y/n] ')).toLowerCase()
     if (answer && !['y', 'yes', 'д', 'да'].includes(answer)) return 0
   }
-  const report = await setupAgents({ chosen, url: s.url, token: s.token, home })
+  const token = await agentToken(new Api(s.url, s.token), hostname(), io)
+  const report = await setupAgents({ chosen, url: s.url, token, home })
   for (const r of report) {
-    if (r.ok) io.err(`  ✓ ${r.agent.padEnd(12)} MCP: ${homePath(r.mcp, home)} · навыки ${SKILLS.join(', ')}: ${r.skills.map((d) => homePath(d, home)).join(', ')}`)
-    else io.err(`  ✗ ${r.agent.padEnd(12)} ${r.error}`)
+    if (r.ok) {
+      io.err(`  ✓ ${r.agent.padEnd(12)} MCP: ${homePath(r.mcp, home)} · навыки ${SKILLS.join(', ')}: ${r.skills.map((d) => homePath(d, home)).join(', ')}`)
+      if (r.note) io.err(`    ${''.padEnd(12)} ${r.note}`)
+    } else io.err(`  ✗ ${r.agent.padEnd(12)} ${r.error}`)
   }
   io.err('\nПерезапустите агентов, чтобы они увидели Airlok. Проверка: спросите агента «какие у меня приложения на Airlok?».')
   return report.every((r) => r.ok) ? 0 : 1
+}
+
+// agentToken — токен, который setup пишет в конфиги ИИ-агентов. Вход CLI туда не попадает: он
+// подключает серверы и кладёт SSH-ключи, а конфиги агентов утекают чаще. Если в AIRLOK_TOKEN уже
+// токен для агентов, пишем его; дашборд без этой возможности (404) получает вход CLI, как раньше.
+export async function agentToken(api, client, io) {
+  try {
+    return (await api.createAgentToken(client)).token
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'cli_login_required') return api.token
+    if (err instanceof ApiError && err.status === 404) {
+      io.err('Дашборд пока не выпускает отдельный токен для ИИ-агентов — записываю им вход CLI. Повторите setup после обновления Airlok.')
+      return api.token
+    }
+    throw err
+  }
 }
 
 async function deploy(target, opts, io, env) {
@@ -382,18 +440,18 @@ async function deploy(target, opts, io, env) {
     s = await session(env)
   }
   const api = new Api(s.url, s.token)
+  // Папку разбираем и упаковываем до выбора приложения: --new не должен создавать приложение
+  // для папки, которую не опубликовать (пустой или с архивом больше 50 МБ).
+  const { files, excluded, git } = await projectFiles(dir, opts, io, env)
+  io.err(`Упаковываю ${files.length} ${plural(files.length, 'файл', 'файла', 'файлов')}…`)
+  const archive = await pack(dir, files, { gitignore: git })
   const app = await chooseApp(api, dir, opts, io)
 
-  const { files } = await listFiles(dir)
-  const problem = checkFiles(files)
-  if (problem) throw new UserError(problem)
-  io.err(`Упаковываю ${files.length} ${plural(files.length, 'файл', 'файла', 'файлов')}…`)
-  const archive = await pack(dir, files)
   const title = opts.title || (await gitTitle(dir)) || `Папка ${basename(dir)}`
   io.err(`Загружаю ${mb(archive.length)} в ${app.name}…`)
   const cmd = await api.deployArchive(app.id, archive, title)
   if (opts['no-wait']) {
-    if (opts.json) io.out(JSON.stringify({ status: cmd.status, command_id: cmd.id, app: app.name }))
+    if (opts.json) io.out(JSON.stringify({ status: cmd.status, command_id: cmd.id, app: app.name, excluded }))
     else io.err(`Публикация поставлена в очередь. Ход сборки — в дашборде: ${s.url}/apps/${app.id}?tab=deploys`)
     return 0
   }
@@ -402,7 +460,7 @@ async function deploy(target, opts, io, env) {
   const url = app.domain ? `https://${app.domain}` : ''
   const failedStage = result.status === 'failed' ? result.stages?.find((st) => st.status === 'failed')?.key : undefined
   if (opts.json) {
-    io.out(JSON.stringify({ status: result.status, command_id: cmd.id, app: app.name, url, message: result.message, failed_stage: failedStage }))
+    io.out(JSON.stringify({ status: result.status, command_id: cmd.id, app: app.name, url, message: result.message, failed_stage: failedStage, excluded }))
   }
   if (result.status === 'success') {
     const took = result.started_at && result.finished_at ? ` за ${duration((Date.parse(result.finished_at) - Date.parse(result.started_at)) / 1000)}` : ''
@@ -432,15 +490,45 @@ async function check(target, opts, io, env) {
   if (!(await stat(dir).catch(() => null))?.isDirectory()) throw new UserError(`Нет такой папки: ${dir}`)
   const s = await session(env)
   if (!s.token) throw new UserError('Вы не вошли: npx @airlok/cli login (или задайте AIRLOK_TOKEN)')
-  const { files } = await listFiles(dir)
-  const problem = checkFiles(files)
-  if (problem) throw new UserError(problem)
+  const { files, excluded, git } = await projectFiles(dir, opts, io, env)
   if (!opts.json) io.err(`Проверяю ${files.length} ${plural(files.length, 'файл', 'файла', 'файлов')}: архив проверяется на сервере и сразу удаляется…`)
-  const report = normalize(await new Api(s.url, s.token).check(await pack(dir, files)))
+  const report = normalize(await new Api(s.url, s.token).check(await pack(dir, files, { gitignore: git })))
   const ok = report.errors.length === 0
-  if (opts.json) io.out(JSON.stringify({ status: ok ? 'ok' : 'error', ...report }))
+  if (opts.json) io.out(JSON.stringify({ status: ok ? 'ok' : 'error', ...report, excluded }))
   else io.out(formatReport(report))
   return ok ? 0 : 1
+}
+
+// projectFiles — что из папки уйдёт в архив. Ключи и доступы не уходят никогда, базы и выгрузки —
+// с --include-data или по ответу человека: сборке они бывают нужны, а молча пропущенный файл
+// сломал бы проект. excluded — что не ушло, для --json; undefined, если ушло всё.
+export async function projectFiles(dir, opts, io, env) {
+  const home = env.HOME || env.USERPROFILE || homedir()
+  const refused = homeProblem(await realpath(dir), await realpath(home).catch(() => resolve(home)))
+  if (refused) throw new UserError(refused)
+  const { files, secrets, data, git, ignored, allIgnored } = await listFiles(dir)
+  if (ignored) io.err(`Папка ${basename(dir)} в .gitignore — публикую все её файлы, кроме зависимостей, .env и ключей.`)
+  if (allIgnored) io.err(`Все файлы папки ${basename(dir)} в .gitignore — публикую их все, кроме зависимостей, .env и ключей.`)
+  if (secrets.length) io.err(`Не загружаю ключи и доступы: ${listed(secrets)}. Секреты задайте переменными окружения приложения.`)
+  const dataPaths = data.map((f) => f.path)
+  let withData = Boolean(opts['include-data'])
+  if (data.length && !withData && io.interactive && !opts.json) {
+    io.err(`Похоже на базы, выгрузки или файлы входа: ${listed(dataPaths)}. Обычно им не место в публикации: данные хранят в базе, а доступы — в переменных окружения. ` +
+      'Статический сайт такие файлы не отдаёт и с ними: базе для sql.js дайте другое расширение, например .bin.')
+    withData = ['y', 'yes', 'д', 'да'].includes((await io.ask('Загрузить и их? [y/N] ')).trim().toLowerCase())
+  }
+  if (data.length && !withData) io.err(`Не загружаю базы, выгрузки и файлы входа: ${listed(dataPaths)}. Если они нужны сборке или приложению, добавьте --include-data.`)
+  const chosen = withData ? [...files, ...data] : files
+  const problem = checkFiles(chosen)
+  if (problem) throw new UserError(problem)
+  const skippedData = withData ? [] : dataPaths
+  const excluded = secrets.length || skippedData.length ? { secrets, data: skippedData } : undefined
+  return { files: chosen, excluded, git }
+}
+
+function listed(paths) {
+  const limit = 10
+  return paths.length <= limit ? paths.join(', ') : `${paths.slice(0, limit).join(', ')} и ещё ${paths.length - limit}`
 }
 
 // chooseApp — куда выкатывать: из флагов, из привязки папки или по вопросу человеку.
@@ -448,6 +536,13 @@ async function chooseApp(api, dir, opts, io) {
   const apps = await api.apps()
   let app
   if (opts.new) {
+    const existing = apps.find((a) => a.name === opts.new)
+    if (existing) {
+      const linked = (await readLink(dir))?.app_id === existing.id
+      throw new UserError(linked
+        ? `Приложение ${existing.name} уже создано и привязано к этой папке: опубликовать в него — npx @airlok/cli deploy`
+        : `Приложение ${existing.name} у вас уже есть: опубликовать в него — --app ${existing.name}`)
+    }
     app = await create(api, opts.new)
   } else if (opts.app) {
     app = apps.find((a) => a.name === opts.app)

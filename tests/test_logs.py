@@ -209,10 +209,16 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(started, [("shop", "c3", "app", 5000)], "после включения вывод за выключенное время не досылается")
 
     def test_oneoff_containers_are_skipped(self):
-        out = ("a" * 12 + "\tshop\tapp\tFalse\n" + "b" * 12 + "\tshop\tapp\tTrue\n" + "c" * 12 + "\tshop\tdb\t\n"
-               + "d" * 12 + "\t../x\tapp\tFalse\n")
+        out = ("a" * 12 + "\tshop\tapp\tFalse\t/srv/apps/shop\n" + "b" * 12 + "\tshop\tapp\tTrue\t/srv/apps/shop\n"
+               + "c" * 12 + "\tshop\tdb\t\t/srv/apps/shop\n" + "d" * 12 + "\t../x\tapp\tFalse\t/srv/apps/../x\n")
         self.assertEqual(logs.parse_ps(out), {"a" * 12: ("shop", "app"), "c" * 12: ("shop", "db")},
                          "вывод задач и команды перед запуском приходит через очередь файлов")
+
+    def test_foreign_project_is_skipped(self):
+        out = ("a" * 12 + "\tshop\tapp\tFalse\t/srv/apps/shop\n" + "b" * 12 + "\tshop\tdb\tFalse\t/home/u/shop\n"
+               + "c" * 12 + "\tshop\tbot\tFalse\t\n" + "d" * 12 + "\tshop\tapp\tFalse\n")
+        self.assertEqual(logs.parse_ps(out), {"a" * 12: ("shop", "app")},
+                         "проект с тем же именем из другой папки человек поднял сам — его вывод не наш")
 
     def test_spool(self):
         spool_dir = os.path.join(tempfile.mkdtemp(), "spool")

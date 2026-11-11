@@ -47,6 +47,22 @@ export class Api {
     return this.request('GET', '/api/cli/v1/me').then((r) => r.data)
   }
 
+  // tokenScope — 'cli' у входа CLI, 'mcp' у токена из настроек; '' — дашборд старше областей токенов.
+  async tokenScope() {
+    try {
+      const { data } = await this.request('GET', '/api/cli/v1/token')
+      return data?.scope ?? ''
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return ''
+      throw err
+    }
+  }
+
+  // createAgentToken — отдельный токен для конфигов ИИ-агентов: выпускает его только вход CLI.
+  createAgentToken(client) {
+    return this.request('POST', '/api/cli/v1/tokens', { client }).then((r) => r.data)
+  }
+
   // apps — приложения на хостинге: архивом выкатывают только туда.
   async apps() {
     return (await this.allApps()).filter((a) => a.hosted)

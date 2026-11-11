@@ -283,3 +283,25 @@ start_cron_timers() {
 	timers=$(systemctl list-unit-files "airlok-cron@${1}_*.timer" --state=enabled --no-legend 2>/dev/null | awk '{print $1}') || true
 	[[ -z $timers ]] || echo "$timers" | xargs systemctl start
 }
+
+# Контейнеры проекта Docker Compose ИМЯ: «id<TAB>имя<TAB>папка проекта». Airlok зовёт compose только
+# с --project-directory /srv/apps/ИМЯ, а Compose без name: называет проект по папке, так что проект,
+# поднятый руками из ~/ИМЯ, совпадает с приложением по имени. Свои контейнеры отличаем по папке.
+project_containers() {
+	docker ps -a --no-trunc --filter "label=com.docker.compose.project=$1" \
+		--format $'{{.ID}}\t{{.Names}}\t{{.Label "com.docker.compose.project.working_dir"}}'
+}
+
+# foreign_containers ИМЯ КАТАЛОГ — чужие контейнеры проекта (те же три поля); без метки папки — чужой.
+foreign_containers() {
+	local out
+	out=$(project_containers "$1") || return 1
+	awk -F'\t' -v dir="$2" 'NF && $3 != dir' <<<"$out"
+}
+
+# own_containers ИМЯ КАТАЛОГ — id своих контейнеров проекта, в том числе разовых контейнеров задач.
+own_containers() {
+	local out
+	out=$(project_containers "$1") || return 1
+	awk -F'\t' -v dir="$2" '$3 == dir {print $1}' <<<"$out"
+}

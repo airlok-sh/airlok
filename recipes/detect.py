@@ -5,6 +5,7 @@
 одинаково и на хостинг, и на свой сервер.
 
     detect.py static-output КАТАЛОГ [ВЫХОД] [built]  — где после сборки лежит index.html
+    detect.py drop-links КАТАЛОГ                     — убрать ссылки за пределы каталога и перечислить их
 """
 import json
 import os
@@ -638,7 +639,32 @@ def static_output(root, output, built):
     raise DetectError("после сборки не нашли index.html в dist, build, out или public — укажите build.output в airlok.yml")
 
 
+def drop_outside_links(root):
+    """Удаляет ссылки, которые ведут за пределы каталога, и возвращает их пути. Код из репозитория
+    читают и собирают от root: ссылка на /etc отдала бы ему файлы сервера. Абсолютные ссылки тоже
+    удаляются: внутрь проекта на сервере они не ведут, путь у репозитория там другой."""
+    real_root = os.path.realpath(root)
+    links = [os.path.join(folder, name) for folder, dirs, files in os.walk(root) for name in dirs + files
+             if os.path.islink(os.path.join(folder, name))]
+    # Сначала решаем по всем, потом удаляем: ссылка на ссылку наружу иначе зависела бы от порядка обхода.
+    outside = [p for p in links
+               if os.path.isabs(os.readlink(p)) or os.path.commonpath([real_root, os.path.realpath(p)]) != real_root]
+    for path in outside:
+        os.unlink(path)
+    return sorted(os.path.relpath(p, root) for p in outside)
+
+
+def printable(text):
+    return "".join(c if c.isprintable() else "?" for c in text)
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "drop-links":
+        dropped = [printable(p) for p in drop_outside_links(sys.argv[2])]
+        if dropped:
+            more = f" и ещё {len(dropped) - 20}" if len(dropped) > 20 else ""
+            print(", ".join(dropped[:20]) + more)
+        return
     if len(sys.argv) >= 3 and sys.argv[1] == "static-output":
         output = sys.argv[3] if len(sys.argv) > 3 else ""
         try:
@@ -646,7 +672,7 @@ def main():
         except DetectError as e:
             sys.exit(f"Ошибка: {e}")
         return
-    sys.exit("использование: detect.py static-output КАТАЛОГ [ВЫХОД] [built]")
+    sys.exit("использование: detect.py static-output КАТАЛОГ [ВЫХОД] [built] | drop-links КАТАЛОГ")
 
 
 if __name__ == "__main__":

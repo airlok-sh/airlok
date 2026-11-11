@@ -4,24 +4,29 @@
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "recipes"))
 
-from detect import BUN_SETUP, DEFAULT_GO, DEFAULT_NODE, DEFAULT_PYTHON, NPM_INSTALL, DetectError, detect, shell_exec, static_output  # noqa: E402
+from detect import BUN_SETUP, DEFAULT_GO, DEFAULT_NODE, DEFAULT_PYTHON, NPM_INSTALL, DetectError, detect, drop_outside_links, shell_exec, static_output  # noqa: E402
 from dockerfile import guess_port  # noqa: E402
 from manifest import ManifestError, parse  # noqa: E402
 
 
-def project(files):
+def project(files, links=None):
     root = tempfile.mkdtemp()
     for name, text in files.items():
         path = os.path.join(root, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
+    for name, target in (links or {}).items():
+        path = os.path.join(root, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.symlink(target, path)
     return root
 
 
@@ -244,6 +249,25 @@ services:
             with self.assertRaises(ManifestError, msg=build):
                 parse(None, project({"compose.yml": f"services:\n  a: {{build: '{build}'}}\n", "Dockerfile": "FROM scratch\n"}))
 
+    def test_links_outside_project(self):
+        outside = project({"secret": "x", "Dockerfile": "FROM scratch\n"})
+        compose = "services:\n  a: {build: {context: ctx, dockerfile: ../Dockerfile}}\n"
+        for target in (outside, "../..", "sub/../.."):
+            with self.assertRaisesRegex(ManifestError, "ссылка за пределы проекта", msg=target):
+                parse(None, project({"compose.yml": compose, "Dockerfile": "FROM scratch\n", "sub/x": "1"}, {"ctx": target}))
+        with self.assertRaisesRegex(ManifestError, "ссылка за пределы проекта"):
+            parse(None, project({"compose.yml": "services:\n  a: {build: ./srv}\n", "srv/x": "1"},
+                                {"srv/Dockerfile": os.path.join(outside, "Dockerfile")}))
+        with self.assertRaisesRegex(ManifestError, "ссылка за пределы проекта"):
+            parse({"version": 1, "build": {"dockerfile": "docker/App"}}, project(self.GO, {"docker/App": os.path.join(outside, "Dockerfile")}))
+
+    def test_links_inside_project(self):
+        compose = "services:\n  a: {build: {context: ctx}}\n"
+        values = parse(None, project({"compose.yml": compose, "sub/Dockerfile": "FROM scratch\n"}, {"ctx": "sub"}))
+        self.assertEqual((values["DOCKER_CONTEXT"], values["DOCKER_FILE"]), ("ctx", "ctx/Dockerfile"))
+        values = parse({"version": 1, "build": {"dockerfile": "Dockerfile"}}, project({"docker/App": "FROM scratch\n"}, {"Dockerfile": "docker/App"}))
+        self.assertEqual(values["DOCKER_FILE"], "Dockerfile")
+
     def test_broken_compose_is_skipped(self):
         values = parse(None, project({"compose.yml": "services: [\n", **self.GO}))
         self.assertEqual(values["APP_STACK"], "go")
@@ -259,6 +283,33 @@ services:
                  ({"ExposedPorts": {"80/tcp": {}, "443/tcp": {}}}, 80)]
         for config, want in cases:
             self.assertEqual(guess_port(config), want, config)
+
+
+class DropLinksTest(unittest.TestCase):
+    def test_drops_links_outside(self):
+        outside = project({"secret": "x"})
+        root = project({"sub/file": "1", "file": "2"}, {
+            "etc": outside, "up": "../..", "sub/up": "../../x", "abs": "/", "chain": "etc/secret",
+            "inside": "sub/file", "sub/back": "../file", "dir": "sub", "dangling": "sub/missing",
+        })
+        root_abs = os.path.join(root, "self")
+        os.symlink(os.path.join(root, "file"), root_abs)
+        self.assertEqual(drop_outside_links(root), ["abs", "chain", "etc", "self", "sub/up", "up"])
+        for kept in ("inside", "sub/back", "dir", "dangling"):
+            self.assertTrue(os.path.islink(os.path.join(root, kept)), kept)
+        self.assertEqual(sorted(os.listdir(root)), ["dangling", "dir", "file", "inside", "sub"])
+
+    def test_command_lists_dropped(self):
+        script = os.path.join(os.path.dirname(__file__), "..", "recipes", "detect.py")
+        root = project({"a": "1"})
+        out = subprocess.run([sys.executable, script, "drop-links", root], capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout, "", "без ссылок наружу — ни строчки")
+        for i in range(25):
+            os.symlink("/", os.path.join(root, f"l{i:02d}"))
+        out = subprocess.run([sys.executable, script, "drop-links", root], capture_output=True, text=True, check=True)
+        self.assertTrue(out.stdout.startswith("l00, l01, "), out.stdout)
+        self.assertTrue(out.stdout.endswith("l19 и ещё 5\n"), out.stdout)
+        self.assertEqual(os.listdir(root), ["a"])
 
 
 class ManifestTest(unittest.TestCase):

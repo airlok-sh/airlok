@@ -179,7 +179,8 @@ prepare_release() {
 	fi
 	rm -rf "$RELEASE" "${RELEASE}.built"
 	install -d -m 755 "$RELEASE"
-	rsync -a --exclude .git --exclude node_modules --exclude .next --exclude .venv --exclude __pycache__ \
+	# --safe-links: ссылки за пределы проекта не копируются, если код пришёл не через github-deploy.sh.
+	rsync -a --safe-links --exclude .git --exclude node_modules --exclude .next --exclude .venv --exclude __pycache__ \
 		--exclude '.env*' "$src/" "$RELEASE/"
 	chown -R "$BUILD_USER:$BUILD_USER" "$RELEASE"
 	if [[ -n $(find "$src" -maxdepth 1 -name '.env*' ! -name '*.example') ]]; then
@@ -227,6 +228,15 @@ build_container() {
 	fi
 }
 
+# release_path ПУТЬ — путь внутри релиза с развёрнутыми ссылками; ошибка, если он выходит наружу.
+# Docker разворачивает ссылку в корне контекста и читает Dockerfile по ссылке от root.
+release_path() {
+	local root path
+	root=$(realpath -e "$RELEASE") && path=$(realpath -e "${RELEASE}/$1") || return 1
+	[[ $path == "$root" || $path == "$root"/* ]] || return 1
+	printf '%s' "$path"
+}
+
 # build_image ЛОГ — сборка образа по Dockerfile проекта. Значения переменных сборки docker берёт из
 # окружения: в ps их не видно. Шаги RUN идут в обычном контейнере сборки, а не на самом сервере.
 build_image() {
@@ -237,12 +247,24 @@ build_image() {
 		[[ -n $line ]] && args+=(--build-arg "$line")
 	done <<<"$DOCKER_ARGS"
 	[[ -n $DOCKER_TARGET ]] && args+=(--target "$DOCKER_TARGET")
-	local run=(env "${BUILD_ENV[@]}" docker build "${args[@]}" -t "$RUN_IMAGE" -f "${RELEASE}/${DOCKER_FILE}" "${RELEASE}/${DOCKER_CONTEXT}")
+	local context file
+	context=$(release_path "$DOCKER_CONTEXT") || die "каталог сборки ${DOCKER_CONTEXT} — ссылка за пределы проекта, так нельзя"
+	file=$(release_path "$DOCKER_FILE") || die "${DOCKER_FILE} — ссылка за пределы проекта, так нельзя"
+	local run=(env "${BUILD_ENV[@]}" docker build "${args[@]}" -t "$RUN_IMAGE" -f "$file" "$context")
 	if [[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]]; then
 		"${run[@]}" 2>&1 | tee "$1"
 	else
 		"${run[@]}" >"$1" 2>&1
 	fi
+}
+
+# next_cache — точка монтирования кэша Next.js. Каталог создаёт root, а .next писала сборка:
+# ссылкой она направила бы его в любое место сервера.
+next_cache() {
+	if [[ -L ${RELEASE}/.next || -L ${RELEASE}/.next/cache ]]; then
+		die "сборка оставила .next ссылкой — так нельзя, .next должен быть обычным каталогом"
+	fi
+	install -d "${RELEASE}/.next/cache"
 }
 
 build() {
@@ -281,7 +303,7 @@ build() {
 		fi
 		die "сборка не удалась, полный лог: ${log}"
 	fi
-	[[ $APP_STACK == nextjs ]] && install -d "${RELEASE}/.next/cache"
+	[[ $APP_STACK == nextjs ]] && next_cache
 	# Каталог сайта проверяем сразу: без index.html выкатывать нечего.
 	[[ $APP_STACK == static ]] && { static_root >/dev/null || exit 1; }
 	chown -R root:root "$RELEASE"
@@ -824,6 +846,21 @@ ensure_domain_free() {
 	done
 }
 
+# Проект compose, который человек поднял сам под тем же именем: compose пересоздал бы его службы db
+# и app своими, а чужой том ИМЯ_pgdata подключил бы как базу приложения. Проверяем на каждой
+# публикации: чужой проект мог появиться и после первой.
+ensure_project_free() {
+	local foreign
+	foreign=$(foreign_containers "$APP_NAME" "$APP_DIR") || die "Docker не ответил, какие контейнеры уже есть на сервере — причина выше"
+	if [[ -n $foreign ]]; then
+		foreign=$(awk -F'\t' '{printf "%s%s (%s)", sep, $2, ($3 == "" ? "папка неизвестна" : "из " $3); sep = ", "}' <<<"$foreign")
+		die "на сервере уже есть проект Docker Compose ${APP_NAME}, запущенный не Airlok: ${foreign}. Создайте приложение под другим именем или уберите тот проект сами — его контейнеры Airlok не трогает"
+	fi
+	if ((DB_ENABLED)) && [[ ! -s $APP_DIR/shared/db.env ]] && docker volume inspect "${APP_NAME}_pgdata" >/dev/null 2>&1; then
+		die "на сервере уже есть том Docker ${APP_NAME}_pgdata, который создал не Airlok: в нём могут быть чужие данные. Создайте приложение под другим именем или удалите том сами, если он точно не нужен: docker volume rm ${APP_NAME}_pgdata"
+	fi
+}
+
 deploy_finished() {
 	# RELEASE_ID, а не RELEASE: при откате RELEASE указывает уже на предыдущую версию.
 	local code=$1 version=${RELEASE_ID:-} took=$((SECONDS - STARTED))
@@ -935,6 +972,7 @@ main() {
 
 	# До сборки: занятый домен выяснится за секунду, а не после нескольких минут npm.
 	[[ $APP_KIND == web ]] && ensure_domain_free
+	ensure_project_free
 	ensure_users
 	layout
 	save_panel_domain

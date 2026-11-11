@@ -58,8 +58,13 @@ async function fakeDashboard(servers = [], { devices = true } = {}) {
       res.end(JSON.stringify(data))
     }
     const p = new URL(req.url, 'http://x').pathname
+    if (p === '/api/cli/v1/token' && state.scopes) {
+      const scope = state.scopes[req.headers.authorization]
+      return scope ? send(200, { scope }) : send(401, { error: { code: 'unauthorized', message: 'x' } })
+    }
     if (p === '/api/cli/v1/servers' && req.method === 'GET') return send(200, { servers: state.servers })
     if (p === '/api/cli/v1/servers' && req.method === 'POST') {
+      state.createdWith = req.headers.authorization
       const s = { id: `id-${body.name}`, name: body.name, last_seen_at: null }
       state.servers.push(s)
       state.created.push(body.name)
@@ -372,4 +377,38 @@ test('server upgrade explains a busy or offline server and an unknown name', asy
   dash.state.upgradeError = 'os_upgrade_pending'
   assert.match(await run('prod'), /уже идёт/)
   assert.match(await run('nope'), /Сервера nope нет/)
+})
+
+async function savedLogin(url, token) {
+  const dir = await home()
+  await mkdir(join(dir, 'airlok'), { recursive: true })
+  if (token) await writeFile(join(dir, 'airlok', 'config.json'), JSON.stringify({ url, token, login: 'dmitry' }))
+  return dir
+}
+
+test('server connect takes the saved CLI login over a dashboard token in AIRLOK_TOKEN', async (t) => {
+  const dash = await fakeDashboard()
+  t.after(dash.close)
+  dash.state.scopes = { 'Bearer airlok_pat_ai': 'mcp', 'Bearer airlok_pat_login': 'cli' }
+  const sys = fakeSystem(dash, [{ code: 0 }, { code: 0, output: 'Сервер готов.', online: true }])
+  const io = captureIO()
+  const env = { AIRLOK_URL: dash.url, AIRLOK_TOKEN: 'airlok_pat_ai', HOME: await home(), XDG_CONFIG_HOME: await savedLogin(dash.url, 'airlok_pat_login') }
+  assert.equal(await main(['server', 'connect', '1.2.3.4'], io, env, sys), 0, io.errLines.join('\n'))
+  assert.equal(dash.state.createdWith, 'Bearer airlok_pat_login')
+  assert.match(io.errLines.join('\n'), /беру вход dmitry/)
+})
+
+test('server connect stops before ssh when only a dashboard token is there', async (t) => {
+  const dash = await fakeDashboard()
+  t.after(dash.close)
+  dash.state.scopes = { 'Bearer airlok_pat_ai': 'mcp', 'Bearer airlok_pat_old': undefined }
+  for (const saved of ['', 'airlok_pat_old']) {
+    const sys = fakeSystem(dash, [])
+    const io = captureIO()
+    const env = { AIRLOK_URL: dash.url, AIRLOK_TOKEN: 'airlok_pat_ai', HOME: await home(), XDG_CONFIG_HOME: await savedLogin(dash.url, saved) }
+    assert.equal(await main(['server', 'connect', '1.2.3.4'], io, env, sys), 1)
+    assert.deepEqual(sys.calls, [], 'ключ на сервер не кладётся')
+    assert.match(io.errLines.join('\n'), /npx @airlok\/cli login/)
+  }
+  assert.deepEqual(dash.state.created, [])
 })

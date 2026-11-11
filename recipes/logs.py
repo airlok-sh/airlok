@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from metrics import conf_value, load_json, save_json  # noqa: E402
 
 DASHBOARD_CONF = "/etc/airlok/dashboard.env"
+APPS_ROOT = "/srv/apps"
 STATE_DIR = "/var/lib/airlok/logs"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
@@ -222,7 +223,7 @@ def running_containers():
         out = subprocess.run(
             ["docker", "ps", "--no-trunc", "--filter", "label=com.docker.compose.project",
              "--format", ('{{.ID}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}'
-                          '\t{{.Label "com.docker.compose.oneoff"}}')],
+                          '\t{{.Label "com.docker.compose.oneoff"}}\t{{.Label "com.docker.compose.project.working_dir"}}')],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20, check=True,
         ).stdout
     except (OSError, subprocess.SubprocessError):
@@ -231,11 +232,13 @@ def running_containers():
 
 
 def parse_ps(out):
-    """Разовые контейнеры (docker compose run) пропускаются: их вывод приходит через очередь файлов."""
+    """Разовые контейнеры (docker compose run) пропускаются: их вывод приходит через очередь файлов.
+    Контейнеры проекта с именем приложения, но не из его папки, человек поднял сам: их вывод не берём."""
     found = {}
     for row in out.splitlines():
         parts = row.split("\t")
-        if len(parts) == 4 and parts[3] != "True" and CONTAINER.match(parts[0]) and NAME.match(parts[1]):
+        if (len(parts) == 5 and parts[3] != "True" and CONTAINER.match(parts[0]) and NAME.match(parts[1])
+                and parts[4] == os.path.join(APPS_ROOT, parts[1])):
             found[parts[0]] = (parts[1], parts[2] or "app")
     return found
 

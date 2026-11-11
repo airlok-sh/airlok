@@ -36,6 +36,14 @@ def is_file(root, name):
     return os.path.isfile(os.path.join(root, *name.split("/")))
 
 
+def inside(root, name):
+    """Путь внутри проекта и после разворота ссылок. Docker разворачивает ссылку в корне контекста
+    сборки и читает Dockerfile по ссылке от root, поэтому «ctx -> /etc» отдал бы в сборку каталог сервера."""
+    real_root = os.path.realpath(root)
+    path = os.path.realpath(os.path.join(root, *name.split("/"))) if name else real_root
+    return os.path.commonpath([real_root, path]) == real_root
+
+
 def valid_port(value):
     try:
         port = int(str(value).strip())
@@ -107,9 +115,13 @@ def service_source(root, compose, name, service):
         raise DockerfileError(f"{compose}: каталог сборки сервиса {name} ({context}) — вне каталога проекта. "
                               "Выберите каталогом проекта корень, от которого собирается сервис")
     context = "" if context == "." else context
+    if not inside(root, context):
+        raise DockerfileError(f"{compose}: каталог сборки сервиса {name} ({context}) — ссылка за пределы проекта, так нельзя")
     dockerfile = posixpath.normpath(posixpath.join(context, str(build.get("dockerfile") or "Dockerfile")))
     if dockerfile.startswith(("/", "../")) or dockerfile == ".." or not is_file(root, dockerfile):
         raise DockerfileError(f"{compose}: у сервиса {name} нет Dockerfile {dockerfile} в каталоге проекта")
+    if not inside(root, dockerfile):
+        raise DockerfileError(f"{compose}: Dockerfile сервиса {name} ({dockerfile}) — ссылка за пределы проекта, так нельзя")
     required, defaults = compose_env(service)
     return {"context": context, "dockerfile": dockerfile, "target": str(build.get("target") or ""), "service": name,
             "args": pairs(build.get("args")), "port": compose_port(service), "env": required, "defaults": defaults,
@@ -162,6 +174,8 @@ def find_source(root, dockerfile=""):
     if dockerfile:
         if not is_file(root, dockerfile):
             raise DockerfileError(f"airlok.yml: нет файла {dockerfile} из build.dockerfile")
+        if not inside(root, dockerfile):
+            raise DockerfileError(f"airlok.yml: {dockerfile} из build.dockerfile — ссылка за пределы проекта, так нельзя")
         return {"context": "", "dockerfile": dockerfile, "target": "", "service": "", "args": {}, "port": 0,
                 "env": [], "defaults": {}, "database": False, "warnings": []}
     src = from_compose(root)

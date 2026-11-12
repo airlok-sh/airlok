@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 
 RECIPES = os.path.join(os.path.dirname(__file__), "..", "recipes")
@@ -630,6 +631,120 @@ class UploadsGroupTest(unittest.TestCase):
         self.assertEqual(os.stat(self.outside).st_gid, before, "файл по ссылке не тронут")
         after = os.stat(os.path.dirname(self.top))
         self.assertEqual((after.st_gid, after.st_mode), (parent.st_gid, parent.st_mode), "каталог по ссылке не тронут")
+
+
+class SSHHardeningTest(AptCase):
+    def setUp(self):
+        super().setUp()
+        root = os.path.dirname(self.bin)
+        self.keys = os.path.join(root, "authorized_keys")
+        with open(self.keys, "w") as f:
+            f.write("ssh-ed25519 AAAA user@laptop\n")
+        self.units = os.path.join(root, "systemd")
+        os.makedirs(self.units)
+        self.unit = os.path.join(self.units, "airlok-ssh-guard.service")
+        self.dropin = os.path.join(root, "00-airlok.conf")
+        self.pending = os.path.join(root, "state", "ssh-pending")
+        self.rollback = os.path.join(root, "rollback")
+        self.fake("sshd", '[[ $1 == -t ]] && exit "${SSHD_T_RC:-0}"\n'
+                  'printf "%b\\n" "${SSHD_CONF:-passwordauthentication yes\\npermitrootlogin yes}"')
+        self.fake("systemctl", 'case $1 in\nstop) [[ -n ${TIMER:-} ]] ;;\nis-enabled) exit "${ENABLED_RC:-1}" ;;\n'
+                  'enable) exit "${ENABLE_RC:-0}" ;;\nesac')
+        self.fake("systemd-run", 'printf %%s "${@: -1}" >"%s"' % self.rollback)
+
+    def run_ssh(self, command, **env):
+        funcs = func("authorized_keys_present", "ssh_guard", "ssh_hardening", "confirm_ssh", "ssh_open") \
+            .replace("/root/.ssh/authorized_keys", self.keys).replace("/etc/systemd/system", self.units)
+        script = ('source "$1"; eval "$2"; %s; need_root() { :; }; SSH_DROPIN=$3 SSH_PENDING=$4 '
+                  'SSH_ROLLBACK_UNIT=airlok-ssh-rollback SSH_GUARD_UNIT=airlok-ssh-guard.service SSH_ROLLBACK_SECONDS=180; "$5"'
+                  % PORTABLE_WRITE)
+        base = {k: v for k, v in os.environ.items() if k not in ("SUDO_USER", "AIRLOK_SSH_USER")}
+        return subprocess.run(["bash", "-c", script, "bash", LIB, funcs, self.dropin, self.pending, command],
+                              capture_output=True, text=True, env={**base, "PATH": self.bin + os.pathsep + os.environ["PATH"], **env})
+
+    def guard(self):
+        with open(self.unit, encoding="utf-8") as f:
+            return dict(line.split("=", 1) for line in f.read().splitlines() if "=" in line)
+
+    def close(self):
+        out = self.run_ssh("ssh_hardening")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out
+
+    def test_closing_leaves_mark_that_survives_reboot(self):
+        before = int(time.time())
+        self.close()
+        self.assertTrue(os.path.exists(self.dropin))
+        with open(self.pending) as f:
+            self.assertGreaterEqual(int(f.read()), before + 180)
+        self.assertIn("systemctl enable --quiet airlok-ssh-guard.service", self.called())
+        unit = self.guard()
+        self.assertEqual(unit["ConditionPathExists"], self.pending)
+        self.assertEqual(unit["DefaultDependencies"], "no", "иначе Before=ssh.socket даёт цикл через basic.target")
+        self.assertEqual(unit["Before"].split(), ["ssh.service", "ssh.socket"])
+        self.assertEqual(unit["WantedBy"], "multi-user.target")
+
+    def test_guard_at_boot_returns_password(self):
+        self.close()
+        subprocess.run(self.guard()["ExecStart"].split(), check=True)
+        self.assertFalse(os.path.exists(self.dropin))
+        self.assertFalse(os.path.exists(self.pending))
+
+    def test_timer_rollback_removes_mark(self):
+        self.close()
+        with open(self.rollback) as f:
+            subprocess.run(["sh", "-c", f.read()], check=True, env={**os.environ, "PATH": self.bin + os.pathsep + os.environ["PATH"]})
+        self.assertFalse(os.path.exists(self.dropin))
+        self.assertFalse(os.path.exists(self.pending))
+
+    def test_confirm_removes_mark_and_keeps_closed(self):
+        self.close()
+        out = self.run_ssh("confirm_ssh", TIMER="1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(os.path.exists(self.pending))
+        self.assertTrue(os.path.exists(self.dropin))
+
+    def test_confirm_without_timer_keeps_mark(self):
+        self.close()
+        self.assertEqual(self.run_ssh("confirm_ssh").returncode, 0)
+        self.assertTrue(os.path.exists(self.pending), "откат не ставился или уже прошёл: закреплять нечего")
+
+    def test_open_removes_mark(self):
+        self.close()
+        out = self.run_ssh("ssh_open")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(os.path.exists(self.pending))
+        self.assertFalse(os.path.exists(self.dropin))
+
+    def test_guard_is_not_rewritten_on_next_closing(self):
+        self.close()
+        self.assertIn("systemctl daemon-reload", self.called())
+        os.remove(self.calls)
+        self.assertEqual(self.run_ssh("ssh_hardening", ENABLED_RC="0").returncode, 0)
+        calls = self.called()
+        self.assertNotIn("systemctl daemon-reload", calls)
+        self.assertFalse([c for c in calls if c.startswith("systemctl enable")])
+
+    def test_rejected_config_leaves_nothing(self):
+        out = self.run_ssh("ssh_hardening", SSHD_T_RC="1")
+        self.assertEqual(out.returncode, 1)
+        self.assertFalse(os.path.exists(self.dropin))
+        self.assertFalse(os.path.exists(self.pending))
+
+    def test_no_guard_no_closing(self):
+        out = self.run_ssh("ssh_hardening", ENABLE_RC="1")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("вход по паролю не трогали", out.stderr)
+        self.assertFalse(os.path.exists(self.dropin))
+        self.assertFalse(os.path.exists(self.pending))
+        self.assertFalse(os.path.exists(self.rollback))
+
+    def test_already_closed_needs_no_guard(self):
+        out = self.run_ssh("ssh_hardening", SSHD_CONF="passwordauthentication no\\npermitrootlogin without-password")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("уже настроен", out.stdout)
+        self.assertFalse(os.path.exists(self.unit))
+        self.assertFalse(os.path.exists(self.pending))
 
 
 if __name__ == "__main__":

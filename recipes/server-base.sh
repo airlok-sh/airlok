@@ -17,6 +17,8 @@ source "$(dirname "$0")/lib.sh"
 
 SSH_DROPIN=/etc/ssh/sshd_config.d/00-airlok.conf
 SSH_ROLLBACK_UNIT=airlok-ssh-rollback
+SSH_PENDING=/var/lib/airlok/ssh-pending
+SSH_GUARD_UNIT=airlok-ssh-guard.service
 # Агенту нужно окно дольше: человек идёт в терминал по подсказке из дашборда.
 SSH_ROLLBACK_SECONDS=${AIRLOK_SSH_ROLLBACK_SECONDS:-180}
 [[ $SSH_ROLLBACK_SECONDS =~ ^[1-9][0-9]{1,3}$ ]] || die "AIRLOK_SSH_ROLLBACK_SECONDS — число секунд от 10 до 9999"
@@ -367,6 +369,29 @@ authorized_keys_present() {
 	return 1
 }
 
+# Таймер отката systemd-run живёт в /run и пропадает при перезагрузке. Пока закрытие пароля
+# не подтверждено, лежит отметка, и этот юнит при загрузке, ещё до sshd, убирает настройки airlok.
+ssh_guard() {
+	if write_if_changed "/etc/systemd/system/$SSH_GUARD_UNIT" 0644 <<EOF; then
+[Unit]
+Description=airlok: вернуть вход по паролю, если его закрытие не подтвердили до перезагрузки
+ConditionPathExists=$SSH_PENDING
+DefaultDependencies=no
+After=local-fs.target
+Before=ssh.service ssh.socket
+
+[Service]
+Type=oneshot
+ExecStart=/bin/rm -f $SSH_DROPIN $SSH_PENDING
+
+[Install]
+WantedBy=multi-user.target
+EOF
+		systemctl daemon-reload || return 1
+	fi
+	systemctl is-enabled --quiet "$SSH_GUARD_UNIT" 2>/dev/null || systemctl enable --quiet "$SSH_GUARD_UNIT"
+}
+
 ssh_hardening() {
 	step "SSH"
 	if ! authorized_keys_present; then
@@ -380,6 +405,9 @@ ssh_hardening() {
 		ok "вход только по ключу уже настроен"
 		return
 	fi
+	ssh_guard || die "не удалось поставить откат SSH на случай перезагрузки, вход по паролю не трогали"
+	mkdir -p "${SSH_PENDING%/*}"
+	echo $(($(date +%s) + SSH_ROLLBACK_SECONDS)) >"$SSH_PENDING"
 	# Имя с 00-: sshd берёт первое найденное значение, а хостер кладёт свои
 	# PasswordAuthentication yes в 50-cloud-init.conf и подобные файлы.
 	cat >"$SSH_DROPIN" <<'EOF'
@@ -389,14 +417,14 @@ PermitRootLogin prohibit-password
 EOF
 	chmod 644 "$SSH_DROPIN"
 	if ! sshd -t; then
-		rm -f "$SSH_DROPIN"
+		rm -f "$SSH_DROPIN" "$SSH_PENDING"
 		die "sshd не принял настройки, вернули как было"
 	fi
 	systemctl reset-failed "$SSH_ROLLBACK_UNIT" 2>/dev/null || true
 	# AccuracySec: без него systemd вправе сдвинуть срабатывание на минуту.
 	systemd-run --quiet --unit="$SSH_ROLLBACK_UNIT" --on-active="$SSH_ROLLBACK_SECONDS" \
 		--timer-property=AccuracySec=1s \
-		/bin/sh -c "rm -f '$SSH_DROPIN' && systemctl reload ssh"
+		/bin/sh -c "rm -f '$SSH_DROPIN' '$SSH_PENDING' && systemctl reload ssh"
 	systemctl reload ssh
 	ok "вход по паролю выключен, root входит только по ключу"
 	# CLI проверяет вход по ключу сам, новым SSH-соединением, а агент ждёт такой вход в журнале sshd.
@@ -412,6 +440,7 @@ EOF
 confirm_ssh() {
 	need_root
 	if systemctl stop "${SSH_ROLLBACK_UNIT}.timer" 2>/dev/null; then
+		rm -f "$SSH_PENDING"
 		ok "откат SSH отменён, вход только по ключу закреплён"
 	else
 		note "таймер отката не найден: либо уже подтверждено, либо настройки уже откатились"
@@ -423,6 +452,7 @@ confirm_ssh() {
 ssh_open() {
 	step "SSH"
 	systemctl stop "${SSH_ROLLBACK_UNIT}.timer" 2>/dev/null || true
+	rm -f "$SSH_PENDING"
 	if [[ -e $SSH_DROPIN ]]; then
 		rm -f "$SSH_DROPIN"
 		sshd -t || die "sshd не принимает свои настройки без файла airlok: проверьте /etc/ssh/sshd_config"

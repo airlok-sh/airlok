@@ -27,10 +27,15 @@ def parse(cmd, env_path=os.devnull, query_path=os.devnull, keys_path=os.devnull)
 
 
 class ParseTest(unittest.TestCase):
-    def test_update_has_no_parameters(self):
+    def test_update_takes_only_sha(self):
+        sha = "a" * 40
         self.assertEqual(parse({"id": CID, "kind": "update"}), ["ok", CID, "update"])
+        self.assertEqual(parse({"id": CID, "kind": "update", "update": {"sha": sha}}), ["ok", CID, "update", sha])
         self.assertEqual(parse({"id": CID, "kind": "update", "deploy": {"app": "x; rm -rf /"}}), ["ok", CID, "update"],
-                         "поля у обновления не используются, что бы ни прислал дашборд")
+                         "другие поля у обновления не используются, что бы ни прислал дашборд")
+        for bad in ("a" * 39, "A" * 40, sha + "\n", "--upload-pack=x", ["a" * 40], None, 7):
+            self.assertEqual(parse({"id": CID, "kind": "update", "update": {"sha": bad}}), ["ok", CID, "update"], bad)
+        self.assertEqual(parse({"id": CID, "kind": "update", "update": sha}), ["ok", CID, "update"])
 
     def test_os_upgrade_action_is_checked(self):
         self.assertEqual(parse({"id": CID, "kind": "os_upgrade", "os_upgrade": {"action": "upgrade"}}), ["ok", CID, "os_upgrade", "upgrade"])
@@ -504,6 +509,77 @@ class ReleaseLinksTest(unittest.TestCase):
             os.makedirs(os.path.join(self.release, ".next"), exist_ok=True)
 
 
+class UploadsLayoutTest(unittest.TestCase):
+    """app-deploy.sh: закрытые загрузки не принадлежат группе nginx, открытые — принадлежат."""
+
+    def setUp(self):
+        with open(os.path.join(os.path.dirname(AGENT), "app-deploy.sh"), encoding="utf-8") as f:
+            src = f.read()
+        self.funcs = "\n".join(re.search(r"^%s\(\) \{\n.*?\n\}\n" % name, src, re.M | re.S).group(0)
+                               for name in ("layout", "uploads_private"))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app_dir = os.path.join(self.tmp.name, "apps", "shop")
+        self.uploads = os.path.join(self.app_dir, "shared", "uploads")
+        self.bin = os.path.join(self.tmp.name, "bin")
+        self.calls = os.path.join(self.tmp.name, "calls")
+        self.group = os.path.join(self.tmp.name, "group")
+        os.makedirs(self.bin)
+        fakes = {
+            # Каталоги создаём по-настоящему: layout смотрит, есть ли уже загрузки.
+            "install": 'for a; do last=$a; done; mkdir -p "$last"',
+            "stat": 'cat "%s"' % self.group,
+            "python3": "",
+            "chgrp": "",
+            "chmod": "",
+        }
+        for name, body in fakes.items():
+            path = os.path.join(self.bin, name)
+            with open(path, "w") as f:
+                f.write('#!/bin/bash\necho "%s $*" >>"%s"\n%s\n' % (name, self.calls, body))
+            os.chmod(path, 0o755)
+
+    def run_layout(self, public, existing_group=None):
+        if existing_group:
+            os.makedirs(self.uploads)
+            with open(self.group, "w") as f:
+                f.write(existing_group + "\n")
+        script = ('source "$1"; eval "$2"; mount_noexec() { :; }; APPS_ROOT=$3/apps APP_DIR=$3/apps/shop APP_USER=app-shop '
+                  'APP_GID=1234 UPLOADS_ENABLED=1 UPLOADS_PUBLIC=$4 DATA_ENABLED=0; layout; uploads_private')
+        out = subprocess.run(["bash", "-c", script, "bash", LIB, self.funcs, self.tmp.name, str(int(public))],
+                             env={**os.environ, "PATH": self.bin + os.pathsep + os.environ["PATH"]}, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        with open(self.calls) as f:
+            return [line.replace(self.tmp.name, "") for line in f.read().splitlines()]
+
+    def test_private_is_created_without_nginx_group(self):
+        calls = self.run_layout(False)
+        self.assertIn("install -d -m 750 -o app-shop -g 1234 /apps/shop/shared/uploads", calls)
+        self.assertNotIn("www-data", " ".join(calls))
+        self.assertEqual(calls[-2:], ["chgrp 1234 /apps/shop/shared/uploads", "chmod 00750 /apps/shop/shared/uploads"])
+
+    def test_private_existing_is_closed_only_after_site(self):
+        calls = self.run_layout(False, existing_group="www-data")
+        self.assertFalse([c for c in calls if c.endswith("/shared/uploads") and c.startswith("install")],
+                         "до нового конфига сайта прежний ещё может отдавать загрузки")
+        self.assertEqual(calls[-2:], ["chgrp 1234 /apps/shop/shared/uploads", "chmod 00750 /apps/shop/shared/uploads"])
+
+    def test_public_is_served_by_nginx(self):
+        calls = self.run_layout(True)
+        self.assertIn("install -d -m 2750 -o app-shop -g www-data /apps/shop/shared/uploads", calls)
+        self.assertFalse([c for c in calls if c.split()[0] in ("python3", "chgrp", "chmod")])
+
+    def test_public_after_private_regroups_files(self):
+        calls = self.run_layout(True, existing_group="app-shop")
+        regroup = calls.index("python3 %s/serverbase.py uploads-group /apps/shop/shared/uploads www-data"
+                               % os.path.realpath(os.path.dirname(AGENT)))
+        self.assertLess(regroup, calls.index("install -d -m 2750 -o app-shop -g www-data /apps/shop/shared/uploads"))
+
+    def test_public_already_served_is_not_walked(self):
+        calls = self.run_layout(True, existing_group="www-data")
+        self.assertFalse([c for c in calls if c.startswith("python3")])
+
+
 class HeartbeatTest(unittest.TestCase):
     def test_reports_caps(self):
         with open(os.path.join(os.path.dirname(AGENT), "healthcheck.sh"), encoding="utf-8") as f:
@@ -607,3 +683,58 @@ class HealthTest(unittest.TestCase):
             with open(rel + ".health", "w") as f:
                 f.write("/healthz")
             self.assertEqual(run(), "[/healthz]")
+
+
+class StoreLinkTest(unittest.TestCase):
+    """app-data.sh: временная ссылка хранилища уходит в curl через stdin, а не аргументом — иначе её видно в ps."""
+
+    LINK = "https://s3.example/b/x.sql.gz?X-Amz-Signature=abc&X-Amz-Expires=7200"
+
+    def setUp(self):
+        with open(os.path.join(os.path.dirname(AGENT), "app-data.sh"), encoding="utf-8") as f:
+            src = f.read()
+        self.funcs = "\n".join([re.search(r"^STORE_URL_RE=.*$", src, re.M).group(0),
+                                re.search(r"^check_store_url\(\) \{.*\}$", src, re.M).group(0)] + [
+            re.search(r"^%s\(\) \{\n.*?\n\}\n" % name, src, re.M | re.S).group(0) for name in ("put", "get")])
+        self.tmp = tempfile.TemporaryDirectory()
+        self.bin = os.path.join(self.tmp.name, "bin")
+        os.makedirs(self.bin)
+        with open(os.path.join(self.bin, "curl"), "w") as f:
+            f.write('#!/bin/sh\nprintf "%s\\n" "$@" >"$ARGV"\ncat >"$STDIN"\n')
+        os.chmod(os.path.join(self.bin, "curl"), 0o755)
+        self.argv = os.path.join(self.tmp.name, "argv")
+        self.stdin = os.path.join(self.tmp.name, "stdin")
+        self.file = os.path.join(self.tmp.name, "db.sql.gz")
+        open(self.file, "w").close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_func(self, call, link):
+        env = {**os.environ, "PATH": self.bin + ":" + os.environ["PATH"], "ARGV": self.argv, "STDIN": self.stdin}
+        return subprocess.run(["bash", "-c", 'source "$1"; eval "$2"; ' + call, "bash", LIB, self.funcs, self.file, link],
+                              env=env, capture_output=True, text=True)
+
+    def read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def test_link_not_in_argv(self):
+        for call in ('put "$3" "$4"', 'get "$4" "$3"'):
+            with self.subTest(call=call):
+                out = self.run_func(call, self.LINK)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                argv = self.read(self.argv).splitlines()
+                self.assertNotIn(self.LINK, self.read(self.argv))
+                self.assertIn("-K", argv)
+                self.assertEqual(self.read(self.stdin), 'url = "%s"\n' % self.LINK)
+
+    def test_rejects_link_that_breaks_config(self):
+        for link in ('https://s3.example/x"\nupload-file = "/etc/shadow', "https://s3.example/x\\y", "https://s3.example/x'y",
+                     "http://s3.example/x", ""):
+            for call in ('put "$3" "$4"', 'get "$4" "$3"'):
+                with self.subTest(link=link, call=call):
+                    out = self.run_func(call, link)
+                    self.assertNotEqual(out.returncode, 0)
+                    self.assertIn("некорректная ссылка хранилища", out.stderr)
+                    self.assertFalse(os.path.exists(self.argv), "curl не должен запускаться")

@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { gunzipSync } from 'node:zlib'
 
-import { certOnly, checkFiles, homeProblem, listFiles, npmrcSecret, pack, privateKind, skipped, splitName } from '../src/pack.js'
+import { certOnly, checkFiles, homeProblem, ignoredBy, ignoreFilter, ignoreRules, listFiles, npmrcSecret, pack, privateKind, skipped, splitName } from '../src/pack.js'
 import { untar } from './untar.js'
 
 async function project(files) {
@@ -160,6 +160,44 @@ test('listFiles keeps .gitignore for a folder whose contents are ignored but not
   assert.equal(pub.allIgnored, false)
   assert.equal(pub.git, true)
   assert.deepEqual(pub.files.map((f) => f.path), ['index.html'])
+})
+
+// Те же случаи, что в тестах дашборда (web/src/folder.test.ts): правила должны совпадать.
+test('ignoredBy excludes what git would and skips lines it does not understand', () => {
+  const rules = ignoreRules([
+    '# comment', '', 'leads.csv', '*.log', 'uploads/', '/root-only.txt', 'docs/*.md', '!docs/keep.md', '**/cache', 'out/**',
+    'a/**/z.txt', 'tmp', '!tmp/keep.txt', 'b[0-9].txt', 'weird\\ name', 'trail.txt   ',
+  ].join('\n'))
+  for (const p of ['leads.csv', 'data/leads.csv', 'app.log', 'logs/x/app.log', 'uploads/a.png', 'web/uploads/b.png', 'root-only.txt',
+    'docs/a.md', 'cache/x', 'web/cache/x', 'out/index.html', 'out/a/b.js', 'a/z.txt', 'a/b/c/z.txt', 'tmp/keep.txt', 'trail.txt']) {
+    assert.equal(ignoredBy(rules, p), true, p)
+  }
+  for (const p of ['index.html', 'uploads', 'web/root-only.txt', 'docs/keep.md', 'docs/sub/a.md', 'out', 'outer/a.js', 'b1.txt', 'weird name', 'log.txt']) {
+    assert.equal(ignoredBy(rules, p), false, p)
+  }
+})
+
+test('ignoreFilter drops .gitignore that would leave nothing, but always applies .airlokignore', () => {
+  const paths = ['.gitignore', 'index.html', 'app.js', 'notes.txt', 'node_modules/x.js']
+  const kept = (git, own) => {
+    const ignored = ignoreFilter(paths, git, own)
+    return paths.filter((p) => !ignored(p))
+  }
+  assert.deepEqual(kept('notes.txt', ''), ['.gitignore', 'index.html', 'app.js', 'node_modules/x.js'])
+  assert.deepEqual(kept('*\n!.gitignore', ''), paths)
+  assert.deepEqual(kept('*', 'app.js'), ['.gitignore', 'index.html', 'notes.txt', 'node_modules/x.js'])
+})
+
+test('listFiles follows .gitignore without git and .airlokignore always', async () => {
+  const plain = await project({ '.gitignore': 'leads.csv\nuploads/\n', 'index.html': 'h', 'leads.csv': 'phone', 'uploads/a.png': 'p', '.airlokignore': 'notes.md', 'notes.md': 'n' })
+  assert.deepEqual((await listFiles(plain)).files.map((f) => f.path), ['.airlokignore', '.gitignore', 'index.html'])
+  const repo = await project({ '.gitignore': 'debug.log\n', 'index.js': 'x', 'debug.log': 'l', '.airlokignore': 'docs/\n', 'docs/a.md': 'd' })
+  execFileSync('git', ['init', '-q'], { cwd: repo })
+  const { files, git } = await listFiles(repo)
+  assert.equal(git, true)
+  assert.deepEqual(files.map((f) => f.path), ['.airlokignore', '.gitignore', 'index.js'])
+  const site = await project({ '.gitignore': '*\n!.gitignore\n', 'index.html': 'h', 'a.js': 'a' })
+  assert.deepEqual((await listFiles(site)).files.map((f) => f.path), ['.gitignore', 'a.js', 'index.html'], '.gitignore папки сборки не учитываем')
 })
 
 test('pack makes a gzipped ustar archive under one top folder', async () => {

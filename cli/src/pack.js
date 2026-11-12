@@ -37,6 +37,79 @@ export function skipped(path) {
   return /^\.env(\..+)?$/.test(name) && !/\.(example|sample|template)$/.test(name)
 }
 
+// Правила .gitignore и .airlokignore из корня папки: имя, *.ext, папка/, путь от корня, ** и «!».
+// Строки с классами [...] и экранированием \ пропускаем: лучше загрузить лишний файл, чем
+// потерять нужный. Те же правила у дашборда (web/src/folder.ts).
+export function ignoreRules(text) {
+  const rules = []
+  for (const raw of text.split(/\r?\n/)) {
+    let line = raw.trimEnd()
+    if (!line || line.startsWith('#') || /[[\\]/.test(line)) continue
+    const negate = line.startsWith('!')
+    if (negate) line = line.slice(1)
+    const dirOnly = line.endsWith('/')
+    line = line.replace(/\/+$/, '')
+    // Шаблон с «/» в начале или в середине считается от корня папки, без него — имя на любой глубине.
+    const anchored = line.includes('/')
+    line = line.replace(/^\/+/, '')
+    if (line) rules.push({ re: globRe(line), negate, dirOnly, anchored })
+  }
+  return rules
+}
+
+function globRe(glob) {
+  let re = ''
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i]
+    const wholeSegment = c === '*' && glob[i + 1] === '*' && (i === 0 || glob[i - 1] === '/') && (i + 2 === glob.length || glob[i + 2] === '/')
+    if (wholeSegment && i + 2 === glob.length) {
+      re += '.*'
+      i++
+    } else if (wholeSegment) {
+      re += '(?:.*/)?'
+      i += 2
+    } else if (c === '*') re += '[^/]*'
+    else if (c === '?') re += '[^/]'
+    else re += c.replace(/[.+^${}()|]/g, '\\$&')
+  }
+  return new RegExp(`^${re}$`)
+}
+
+// lastMatch — решение последнего совпавшего правила: true — исключить, false — оставить, null — не совпало.
+function lastMatch(rules, path, isDir) {
+  const base = path.slice(path.lastIndexOf('/') + 1)
+  let out = null
+  for (const r of rules) {
+    if ((!r.dirOnly || isDir) && r.re.test(r.anchored ? path : base)) out = !r.negate
+  }
+  return out
+}
+
+// ignoredBy — файл исключён правилами. Как в git, файл из исключённой папки «!» не вернёт.
+export function ignoredBy(rules, path) {
+  if (rules.length === 0) return false
+  const parts = path.split('/')
+  for (let i = 1; i < parts.length; i++) {
+    if (lastMatch(rules, parts.slice(0, i).join('/'), true)) return true
+  }
+  return lastMatch(rules, path, false) === true
+}
+
+const ignoreFiles = ['.gitignore', '.airlokignore']
+
+// ignoreFilter — что исключить по .gitignore и .airlokignore из корня папки. .gitignore с «*»
+// бывает у папки сборки (dist, build): git она не нужна, но публикуют как раз её — если
+// .gitignore исключил бы все файлы, его не учитываем. .airlokignore действует всегда.
+export function ignoreFilter(paths, gitignore, airlokignore) {
+  const own = ignoreRules(airlokignore)
+  const git = ignoreRules(gitignore)
+  const ownIgnored = (p) => ignoredBy(own, p)
+  if (git.length === 0) return ownIgnored
+  const kept = (p) => p !== '' && !ignoreFiles.includes(p) && !skipped(p) && !ownIgnored(p) && !ignoredBy(git, p)
+  if (!paths.some(kept)) return ownIgnored
+  return (p) => ownIgnored(p) || ignoredBy(git, p)
+}
+
 // Ключи и учётные данные в архив не идут никогда, а базы и выгрузки — только с согласия
 // человека: сборке они бывают нужны. Те же правила у дашборда (web/src/folder.ts), а сборщик
 // статики и edge не отдают такие файлы с сайта (cluster.PrivateFile).
@@ -109,17 +182,21 @@ export function homeProblem(dir, home) {
 // allIgnored — сама папка не в .gitignore, но git не дал из неё ни одного файла (в ней свой
 // .gitignore с «*»): её тоже обходим сами, а человеку об этом сообщаем.
 // secrets — пропущенные ключи и учётные данные, data — базы и выгрузки: в files их нет,
-// взять их решает вызывающий.
+// взять их решает вызывающий. .airlokignore действует всегда, а свой разбор .gitignore —
+// только без git: git учитывает его точнее, с вложенными и общими правилами.
 export async function listFiles(dir) {
   const fromGit = await gitFiles(dir)
   const ignored = fromGit !== null && (await gitIgnored(dir))
   const useGit = fromGit !== null && fromGit.length > 0 && !ignored
   const paths = useGit ? fromGit : await walk(dir, '')
   const allIgnored = fromGit !== null && !useGit && !ignored && paths.length > 0
+  const rootText = (name) => readFile(join(dir, name), 'utf8').catch(() => '')
+  const excluded = ignoreFilter(paths.filter((p) => !p.endsWith('/')), useGit ? '' : await rootText('.gitignore'), await rootText('.airlokignore'))
   const files = []
   const data = []
   const secrets = new Set()
   for (const path of paths) {
+    if (excluded(path)) continue
     if (path.endsWith('/')) {
       secrets.add(path)
       continue

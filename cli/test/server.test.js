@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 
 import { main } from '../src/main.js'
-import { defaultName, installCommand, parseTarget, osUpdatesText, sshFailure } from '../src/server.js'
+import { defaultName, installCommand, installFailure, parseTarget, osUpdatesText, sshFailure } from '../src/server.js'
 
 test('parseTarget', () => {
   assert.deepEqual(parseTarget('1.2.3.4'), { user: 'root', host: '1.2.3.4', dest: 'root@1.2.3.4' })
@@ -24,15 +24,27 @@ test('defaultName fits the dashboard name rules', () => {
   assert.equal(defaultName('2a01::1'), '2a01--1')
 })
 
+const FETCH =
+  `command -v curl >/dev/null 2>&1 || { echo 'airlok: на сервере нет curl' >&2; exit 96; }; ` +
+  `s=$(curl -fsSL https://airlok.ru/install.sh) && [ -n "$s" ] || { echo 'airlok: не скачался установщик https://airlok.ru/install.sh' >&2; exit 97; }; `
+
 test('installCommand never carries the token and checks what goes into the shell', () => {
-  assert.equal(installCommand('https://app.airlok.ru'), 'bash -c "$(curl -fsSL https://airlok.ru/install.sh)" install https://app.airlok.ru')
+  assert.equal(installCommand('https://app.airlok.ru'), `${FETCH}bash -c "$s" install https://app.airlok.ru`)
   assert.equal(
     installCommand('https://app.airlok.ru', { letsencrypt: true, email: 'a@b.ru', keysOnly: true, root: false }),
-    'sudo -n env AIRLOK_SSH_CONFIRM=cli bash -c "$(curl -fsSL https://airlok.ru/install.sh)" install https://app.airlok.ru --letsencrypt a@b.ru --ssh-keys-only',
+    `${FETCH}sudo -n env AIRLOK_SSH_CONFIRM=cli bash -c "$s" install https://app.airlok.ru --letsencrypt a@b.ru --ssh-keys-only`,
   )
+  assert.equal(installCommand('https://app.airlok.ru', { root: false }), `${FETCH}sudo -n bash -c "$s" install https://app.airlok.ru`)
   assert.match(installCommand('http://localhost:8080', { letsencrypt: true }), /install http:\/\/localhost:8080 --letsencrypt$/)
   assert.throws(() => installCommand('https://x.ru/$(id)'), /адрес дашборда/)
   assert.throws(() => installCommand('https://x.ru', { email: 'a@b.ru;id' }), /email/)
+})
+
+test('installFailure tells a missing curl and a failed download from the installer itself', () => {
+  assert.match(installFailure(96, 'airlok: на сервере нет curl', '1.2.3.4'), /нет curl.*apt install curl/)
+  assert.match(installFailure(97, 'curl: (6) Could not resolve host: airlok.ru\nairlok: не скачался установщик', '1.2.3.4'), /не смог скачать установщик.*DNS/)
+  assert.equal(installFailure(97, 'Ошибка: что-то в установщике', '1.2.3.4'), null, 'тот же код из install.sh — не про скачивание')
+  assert.equal(installFailure(1, 'airlok: что-то', '1.2.3.4'), null)
 })
 
 test('sshFailure', () => {
@@ -139,7 +151,7 @@ test('server connect with a working key installs without asking anything', async
   assert.ok(!probe.args.includes('-i'), 'своего ключа Airlok ещё нет — пускают ключи человека')
   assert.equal(install.input, 'airlok_srv_secret\n', 'токен идёт через stdin')
   assert.ok(!install.args.join(' ').includes('airlok_srv_'), 'и не попадает в аргументы')
-  assert.equal(install.args.at(-1), `bash -c "$(curl -fsSL https://airlok.ru/install.sh)" install ${dash.url} --letsencrypt`)
+  assert.equal(install.args.at(-1), `${FETCH}bash -c "$s" install ${dash.url} --letsencrypt`)
   assert.deepEqual(install.args.slice(-3, -1), ['--', 'root@1.2.3.4'])
 
   const res = JSON.parse(io.outLines[0])
@@ -184,7 +196,7 @@ test('server connect in a terminal makes a key, puts it on the server and confir
   assert.equal(sys.calls[2].input, 'ssh-ed25519 AAAA airlok@test\n')
   assert.ok(!sys.calls[2].args.includes('BatchMode=yes'), 'здесь ssh спрашивает пароль')
   assert.ok(sys.calls[4].args.includes(key))
-  assert.match(sys.calls[4].args.at(-1), /^env AIRLOK_SSH_CONFIRM=cli bash .* --ssh-keys-only$/)
+  assert.match(sys.calls[4].args.at(-1), /; env AIRLOK_SSH_CONFIRM=cli bash .* --ssh-keys-only$/)
   assert.match(sys.calls[5].args.at(-1), /confirm-ssh/)
   assert.deepEqual(dash.state.created, ['prod'])
   assert.match(io.errLines.join('\n'), /Вход по паролю закрыт/)
@@ -267,6 +279,28 @@ test('server connect explains a failed install and a changed host key', async (t
   const changed = captureIO()
   assert.equal(await main(['server', 'connect', '5.6.7.8'], changed, env, fakeSystem(dash, [{ code: 255, output: 'Host key verification failed.' }])), 1)
   assert.match(changed.errLines.join('\n'), /ssh-keygen -R 5\.6\.7\.8/)
+})
+
+test('server connect stops at once when the server cannot fetch the installer', async (t) => {
+  const dash = await fakeDashboard()
+  t.after(dash.close)
+  const env = { AIRLOK_URL: dash.url, AIRLOK_TOKEN: 't', HOME: await home() }
+  const cases = [
+    [97, 'curl: (6) Could not resolve host: airlok.ru\nairlok: не скачался установщик https://airlok.ru/install.sh', /не смог скачать установщик https:\/\/airlok\.ru\/install\.sh/],
+    [96, 'airlok: на сервере нет curl', /нет curl.*apt install curl/],
+  ]
+  for (const [code, output, reason] of cases) {
+    const io = captureIO()
+    const sys = fakeSystem(dash, [{ code: 0 }, { code, output }])
+    assert.equal(await main(['server', 'connect', 'root@1.2.3.4', '--ssh-keys-only', '--json'], io, env, sys), 1)
+    const err = io.errLines.join('\n')
+    assert.match(err, reason)
+    assert.doesNotMatch(err, /Установка прошла|Жду, когда агент|Установка не закончилась/)
+    assert.equal(sys.calls.length, 2, 'без проверки входа по ключу и ожидания агента')
+    const res = JSON.parse(io.outLines[0])
+    assert.equal(res.status, 'error')
+    assert.match(res.message, reason)
+  }
 })
 
 async function connectWith(t, { osUpdates, answers = [], tty = false, args = [], ...state }) {

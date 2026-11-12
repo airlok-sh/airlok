@@ -12,7 +12,13 @@ BUILD_USER=airlok-build
 PG_IMAGE=postgres:16
 # Статику отдаёт nginx без root внутри контейнера: тот же откат, проверки и изоляция,
 # что у приложений.
-STATIC_IMAGE=nginxinc/nginx-unprivileged:1.27-alpine
+STATIC_IMAGE=nginxinc/nginx-unprivileged:1.30-alpine
+# Базовые образы Docker сам не обновляет: берёт, только если их нет. Публикация скачивает их заново,
+# но не чаще раза в сутки, а после неудачи — не чаще раза в час: недоступный Docker Hub не должен
+# задерживать каждую публикацию.
+BASE_STAMPS=/var/lib/airlok/images
+BASE_PULL_MINUTES=1440
+BASE_RETRY_MINUTES=60
 # Порт приложения внутри контейнера; снаружи он доступен только nginx сервера.
 CONTAINER_PORT=8080
 KEEP_RELEASES=3
@@ -66,9 +72,19 @@ layout() {
 	install -d -m 700 -o root -g root "$APP_DIR/shared/backups"
 	ok "код в ${APP_DIR}/releases: владелец root, приложению только чтение"
 	if ((UPLOADS_ENABLED)); then
-		# setgid на каталоге: новые файлы получают группу www-data, и nginx может их отдавать.
-		install -d -m 2750 -o "$APP_USER" -g www-data "$APP_DIR/shared/uploads"
-		mount_noexec "$APP_DIR/shared/uploads"
+		local uploads=$APP_DIR/shared/uploads
+		if ((UPLOADS_PUBLIC)); then
+			# Файлам, загруженным, пока загрузки были закрыты, nginx нужна та же группа.
+			if [[ -d $uploads && $(stat -c %G "$uploads") != www-data ]]; then
+				python3 "$RECIPES_DIR/serverbase.py" uploads-group "$uploads" www-data ||
+					die "не удалось открыть nginx файлы в ${uploads}"
+			fi
+			# setgid на каталоге: новые файлы получают группу www-data, и nginx может их отдавать.
+			install -d -m 2750 -o "$APP_USER" -g www-data "$uploads"
+		elif [[ ! -d $uploads ]]; then
+			install -d -m 750 -o "$APP_USER" -g "$APP_GID" "$uploads"
+		fi
+		mount_noexec "$uploads"
 		ok "загрузки в ${APP_DIR}/shared/uploads: единственное место с записью, noexec"
 	fi
 	if ((DATA_ENABLED)); then
@@ -78,6 +94,16 @@ layout() {
 	elif [[ -d $APP_DIR/shared/data ]]; then
 		note "постоянная папка больше не подключена, данные остались в ${APP_DIR}/shared/data"
 	fi
+}
+
+# uploads_private — закрыть от nginx загрузки, которые сайт не отдаёт. Только после nginx_site:
+# до него прежний конфиг сайта мог ещё отдавать их, и неудачная публикация оставила бы его без файлов.
+uploads_private() {
+	((UPLOADS_ENABLED && !UPLOADS_PUBLIC)) || return 0
+	chgrp "$APP_GID" "$APP_DIR/shared/uploads"
+	# Пять цифр: иначе chmod оставит каталогу setgid.
+	chmod 00750 "$APP_DIR/shared/uploads"
+	ok "загрузки закрыты от nginx: сайт их не отдаёт"
 }
 
 allocate_port() {
@@ -175,7 +201,7 @@ prepare_release() {
 			ok "релиз ${id} уже собран, используем его"
 			return
 		fi
-		note "переменные сборки изменились с прошлой сборки ${id} — собираем заново"
+		note "переменные сборки, версия среды или образ сборки изменились с прошлой сборки ${id} — собираем заново"
 	fi
 	rm -rf "$RELEASE" "${RELEASE}.built"
 	install -d -m 755 "$RELEASE"
@@ -204,6 +230,45 @@ images() {
 	docker) BUILD_IMAGE="" RUN_IMAGE="" ;;
 	*) BUILD_IMAGE=node:${NODE_VERSION}-bookworm-slim RUN_IMAGE=$BUILD_IMAGE ;;
 	esac
+}
+
+# pull_base ОБРАЗ — скачать базовый образ заново, если пора. Неудача публикацию не останавливает:
+# если образ уже есть, сборка идёт на прежнем, а если нет — его попробует скачать сама сборка.
+pull_base() {
+	local image=$1 stamp
+	stamp=$BASE_STAMPS/$(printf '%s' "$image" | tr -c 'A-Za-z0-9._-' '_')
+	[[ -n $(find "$stamp" -mmin "-${BASE_PULL_MINUTES}" 2>/dev/null) ]] && return 0
+	[[ -n $(find "${stamp}.failed" -mmin "-${BASE_RETRY_MINUTES}" 2>/dev/null) ]] && return 0
+	install -d -m 755 "$BASE_STAMPS"
+	if timeout 300 docker pull -q "$image" >/dev/null 2>&1; then
+		touch "$stamp"
+		rm -f "${stamp}.failed"
+		return 0
+	fi
+	touch "${stamp}.failed"
+	if docker image inspect "$image" >/dev/null 2>&1; then
+		note "не удалось обновить базовый образ ${image}, собираю на прежнем"
+	fi
+	return 0
+}
+
+# base_images — свежие базовые образы до сборки. Node.js, Python, nginx и Postgres живут в образе
+# запуска и обновляются при пересоздании контейнера, а Go вшит в собранную программу: для Go
+# идентификатор образа сборки входит в отпечаток релиза, и после обновления Go релиз собирается
+# заново. Образ по Dockerfile обновляет docker build --pull.
+# Имя образа сборки тоже входит в отпечаток: node_modules с нативными модулями и .venv собраны под
+# свою версию среды, а её меняет не только проект, но и обновление агента (правила выбора версии).
+base_images() {
+	local image id
+	for image in $BUILD_IMAGE $RUN_IMAGE; do pull_base "$image"; done
+	if ((DB_ENABLED)); then pull_base "$PG_IMAGE"; fi
+	if [[ -n $BUILD_IMAGE ]]; then
+		BUILD_ENV_SUM=$(printf '%s\n%s' "$BUILD_ENV_SUM" "$BUILD_IMAGE" | sha256sum | cut -d' ' -f1)
+	fi
+	if [[ $APP_STACK == go ]] && id=$(docker image inspect --format '{{.Id}}' "$BUILD_IMAGE" 2>/dev/null) && [[ -n $id ]]; then
+		BUILD_ENV_SUM=$(printf '%s\n%s' "$BUILD_ENV_SUM" "$id" | sha256sum | cut -d' ' -f1)
+	fi
+	return 0
 }
 
 # build_container СКРИПТ ЛОГ — установка зависимостей и сборка в контейнере. Значения
@@ -237,11 +302,12 @@ release_path() {
 	printf '%s' "$path"
 }
 
-# build_image ЛОГ — сборка образа по Dockerfile проекта. Значения переменных сборки docker берёт из
+# build_image ЛОГ [--pull] — сборка образа по Dockerfile проекта. Значения переменных сборки docker берёт из
 # окружения: в ps их не видно. Шаги RUN идут в обычном контейнере сборки, а не на самом сервере.
 build_image() {
 	local args=(--progress plain) pair line
 	docker buildx version >/dev/null 2>&1 || args=()
+	[[ ${2:-} == --pull ]] && args+=(--pull)
 	for pair in "${BUILD_ENV[@]}"; do args+=(--build-arg "${pair%%=*}"); done
 	while IFS= read -r line; do
 		[[ -n $line ]] && args+=(--build-arg "$line")
@@ -256,6 +322,16 @@ build_image() {
 	else
 		"${run[@]}" >"$1" 2>&1
 	fi
+}
+
+# base_unreachable ЛОГ — сборка упала, не достучавшись до реестра базового образа, а не на шаге
+# проекта и не из-за опечатки в FROM: отказ Docker Hub (hub_failed) или сетевой сбой чужого реестра.
+base_unreachable() {
+	hub_failed "$1" && return 0
+	local lines
+	lines=$(grep -E 'failed to resolve source metadata for|failed to authorize: failed to fetch|Error response from daemon: (Get|Head) "?https://' "$1" |
+		grep -viE 'pull access denied|manifest unknown|not found|repository does not exist|requested access to the resource is denied|\b401\b|unauthorized') || return 1
+	grep -qiE 'toomanyrequests|\b(429|50[234])\b|timeout|timed out|connection reset|connection refused|no such host|misbehaving|name resolution|deadline exceeded|network is unreachable|EOF' <<<"$lines"
 }
 
 # next_cache — точка монтирования кэша Next.js. Каталог создаёт root, а .next писала сборка:
@@ -281,9 +357,17 @@ build() {
 		while IFS= read -r line; do
 			[[ -n $line ]] && note "внимание: $line"
 		done <<<"$DOCKER_WARNINGS"
-		if ! build_image "$log"; then
+		# --pull: иначе Docker собирал бы на том образе из FROM, что скачал когда-то впервые.
+		local built=0
+		if build_image "$log" --pull; then
+			built=1
+		elif base_unreachable "$log"; then
+			note "не удалось обновить базовые образы из ${DOCKER_FILE} — собираю на тех, что уже есть на сервере"
+			build_image "$log" && built=1
+		fi
+		if ((!built)); then
 			[[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]] || tail -30 "$log" >&2
-			die "сборка по ${DOCKER_FILE} не удалась, полный лог: ${log}"
+			die "сборка по ${DOCKER_FILE} не удалась, полный лог: ${log}$(hub_hint "$log")"
 		fi
 		chown -R root:root "$RELEASE"
 		chmod -R u+rwX,go+rX,go-w "$RELEASE"
@@ -301,7 +385,7 @@ build() {
 		if [[ -n $outside ]]; then
 			die "сборка пишет за пределы папки проекта (${outside#*, }): так бывает в монорепозитории, где фронтенд собирается в каталог бэкенда. Публикуйте каталог, в котором собирается всё приложение, или поправьте путь сборки. Полный лог: ${log}"
 		fi
-		die "сборка не удалась, полный лог: ${log}"
+		die "сборка не удалась, полный лог: ${log}$(hub_hint "$log")"
 	fi
 	[[ $APP_STACK == nextjs ]] && next_cache
 	# Каталог сайта проверяем сразу: без index.html выкатывать нечего.
@@ -614,15 +698,20 @@ deploy() {
 	save_compose
 	write_compose
 	if ((DB_ENABLED)); then
-		compose up -d --wait db >"$log" 2>&1 || die "база не запустилась, лог: ${log}"
+		compose up -d --wait db >"$log" 2>&1 || die "база не запустилась, лог: ${log}$(hub_hint "$log")"
 	fi
 	release_command "$prev"
+	# Без базы лог копится от публикации к публикации: про Docker Hub смотрим только этот запуск.
+	local mark
+	mark=$({ wc -c <"$log"; } 2>/dev/null || echo 0)
 	# Пересоздаём всегда: папка релиза могла быть пересобрана под тем же коммитом.
-	compose up -d --force-recreate --no-deps app >>"$log" 2>&1 || die "приложение не запустилось, лог: ${log}"
+	compose up -d --force-recreate --no-deps app >>"$log" 2>&1 ||
+		die "приложение не запустилось, лог: ${log}$(hub_hint <(tail -c +$((mark + 1)) "$log"))"
 
 	stage start "ждём, что приложение заработает"
 	if ! wait_healthy; then
-		compose logs --tail 30 app >&2 || true
+		local where
+		where=$(app_tail "$log")
 		local crashed=0
 		crashing && crashed=1
 		if [[ -n $prev && $prev != "$RELEASE" ]]; then
@@ -631,11 +720,11 @@ deploy() {
 			restore_compose
 			compose up -d --force-recreate --no-deps app >>"$log" 2>&1 || true
 			ROLLED_BACK=$(basename "$prev")
-			((crashed)) && die "новая версия падает при запуске (причина в логе выше), вернули предыдущую (${ROLLED_BACK})"
+			((crashed)) && die "новая версия падает при запуске (причина ${where}), вернули предыдущую (${ROLLED_BACK})"
 			die "новая версия не запустилась, вернули предыдущую (${ROLLED_BACK})"
 		fi
 		if ((crashed)) || [[ $APP_KIND == worker ]]; then
-			die "приложение падает при запуске — причина в логе выше. Если ему не хватает переменных окружения, задайте их на странице приложения в дашборде airlok или впишите в ${APP_DIR}/shared/user.env и опубликуйте снова"
+			die "приложение падает при запуске — причина ${where}. Если ему не хватает переменных окружения, задайте их на странице приложения в дашборде airlok или впишите в ${APP_DIR}/shared/user.env и опубликуйте снова"
 		fi
 		local path
 		path=$(release_health "$RELEASE")
@@ -696,8 +785,10 @@ nginx_site() {
 		uploads_block="
     # Отдаём только разрешённые расширения. CSP sandbox и nosniff не дают файлу
     # выполниться как страница сайта, остальное (не картинки) только скачивается.
+    # Ссылку приложения на чужой файл (загрузки соседа, журналы nginx) nginx не отдаёт.
     location /uploads/ {
         alias ${APP_DIR}/shared/uploads/;
+        disable_symlinks if_not_owner from=${APP_DIR}/shared/uploads;
         autoindex off;"
 		if ((${#images[@]})); then
 			uploads_block+="
@@ -960,6 +1051,10 @@ main() {
 		[[ -f $src/airlok.yml ]] || note "airlok.yml нет: ${APP_FRAMEWORK}, адрес ${APP_DOMAIN}, без базы и загрузок"
 	fi
 	images
+	local warning
+	while IFS= read -r warning; do
+		[[ -n $warning ]] && note "внимание: $warning"
+	done <<<"${RUNTIME_WARNINGS:-}"
 	APP_USER=app-$APP_NAME
 
 	# Блокировка: две выкатки одного приложения не идут одновременно, а проверка
@@ -978,16 +1073,19 @@ main() {
 	save_panel_domain
 	[[ $APP_KIND == web ]] && allocate_port
 	secrets
+	base_images
 	prepare_release "$src"
 	build
 	backup_setup
 	deploy
 	cron_setup
 	if [[ $APP_KIND == worker ]]; then
+		uploads_private
 		printf '\n%sГотово:%s фоновое приложение %s работает, логи: docker compose -f %s/compose.yml logs app\n' "$C_B" "$C_0" "$APP_NAME" "$APP_DIR"
 		return
 	fi
 	nginx_site
+	uploads_private
 	issue_certificate
 	printf '\n%sГотово:%s https://%s\n' "$C_B" "$C_0" "$APP_DOMAIN"
 }

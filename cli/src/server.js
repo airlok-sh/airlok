@@ -44,16 +44,38 @@ export function defaultName(host) {
   return host.replace(/:/g, '-').slice(0, 64)
 }
 
+// Коды выхода команды установки, когда до install.sh дело не дошло. Пометка «airlok:» в выводе отличает
+// их от тех же кодов из самого установщика.
+const NO_CURL = 96
+const NO_INSTALLER = 97
+
 // installCommand — что выполнить на сервере. Токен в ней не участвует: он придёт через stdin.
+// Скрипт сначала скачивается в переменную: bash -c "$(curl …)" при сбое curl выполнил бы пустую
+// строку и вернул 0, будто установка прошла.
 export function installCommand(origin, { letsencrypt = false, email = '', keysOnly = false, root = true } = {}) {
   if (!ORIGIN.test(origin)) throw new ServerError(`Странный адрес дашборда: ${origin}`)
   if (email && !EMAIL.test(email)) throw new ServerError(`Это не похоже на email: ${email}`)
-  let cmd = `bash -c "$(curl -fsSL ${INSTALL_URL})" install ${origin}`
-  if (letsencrypt) cmd += email ? ` --letsencrypt ${email}` : ' --letsencrypt'
+  let run = `bash -c "$s" install ${origin}`
+  if (letsencrypt) run += email ? ` --letsencrypt ${email}` : ' --letsencrypt'
   // Вход по ключу CLI подтверждает сам (confirmKeysOnly): установщику не нужно звать человека во второе окно.
-  if (keysOnly) cmd = `env AIRLOK_SSH_CONFIRM=cli ${cmd} --ssh-keys-only`
-  // sudo -n: спросить пароль sudo негде, stdin занят токеном.
-  return root ? cmd : `sudo -n ${cmd}`
+  if (keysOnly) run = `env AIRLOK_SSH_CONFIRM=cli ${run} --ssh-keys-only`
+  // sudo -n: спросить пароль sudo негде, stdin занят токеном. Скачивание идёт без sudo.
+  if (!root) run = `sudo -n ${run}`
+  return (
+    `command -v curl >/dev/null 2>&1 || { echo 'airlok: на сервере нет curl' >&2; exit ${NO_CURL}; }; ` +
+    `s=$(curl -fsSL ${INSTALL_URL}) && [ -n "$s" ] || { echo 'airlok: не скачался установщик ${INSTALL_URL}' >&2; exit ${NO_INSTALLER}; }; ` +
+    run
+  )
+}
+
+// installFailure — понятная причина, если до установщика дело не дошло; null — упал сам установщик.
+export function installFailure(code, output, host) {
+  if (!/airlok: /.test(output)) return null
+  if (code === NO_CURL) return `На ${host} нет curl, а без него установщик не скачать. Поставьте его (apt install curl) и запустите команду ещё раз.`
+  if (code === NO_INSTALLER) {
+    return `Сервер ${host} не смог скачать установщик ${INSTALL_URL}: ничего не установлено. Проверьте на сервере DNS и исходящий доступ в интернет (curl -I ${INSTALL_URL}) и запустите команду ещё раз.`
+  }
+  return null
 }
 
 // sshFailure — почему ssh не пустил, по его сообщению: от этого зависит, что советовать человеку.
@@ -114,6 +136,8 @@ export async function serverCommand(api, origin, sub, rest, opts, io, home, sys 
   io.err(`\nСтавлю Airlok на ${target.host} — несколько минут: Docker, nginx, файрвол, агент.\n`)
   const install = await sys.run('ssh', [...sshArgs(usedKey, target, { port }), remote], { input: `${server.token}\n`, out: echo })
   if (install.code !== 0) {
+    const early = installFailure(install.code, install.output, target.host)
+    if (early) throw new ServerError(early)
     if (target.user !== 'root' && /sudo: a (terminal|password) is required/.test(install.output)) {
       throw new ServerError(`У ${target.user} sudo спрашивает пароль. Подключитесь как root (server connect root@${target.host}) или разрешите ${target.user} sudo без пароля.`)
     }

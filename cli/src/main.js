@@ -6,14 +6,14 @@ import { createInterface } from 'node:readline/promises'
 import { parseArgs, promisify } from 'node:util'
 
 import { Api, ApiError } from './api.js'
-import { forgetSession, readLink, saveLink, saveSession, session } from './config.js'
+import { forgetSession, readLink, savedLogin, saveLink, saveSession, session } from './config.js'
 import { formatReport, normalize } from './check.js'
 import { DeviceError, deviceCommand } from './device.js'
 import { DomainError, domainCommand } from './domain.js'
 import { EnvError, envCommand } from './env.js'
 import { checkFiles, homeProblem, listFiles, pack, PackError } from './pack.js'
 import { plural, serverCommand, ServerError, system } from './server.js'
-import { agents, detect, homePath, onPath, setupAgents, SKILLS } from './setup.js'
+import { agents, detect, filesWithToken, homePath, onPath, setupAgents, SKILLS } from './setup.js'
 
 const run = promisify(execFile)
 const POLL_MS = 2000
@@ -37,7 +37,8 @@ const help = `Airlok — публикация проекта на хостинг
   npx @airlok/cli device add [--server <сервер>]   добавить SSH-ключ этого компьютера в «Устройства» и открыть ему серверы
   npx @airlok/cli device list                   устройства и серверы, к которым у них есть доступ
   npx @airlok/cli whoami            под кем выполнен вход
-  npx @airlok/cli logout            забыть вход на этом компьютере
+  npx @airlok/cli logout            выйти на этом компьютере и отозвать токен входа (--keep-token — только забыть,
+                                    --force — отозвать, даже если он записан в настройках ИИ-агентов)
 
 Для deploy:
   --app <имя>       опубликовать в существующее приложение
@@ -204,6 +205,7 @@ export async function main(argv, io = makeIO(), env = process.env, sys = system)
         from: { type: 'string' }, 'allow-empty': { type: 'boolean' }, name: { type: 'string' }, port: { type: 'string' }, email: { type: 'string' },
         letsencrypt: { type: 'boolean' }, 'ssh-keys-only': { type: 'boolean' }, key: { type: 'string' }, server: { type: 'string' },
         'no-wait': { type: 'boolean' }, 'include-data': { type: 'boolean' }, json: { type: 'boolean' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
+        'keep-token': { type: 'boolean' }, force: { type: 'boolean' },
       },
     })
   } catch (err) {
@@ -226,8 +228,7 @@ export async function main(argv, io = makeIO(), env = process.env, sys = system)
         await login(io, env)
         return 0
       case 'logout':
-        await forgetSession(env)
-        io.err('Вход на этом компьютере забыт. Сам токен можно отозвать в дашборде: Настройки → токены.')
+        await logout(opts, io, env)
         return 0
       case 'whoami': {
         const s = await session(env)
@@ -304,6 +305,12 @@ async function version() {
 
 async function login(io, env) {
   const s = await session(env)
+  const saved = await savedLogin(env)
+  // Прежний токен показываем только дашборду, который его выдал, и не отзываем, пока он записан
+  // в настройках ИИ-агентов.
+  let previous = saved.url === s.url ? saved.token : ''
+  const usedByAgents = await filesWithToken(previous, homeOf(env))
+  if (usedByAgents.length) previous = ''
   const api = new Api(s.url)
   const start = await api.startLogin(hostname())
   io.err(`Откройте ссылку и подтвердите код ${start.user_code}:\n\n  ${start.url}\n`)
@@ -312,13 +319,58 @@ async function login(io, env) {
   const deadline = Date.now() + start.expires_in * 1000
   while (Date.now() < deadline) {
     await sleep(start.interval * 1000)
-    const done = await api.pollLogin(start.device_code)
+    const done = await api.pollLogin(start.device_code, previous)
     if (!done) continue
     const path = await saveSession({ url: s.url, token: done.token, login: done.login }, env)
     io.err(`Готово: вы вошли как ${done.login}. Токен сохранён в ${path}`)
+    if (done.replaced) io.err(`Прежний вход этого компьютера отозван. Если ИИ-агенты перестанут видеть Airlok, запустите ${SETUP_AGAIN}.`)
+    if (usedByAgents.length) {
+      io.err(`Прежний вход не отозван: его токен записан в настройках ИИ-агентов (${usedByAgents.map((f) => homePath(f, homeOf(env))).join(', ')}). ` +
+        `Запустите ${SETUP_AGAIN} — агенты получат свой токен, а прежний вход потом ${REVOKE_IN_DASHBOARD}.`)
+    }
     return
   }
   throw new UserError('Код входа истёк: запустите npx @airlok/cli login ещё раз.')
+}
+
+const SETUP_AGAIN = 'npx @airlok/cli setup'
+const homeOf = (env) => env.HOME || env.USERPROFILE || homedir()
+const REVOKE_IN_DASHBOARD = 'отзовите его в дашборде: Настройки → «ИИ-агенты»'
+
+// logout отзывает сохранённый вход и забывает его. Токен из AIRLOK_TOKEN не трогаем: его задали
+// снаружи, и он может быть нужен CI. Если отозвать не вышло, файл остаётся — logout можно повторить.
+async function logout(opts, io, env) {
+  const saved = await savedLogin(env)
+  if (!saved.token) {
+    io.err(env.AIRLOK_TOKEN ? `Сохранённого входа нет. Токен из AIRLOK_TOKEN logout не отзывает — ${REVOKE_IN_DASHBOARD}.` : 'На этом компьютере вход не сохранён.')
+    return
+  }
+  if (opts['keep-token']) {
+    await forgetSession(env)
+    io.err(`Вход на этом компьютере забыт, но токен действует — ${REVOKE_IN_DASHBOARD}.`)
+    return
+  }
+  const usedByAgents = await filesWithToken(saved.token, homeOf(env))
+  if (usedByAgents.length && !opts.force) {
+    throw new UserError(`Токен этого входа записан в настройках ИИ-агентов: ${usedByAgents.map((f) => homePath(f, homeOf(env))).join(', ')}. ` +
+      `Отзыв отключит им Airlok. Сначала запустите ${SETUP_AGAIN} — агенты получат свой токен, — потом logout. ` +
+      'Отозвать всё равно: npx @airlok/cli logout --force; только забыть вход на этом компьютере: --keep-token.')
+  }
+  try {
+    await new Api(saved.url, saved.token).revokeToken()
+  } catch (err) {
+    if (!(err instanceof ApiError) || ![401, 404, 405].includes(err.status)) {
+      throw new UserError(`Не удалось отозвать токен: ${err.message}. Повторите logout позже или выйдите без отзыва: ` +
+        `npx @airlok/cli logout --keep-token — тогда ${REVOKE_IN_DASHBOARD}.`)
+    }
+    await forgetSession(env)
+    if (err.status === 401) io.err('Вход на этом компьютере забыт: его токен уже не действовал.')
+    else io.err(`Вход на этом компьютере забыт. Дашборд пока не умеет отзывать токен из CLI — ${REVOKE_IN_DASHBOARD}.`)
+    return
+  }
+  await forgetSession(env)
+  io.err(`Вы вышли: токен входа отозван. Если ИИ-агенты перестанут видеть Airlok, запустите ${SETUP_AGAIN}.`)
+  if (env.AIRLOK_TOKEN) io.err('Токен из AIRLOK_TOKEN по-прежнему действует: logout его не отзывает.')
 }
 
 function openBrowser(url) {
@@ -514,7 +566,7 @@ export async function projectFiles(dir, opts, io, env) {
   let withData = Boolean(opts['include-data'])
   if (data.length && !withData && io.interactive && !opts.json) {
     io.err(`Похоже на базы, выгрузки или файлы входа: ${listed(dataPaths)}. Обычно им не место в публикации: данные хранят в базе, а доступы — в переменных окружения. ` +
-      'Статический сайт такие файлы не отдаёт и с ними: базе для sql.js дайте другое расширение, например .bin.')
+      'Статический сайт и сайт на PHP не отдают такие файлы по адресу: базе для sql.js дайте другое расширение, например .bin.')
     withData = ['y', 'yes', 'д', 'да'].includes((await io.ask('Загрузить и их? [y/N] ')).trim().toLowerCase())
   }
   if (data.length && !withData) io.err(`Не загружаю базы, выгрузки и файлы входа: ${listed(dataPaths)}. Если они нужны сборке или приложению, добавьте --include-data.`)

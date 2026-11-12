@@ -3,6 +3,7 @@
 python3 -m unittest discover tests
 """
 import contextlib
+import grp
 import hashlib
 import importlib.util
 import io
@@ -506,6 +507,129 @@ class DefaultSiteTest(AptCase):
     def test_own_files_in_www_stay(self):
         open(os.path.join(self.www, "index.html"), "w").close()
         self.assertFalse(self.pristine())
+
+
+def site_with_uploads(app_dir):
+    """Конфиг сайта из шаблона app-deploy.sh с публичными загрузками png."""
+    with open(os.path.join(RECIPES, "app-deploy.sh"), encoding="utf-8") as f:
+        src = f.read()
+    tpl = re.search(r'write_if_changed "/etc/nginx/sites-available/airlok-\$\{APP_NAME\}\.conf" 0644 <<EOF; then\n(.*?)\nEOF\n',
+                    src, re.S).group(1)
+    block = re.search(r'\t\tuploads_block="\n(.*?)"\n', src, re.S).group(1) + "\n        return 404;\n    }"
+    values = {"APP_NAME": "shop", "APP_DOMAIN": "shop.example.ru", "APP_PORT": "3100", "cert": "/c", "key": "/k",
+              "UPLOAD_MAX_MB": "10", "tls_listen": "    listen 443 ssl;", "APP_DIR": app_dir}
+    values["uploads_block"] = "\n" + re.sub(r"\$\{(\w+)\}", lambda m: values[m.group(1)], block)
+    out = re.sub(r"\$\{(\w+)\}", lambda m: values[m.group(1)], tpl)
+    return out.replace("\\$", "$").replace("\\\\", "\\")
+
+
+class UploadsSymlinksTest(unittest.TestCase):
+    APP_DIR = "/srv/apps/shop"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.new = site_with_uploads(self.APP_DIR)
+        self.old = self.new.replace("        " + serverbase.uploads_symlinks_line(self.APP_DIR) + "\n", "")
+        self.nginx_ok = True
+        self.calls = []
+
+    def runner(self, args, **_):
+        self.calls.append(args)
+        return subprocess.CompletedProcess(args, 0 if self.nginx_ok else 1, "", "bad directive")
+
+    def site(self, name, text):
+        path = os.path.join(self.dir, "airlok-%s.conf" % name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def apply(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = serverbase.nginx_uploads(os.path.join(self.dir, "airlok-*.conf"), self.runner)
+        return rc, out.getvalue()
+
+    def read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_template_forbids_foreign_symlinks(self):
+        self.assertIn("        alias /srv/apps/shop/shared/uploads/;\n        disable_symlinks if_not_owner from=/srv/apps/shop/shared/uploads;\n",
+                      self.new)
+        self.assertNotEqual(self.old, self.new)
+
+    def test_old_site_gets_the_template_line(self):
+        self.assertEqual(serverbase.with_uploads_symlinks(self.old), self.new)
+        self.assertEqual(serverbase.with_uploads_symlinks(self.new), self.new)
+
+    def test_site_without_uploads_is_left(self):
+        text = self.old.replace("location /uploads/ {", "location /files/ {")
+        self.assertEqual(serverbase.with_uploads_symlinks(text), text)
+
+    def test_hand_edited_site_is_skipped(self):
+        self.assertIsNone(serverbase.with_uploads_symlinks(self.old.replace("        alias /srv", "        root /srv")))
+        twice = self.old.replace("    location / {", "    location /uploads/ {\n    }\n    location / {")
+        self.assertIsNone(serverbase.with_uploads_symlinks(twice))
+
+    def test_apply_once_and_reload_needed(self):
+        shop = self.site("shop", self.old)
+        plain = self.site("blog", "server {}\n")
+        odd = self.site("odd", self.old.replace("        alias /srv", "        root /srv"))
+        self.assertEqual(self.apply(), (0, "shop\n"))
+        self.assertEqual(self.read(shop), self.new)
+        self.assertEqual(self.read(plain), "server {}\n")
+        self.assertNotIn("disable_symlinks", self.read(odd))
+        self.assertEqual(self.calls, [["nginx", "-t", "-q"]])
+        self.assertEqual(self.apply(), (serverbase.EXIT_UNCHANGED, ""))
+        self.assertEqual(len(self.calls), 1, "второй проход nginx не трогает")
+
+    def test_rejected_config_is_restored(self):
+        shop = self.site("shop", self.old)
+        os.chmod(shop, 0o640)
+        self.nginx_ok = False
+        self.assertEqual(self.apply()[0], serverbase.EXIT_NGINX_FAILED)
+        self.assertEqual(self.read(shop), self.old)
+        self.assertEqual(stat.S_IMODE(os.stat(shop).st_mode), 0o640)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["airlok-shop.conf"], "временных файлов не осталось")
+
+
+class UploadsGroupTest(unittest.TestCase):
+    def setUp(self):
+        groups = [g for g in os.getgroups() if g != os.getegid()]
+        if not groups:
+            self.skipTest("нужна вторая группа пользователя")
+        self.gid = groups[0]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.top = os.path.join(tmp.name, "uploads")
+        os.makedirs(os.path.join(self.top, "a", "b"))
+        for name in ("x.png", "a/y.png", "a/b/z.png"):
+            open(os.path.join(self.top, name), "w").close()
+        self.outside = os.path.join(tmp.name, "secret.png")
+        open(self.outside, "w").close()
+        os.symlink(self.outside, os.path.join(self.top, "link.png"))
+        os.symlink(tmp.name, os.path.join(self.top, "a", "up"))
+
+    def run_group(self):
+        serverbase.uploads_group(self.top, grp.getgrgid(self.gid).gr_name)
+
+    def test_regroups_everything_inside_without_following_links(self):
+        before = os.stat(self.outside).st_gid
+        parent = os.stat(os.path.dirname(self.top))
+        self.run_group()
+        for root, dirs, files in os.walk(self.top):
+            for name in files + dirs:
+                path = os.path.join(root, name)
+                if not os.path.islink(path):
+                    self.assertEqual(os.lstat(path).st_gid, self.gid, path)
+            st = os.stat(root)
+            self.assertEqual(st.st_gid, self.gid, root)
+            self.assertTrue(st.st_mode & stat.S_ISGID, root)
+        self.assertEqual(os.stat(self.outside).st_gid, before, "файл по ссылке не тронут")
+        after = os.stat(os.path.dirname(self.top))
+        self.assertEqual((after.st_gid, after.st_mode), (parent.st_gid, parent.st_mode), "каталог по ссылке не тронут")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 # Установка airlok одной командой: рецепты в /opt/airlok, подготовка сервера и, если
 # передан адрес дашборда, подключение к нему. Повторный запуск обновляет и досоздаёт.
 #
-#   echo "ТОКЕН" | sudo bash -c "$(curl -fsSL https://airlok.ru/install.sh)" install https://app.airlok.ru [опции]
+#   sudo bash -c "$(curl -fsSL https://airlok.ru/install.sh)" install https://app.airlok.ru [опции]
 #   sudo bash -c "$(curl -fsSL https://airlok.ru/install.sh)" install [опции]   # без дашборда
 #
 # Опции:
@@ -15,10 +15,11 @@
 #
 # Для строгого режима лучше не запускать скрипт из сети, а прочитать код и поставить именно его:
 #   git clone https://github.com/airlok-sh/airlok /opt/airlok && git -C /opt/airlok checkout КОММИТ
-#   echo "ТОКЕН" | sudo /opt/airlok/install.sh https://app.airlok.ru --strict --allow-repo владелец/имя
+#   sudo /opt/airlok/install.sh https://app.airlok.ru --strict --allow-repo владелец/имя
 #
-# Токен приходит через stdin, а не аргументом: аргументы видны в ps и остаются в истории.
-# Сам скрипт поэтому передаётся через bash -c, а не через конвейер в bash.
+# Токен агента скрипт спрашивает сам, не показывая ввод: аргументы видны в ps, а строка команды
+# с токеном осталась бы в истории shell. Без терминала (cloud-init, CLI по SSH) токен читается
+# из stdin. Сам скрипт поэтому передаётся через bash -c, а не через конвейер в bash.
 # AIRLOK_REPO — откуда брать рецепты (зеркало или локальный путь) вместо GitHub.
 # AIRLOK_SSH_CONFIRM=cli — установку запустил airlok CLI: вход по ключу он подтвердит сам,
 # просить человека открыть второе окно не нужно. Переменная, а не опция: старый install.sh её
@@ -29,6 +30,15 @@ export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 
 REPO=${AIRLOK_REPO:-https://github.com/airlok-sh/airlok}
 DIR=/opt/airlok
+SIGNERS_CONF=/etc/airlok/allowed_signers
+
+# Открытые ключи подписи версий Airlok — те же, что в recipes/allowed_signers. Встроены в скрипт,
+# который отдаёт airlok.ru, а не берутся из клона: иначе новая версия из GitHub назначала бы
+# ключ себе сама.
+release_signers() {
+	cat <<'EOF'
+EOF
+}
 
 die() {
 	printf 'Ошибка: %s\n' "$*" >&2
@@ -49,6 +59,65 @@ install_git() {
 		told=1
 		sleep 5
 	done
+}
+
+has_signers() { [[ -r $1 ]] && grep -Eqv '^[[:space:]]*(#|$)' "$1"; }
+
+# signed КЛОН КОММИТ и latest_signed КЛОН АРГУМЕНТЫ_REV_LIST… — как в recipes/lib.sh: его ещё нельзя
+# подключить, пока не проверена версия, из которой он взят.
+signed() {
+	git -C "$1" -c gpg.ssh.allowedSignersFile="$SIGNERS_CONF" -c gpg.program=false -c gpg.x509.program=false \
+		verify-commit "$2" >/dev/null 2>&1
+}
+
+latest_signed() {
+	local rev
+	while read -r rev; do
+		signed "$1" "$rev" && echo "$rev" && return 0
+	done < <(git -C "$1" rev-list --first-parent "${@:2}" 2>/dev/null)
+	return 1
+}
+
+# Ключи на сервере не трогаем: их могла сменить подписанная версия, вышедшая после этого скрипта.
+install_signers() {
+	has_signers "$SIGNERS_CONF" && return 0
+	grep -Eqv '^[[:space:]]*(#|$)' < <(release_signers) || return 0
+	mkdir -p "$(dirname "$SIGNERS_CONF")"
+	release_signers >"$SIGNERS_CONF.tmp"
+	chmod 644 "$SIGNERS_CONF.tmp"
+	mv "$SIGNERS_CONF.tmp" "$SIGNERS_CONF"
+}
+
+# Первая установка: клон во временную папку, и в /opt/airlok он попадает только проверенным —
+# иначе повторный запуск принял бы непроверенный клон за стоящую версию.
+fresh_clone() {
+	local tmp=$DIR.new rev
+	rmdir "$DIR" 2>/dev/null || true
+	[[ ! -e $DIR ]] || die "${DIR} уже есть, но это не git-клон: уберите его и запустите установку ещё раз"
+	rm -rf "$tmp"
+	if ! has_signers "$SIGNERS_CONF"; then
+		git clone -q --depth 1 "$REPO" "$tmp" || { rm -rf "$tmp"; die "не удалось скачать рецепты из ${REPO}"; }
+	else
+		git clone -q --depth 50 --no-checkout "$REPO" "$tmp" || { rm -rf "$tmp"; die "не удалось скачать рецепты из ${REPO}"; }
+		if ! rev=$(latest_signed "$tmp" HEAD); then
+			rm -rf "$tmp"
+			die "в ${REPO} нет версии, подписанной ключом Airlok, и ставить её нельзя. Напишите в поддержку: https://app.airlok.ru/support"
+		fi
+		git -C "$tmp" reset -q --hard "$rev"
+	fi
+	mv "$tmp" "$DIR"
+}
+
+# Повторный запуск обновляет так же, как update.sh: при ключах — только до подписанной версии.
+update_clone() {
+	local rev=FETCH_HEAD
+	git -C "$DIR" fetch -q origin main || die "не удалось получить новую версию из ${REPO}"
+	if has_signers "$SIGNERS_CONF"; then
+		rev=$(latest_signed "$DIR" --ancestry-path HEAD..FETCH_HEAD) || rev=HEAD
+		[[ $(git -C "$DIR" rev-parse "$rev") == $(git -C "$DIR" rev-parse FETCH_HEAD) ]] ||
+			echo "  в main есть версия $(git -C "$DIR" rev-parse --short FETCH_HEAD) без подписи Airlok: она ещё не выпущена, ставим последнюю подписанную"
+	fi
+	git -C "$DIR" merge -q --ff-only "$rev" || die "не удалось обновить ${DIR}: есть локальные правки? git -C ${DIR} status"
 }
 
 [[ $EUID -eq 0 ]] || die "запустите через sudo"
@@ -97,7 +166,7 @@ if [[ -n $dashboard ]]; then
 	else
 		read -r token || true
 	fi
-	[[ -n $token ]] || die "нет токена агента: скопируйте команду из дашборда целиком"
+	[[ -n $token ]] || die "нет токена агента: вставьте токен из дашборда, когда установщик спросит"
 fi
 
 if ! command -v git >/dev/null; then
@@ -105,14 +174,15 @@ if ! command -v git >/dev/null; then
 	install_git
 fi
 
+install_signers
 if [[ -d $DIR/.git ]] && ((strict)); then
 	echo "→ Рецепты остаются на коммите $(git -C "$DIR" rev-parse --short HEAD): строгий режим обновляется только вручную"
 elif [[ -d $DIR/.git ]]; then
 	echo "→ Обновляем рецепты в ${DIR}"
-	git -C "$DIR" pull -q --ff-only || die "не удалось обновить ${DIR}: есть локальные правки? git -C ${DIR} status"
+	update_clone
 else
 	echo "→ Скачиваем рецепты в ${DIR}"
-	git clone -q --depth 1 "$REPO" "$DIR"
+	fresh_clone
 fi
 
 "$DIR/recipes/server-base.sh" --skip-ssh

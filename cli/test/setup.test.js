@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,7 +7,7 @@ import { test } from 'node:test'
 
 import { saveSession, session } from '../src/config.js'
 import { main } from '../src/main.js'
-import { agents, claudeCommand, mergeServers, onPath, setupAgents, upsertTomlServer } from '../src/setup.js'
+import { agents, claudeCommand, mergeServers, onPath, setupAgents, upsertTomlServer, withoutServer, withoutTomlServer } from '../src/setup.js'
 
 const URL_ = 'https://app.airlok.ru'
 const TOKEN = 'airlok_pat_test'
@@ -48,6 +48,19 @@ test('upsertTomlServer replaces only the airlok section', () => {
   assert.equal(after.match(/\[mcp_servers\.airlok\]/g).length, 1)
   assert.equal(upsertTomlServer(after, block), after, 'повтор ничего не меняет')
   assert.equal(upsertTomlServer('', block), block + '\n')
+})
+
+test('backups lose only the airlok entry', () => {
+  const json = JSON.stringify({ theme: 'dark', mcpServers: { github: { url: 'g' }, airlok: { url: 'u', headers: { Authorization: 'Bearer airlok_pat_old' } } } })
+  assert.deepEqual(JSON.parse(withoutServer(json)), { theme: 'dark', mcpServers: { github: { url: 'g' } } })
+  const plain = '{"mcpServers":{"github":{}}}'
+  assert.equal(withoutServer(plain), plain, 'без нашей записи файл не переформатируем')
+  assert.equal(withoutServer('{ broken'), '{ broken')
+  assert.equal(withoutServer('null'), 'null')
+
+  const toml = 'model = "gpt-5"\n\n[mcp_servers.airlok]\nhttp_headers = { Authorization = "Bearer airlok_pat_old" }\n\n[mcp_servers.github]\nurl = "g"\n'
+  assert.equal(withoutTomlServer(toml), 'model = "gpt-5"\n\n[mcp_servers.github]\nurl = "g"\n')
+  assert.equal(withoutTomlServer('model = "x"\n'), 'model = "x"\n')
 })
 
 // crtArgs разбирает командную строку так, как это делает CRT Windows (argv программы на C и node.exe).
@@ -221,6 +234,38 @@ test('setupAgents configures every agent and copies the skill', async () => {
   const again = await setupAgents({ chosen, url: URL_, token: TOKEN, run, skills })
   assert.ok(again.every((r) => r.ok))
   assert.equal((await readFile(join(home, '.codex', 'config.toml'), 'utf8')).match(/\[mcp_servers\.airlok\]/g).length, 1)
+})
+
+test('setupAgents keeps no live token in backups and closes config files to others', { skip: process.platform === 'win32' }, async () => {
+  const { home, skills } = await fakeHome()
+  const cursorFile = join(home, '.cursor', 'mcp.json')
+  const codexFile = join(home, '.codex', 'config.toml')
+  await mkdir(join(home, '.cursor'), { recursive: true })
+  await mkdir(join(home, '.codex'), { recursive: true })
+  await writeFile(cursorFile, JSON.stringify({ mcpServers: { other: { url: 'o' }, airlok: { url: 'u', headers: { Authorization: 'Bearer airlok_pat_old' } } } }))
+  await writeFile(codexFile, 'model = "gpt-5"\n\n[mcp_servers.airlok]\nhttp_headers = { Authorization = "Bearer airlok_pat_old" }\n')
+  await chmod(cursorFile, 0o644)
+  await chmod(codexFile, 0o644)
+  const chosen = agents(home).filter((a) => ['cursor', 'codex'].includes(a.id)).map((a) => ({ ...a, hasBin: false }))
+  const report = await setupAgents({ chosen, url: URL_, token: TOKEN, run: async () => {}, skills })
+  assert.ok(report.every((r) => r.ok), JSON.stringify(report))
+
+  for (const file of [cursorFile, codexFile]) {
+    const backup = await readFile(file + '.airlok-backup', 'utf8')
+    assert.doesNotMatch(backup, /airlok_pat_/, `${file}: в копии нет токена`)
+    assert.match(await readFile(file, 'utf8'), /Bearer airlok_pat_test/)
+    assert.equal((await stat(file)).mode & 0o777, 0o600, `${file}: права закрыты и у существующего файла`)
+    assert.equal((await stat(file + '.airlok-backup')).mode & 0o777, 0o600)
+  }
+  assert.match(await readFile(cursorFile + '.airlok-backup', 'utf8'), /"other"/, 'остальное в копии сохранено')
+  assert.match(await readFile(codexFile + '.airlok-backup', 'utf8'), /model = "gpt-5"/)
+
+  // Копия от прежней версии CLI с токеном вычищается и тогда, когда сам файл менять не нужно.
+  await writeFile(cursorFile + '.airlok-backup', JSON.stringify({ mcpServers: { airlok: { headers: { Authorization: 'Bearer airlok_pat_old' } } } }))
+  await chmod(cursorFile, 0o644)
+  assert.ok((await setupAgents({ chosen, url: URL_, token: TOKEN, run: async () => {}, skills })).every((r) => r.ok))
+  assert.doesNotMatch(await readFile(cursorFile + '.airlok-backup', 'utf8'), /airlok_pat_/)
+  assert.equal((await stat(cursorFile)).mode & 0o777, 0o600)
 })
 
 test('setupAgents reports a broken config instead of overwriting it', async () => {

@@ -199,6 +199,27 @@ docker_apply() {
 
 live_restore_on() { [[ $(docker info --format '{{.LiveRestoreEnabled}}' 2>/dev/null) == true ]]; }
 
+# hub_check — предупредить заранее, если Docker Hub с сервера не отвечает: с него публикации берут
+# образы сборки, nginx и Postgres. Установку и обновление это не останавливает.
+hub_check() {
+	local mirrors code
+	mirrors=$(docker info --format '{{range .RegistryConfig.Mirrors}}{{.}} {{end}}' 2>/dev/null) || mirrors=""
+	if [[ -n ${mirrors// /} ]]; then
+		ok "образы Docker Hub — через зеркало ${mirrors% }"
+		return 0
+	fi
+	command -v curl >/dev/null || return 0
+	# Без входа реестр отвечает 401 — значит, он доступен. Слои образов Hub отдаёт с Cloudflare по
+	# адресам, которые меняются, поэтому их скачивание проверит уже первая публикация.
+	code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://registry-1.docker.io/v2/ 2>/dev/null) || true
+	if [[ $code == 401 ]]; then
+		ok "реестр Docker Hub отвечает"
+		return 0
+	fi
+	if [[ $code =~ ^[1-9] ]]; then code="код ${code}"; else code="нет ответа"; fi
+	note "внимание: Docker Hub с сервера не отвечает (${code}), публикации могут не скачать образы. ${HUB_MIRROR_ADVICE}"
+}
+
 # firewall включает ufw только при первой установке и открывает в нём всё, что уже слушает снаружи:
 # VPN и чужие сервисы на сервере должны работать и дальше. Потом во включённый ufw только добавляются
 # SSH, 80 и 443, а выключенный человеком больше не включается. FIREWALL в server.env: airlok — ufw
@@ -262,6 +283,17 @@ add_header X-Content-Type-Options nosniff always;
 add_header X-Frame-Options SAMEORIGIN always;
 add_header Referrer-Policy strict-origin-when-cross-origin always;
 EOF
+	# Сайты, опубликованные раньше, получают запрет ссылок в загрузках без новой публикации.
+	local sites="" rc=0
+	sites=$(python3 "$RECIPES_DIR/serverbase.py" nginx-uploads) || rc=$?
+	case $rc in
+	0)
+		changed=yes
+		ok "загрузки сайтов ${sites} больше не отдаются по ссылкам на чужие файлы"
+		;;
+	10) ;;
+	*) note "запрет ссылок в загрузках заработает после следующей публикации сайтов" ;;
+	esac
 	local default=""
 	if [[ -e /etc/nginx/sites-enabled/default ]]; then
 		if default_site_pristine; then
@@ -411,6 +443,7 @@ main() {
 	packages
 	swap
 	docker_daemon
+	hub_check
 	firewall
 	bruteforce
 	web

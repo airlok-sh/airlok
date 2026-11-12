@@ -38,6 +38,12 @@ export async function saveSession(s, env = process.env) {
   return path
 }
 
+// savedLogin — вход из файла без учёта переменных окружения: его заменяет login и отзывает logout.
+export async function savedLogin(env = process.env) {
+  const saved = (await readJSON(configPath(env))) ?? {}
+  return { url: (saved.url || DEFAULT_URL).replace(/\/+$/, ''), token: saved.token || '' }
+}
+
 export async function forgetSession(env = process.env) {
   await rm(configPath(env), { force: true })
 }

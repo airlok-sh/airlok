@@ -1,25 +1,38 @@
 #!/usr/bin/env python3
-"""Настройки Docker и порты для файрвола: части server-base.sh, которые на bash вышли бы хрупкими.
+"""Части server-base.sh и app-deploy.sh, которые на bash вышли бы хрупкими.
 
   serverbase.py daemon-json ФАЙЛ [--dockerd-flags ФЛАГИ] [--swarm] [--no-new-privileges]
       дописать в настройки Docker ротацию логов и live-restore, не трогая заданное человеком
   serverbase.py firewall-ports [--listening]
       порты SSH, 80 и 443, а с --listening ещё все, что слушают не только на localhost
+  serverbase.py nginx-uploads
+      дописать запрет ссылок на чужие файлы в /uploads/ сайтов, опубликованных раньше
+  serverbase.py uploads-group КАТАЛОГ ГРУППА
+      отдать группе всё в каталоге загрузок, не переходя по ссылкам, которые там оставило приложение
 
 daemon-json печатает, что дописал, и выходит с кодом 0, если файл изменился, 10 — если менять
-нечего, 11 — если файл не JSON-объект: такой файл не трогаем.
+нечего, 11 — если файл не JSON-объект: такой файл не трогаем. nginx-uploads печатает изменённые
+сайты и выходит с кодом 0, если что-то дописал, 10 — если нечего, 12 — если nginx не принял
+конфиг: тогда файлы возвращены как были.
 """
 import argparse
+import glob
+import grp
 import ipaddress
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
 
 EXIT_UNCHANGED = 10
 EXIT_NOT_JSON = 11
+EXIT_NGINX_FAILED = 12
+NGINX_SITES = "/etc/nginx/sites-available/airlok-*.conf"
+UPLOADS_LOCATION = "\n    location /uploads/ {\n"
+UPLOADS_ALIAS = re.compile(r"( +)alias (/[A-Za-z0-9._/-]+)/shared/uploads/;\n")
 LOG_OPTS = {"max-size": "10m", "max-file": "3"}
 
 
@@ -54,7 +67,7 @@ def write_atomic(path, text):
         mode = os.stat(path).st_mode & 0o7777
     except FileNotFoundError:
         mode = 0o644
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".daemon.json.")
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix="." + os.path.basename(path) + ".")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
@@ -152,6 +165,79 @@ def firewall_ports(listening):
     return list(dict.fromkeys(ports))
 
 
+def uploads_symlinks_line(app_dir):
+    """Та же строка, что в шаблоне сайта app-deploy.sh. if_not_owner: ссылку приложения на его же файл
+    nginx отдаёт, а на файл другого владельца — нет; from= — выше загрузок ссылки не проверяются."""
+    return "disable_symlinks if_not_owner from=%s/shared/uploads;" % app_dir
+
+
+def with_uploads_symlinks(text):
+    """Конфиг сайта с запретом ссылок в /uploads/ — как в шаблоне. None — конфиг не похож на шаблон
+    Airlok, его не трогаем."""
+    if "location /uploads/ {" not in text or "disable_symlinks" in text:
+        return text
+    if text.count(UPLOADS_LOCATION) != 1:
+        return None
+    start = text.index(UPLOADS_LOCATION) + len(UPLOADS_LOCATION)
+    m = UPLOADS_ALIAS.match(text, start)
+    if not m:
+        return None
+    return text[:m.end()] + m.group(1) + uploads_symlinks_line(m.group(2)) + "\n" + text[m.end():]
+
+
+def nginx_uploads(pattern=NGINX_SITES, runner=subprocess.run):
+    done, skipped = [], []
+    for path in sorted(glob.glob(pattern)):
+        with open(path, "rb") as f:
+            old = f.read()
+        try:
+            new = with_uploads_symlinks(old.decode())
+        except UnicodeDecodeError:
+            new = None
+        if new is None:
+            skipped.append(os.path.basename(path))
+            continue
+        if new.encode() == old:
+            continue
+        write_atomic(path, new)
+        done.append((path, old))
+    for name in skipped:
+        print(f"{name} не похож на шаблон Airlok, загрузки в нём проверятся после публикации", file=sys.stderr)
+    if not done:
+        return EXIT_UNCHANGED
+    test = runner(["nginx", "-t", "-q"], capture_output=True, text=True)
+    if test.returncode != 0:
+        for path, old in done:
+            with open(path, "wb") as f:
+                f.write(old)
+        print("nginx не принял запрет ссылок в загрузках, конфиги возвращены: %s" % test.stderr.strip()[:500], file=sys.stderr)
+        return EXIT_NGINX_FAILED
+    print(", ".join(os.path.basename(p)[len("airlok-"):-len(".conf")] for p, _ in done))
+    return 0
+
+
+def uploads_group(top, group):
+    """Группа и setgid на каталогах, чтобы новые файлы получали ту же группу. Каталог пишет приложение,
+    поэтому всё через дескрипторы и без перехода по ссылкам: подменённый на ссылку путь не уведёт
+    chown за пределы загрузок. Сам каталог — последним: если обход оборвётся, его повторит следующая
+    публикация."""
+    gid = grp.getgrnam(group).gr_gid
+    for _, _, files, dirfd in os.fwalk(top, topdown=False):
+        for name in files:
+            # Приложение работает и может удалить файл посреди обхода.
+            try:
+                st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+                if not stat.S_ISLNK(st.st_mode) and st.st_gid != gid:
+                    os.chown(name, -1, gid, dir_fd=dirfd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+        st = os.fstat(dirfd)
+        if st.st_gid != gid:
+            os.fchown(dirfd, -1, gid)
+        if not st.st_mode & stat.S_ISGID:
+            os.fchmod(dirfd, stat.S_IMODE(st.st_mode) | stat.S_ISGID)
+
+
 def main(argv):
     parser = argparse.ArgumentParser(prog="serverbase.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -162,9 +248,18 @@ def main(argv):
     daemon.add_argument("--no-new-privileges", action="store_true")
     fw = sub.add_parser("firewall-ports")
     fw.add_argument("--listening", action="store_true")
+    sub.add_parser("nginx-uploads")
+    group = sub.add_parser("uploads-group")
+    group.add_argument("path")
+    group.add_argument("group")
     args = parser.parse_args(argv[1:])
     if args.cmd == "daemon-json":
         return daemon_json(args.path, args.dockerd_flags, args.swarm, args.no_new_privileges)
+    if args.cmd == "nginx-uploads":
+        return nginx_uploads()
+    if args.cmd == "uploads-group":
+        uploads_group(args.path, args.group)
+        return 0
     print("\n".join(firewall_ports(args.listening)))
     return 0
 

@@ -2,7 +2,7 @@
 // каждого найденного агента. Повторный запуск ничего не дублирует.
 
 import { execFile } from 'node:child_process'
-import { access, copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { access, chmod, copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -61,10 +61,24 @@ export function mergeServers(text, entry, file) {
   return JSON.stringify(cfg, null, 2) + '\n'
 }
 
+// withoutServer — JSON-конфиг без нашей записи: резервной копии токен ни к чему. Файл без неё не
+// переписываем, чтобы копия совпадала с прежним файлом до байта.
+export function withoutServer(text) {
+  let cfg
+  try {
+    cfg = JSON.parse(text)
+  } catch {
+    return text
+  }
+  if (!cfg?.mcpServers || typeof cfg.mcpServers !== 'object' || !Object.hasOwn(cfg.mcpServers, SERVER)) return text
+  delete cfg.mcpServers[SERVER]
+  return JSON.stringify(cfg, null, 2) + '\n'
+}
+
 const tomlHeader = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(#.*)?$/
 
-// upsertTomlServer заменяет раздел [mcp_servers.airlok] (с подразделами) в config.toml Codex.
-export function upsertTomlServer(text, block) {
+// withoutTomlServer — config.toml Codex без раздела [mcp_servers.airlok] и его подразделов.
+export function withoutTomlServer(text) {
   const lines = (text ?? '').split('\n')
   const out = []
   let skipping = false
@@ -76,22 +90,50 @@ export function upsertTomlServer(text, block) {
     }
     if (!skipping) out.push(line)
   }
-  const body = out.join('\n').replace(/\n+$/, '')
+  return out.join('\n')
+}
+
+// upsertTomlServer заменяет раздел [mcp_servers.airlok] в config.toml Codex.
+export function upsertTomlServer(text, block) {
+  const body = withoutTomlServer(text).replace(/\n+$/, '')
   return (body ? body + '\n\n' : '') + block.trim() + '\n'
 }
 
 const tomlString = (s) => JSON.stringify(s)
 
+// mcpFiles — где агенты хранят настройки MCP, а с ними токен airlok.
+function mcpFiles(home) {
+  return {
+    claude: join(home, '.claude.json'),
+    codex: join(home, '.codex', 'config.toml'),
+    antigravity: join(home, '.gemini', 'config', 'mcp_config.json'),
+    cursor: join(home, '.cursor', 'mcp.json'),
+  }
+}
+
+// filesWithToken — настройки ИИ-агентов, в которых записан token. CLI до 0.8.0 писал агентам сам
+// вход CLI: отозвать его — значит отключить им Airlok.
+export async function filesWithToken(token, home) {
+  if (!token) return []
+  const found = []
+  for (const file of Object.values(mcpFiles(home))) {
+    const text = await readText(file).catch(() => null)
+    if (text?.includes(token)) found.push(file)
+  }
+  return found
+}
+
 // agents — кого умеем настраивать. Пути — из документации агентов: навыки в формате SKILL.md.
 export function agents(home) {
   const gemini = join(home, '.gemini')
+  const files = mcpFiles(home)
   return [
     {
       id: 'claude', label: 'Claude Code', bin: 'claude', dir: join(home, '.claude'),
       skills: [join(home, '.claude', 'skills')],
       async mcp({ url, token, run, hasBin, platform }) {
         const entry = { type: 'http', url, headers: { Authorization: `Bearer ${token}` } }
-        const file = join(home, '.claude.json')
+        const file = files.claude
         // Claude держит ~/.claude.json открытым и может перезаписать правку: надёжнее его собственная команда.
         const c = hasBin ? claudeCommand(platform, hasBin, entry) : null
         if (c) {
@@ -104,7 +146,7 @@ export function agents(home) {
             if (platform !== 'win32') throw err
           }
         }
-        await writeConfig(file, (t) => mergeServers(t, entry, file))
+        await writeConfig(file, (t) => mergeServers(t, entry, file), withoutServer)
         if (hasBin) return { where: file, note: 'Если Claude Code был открыт, закройте его и запустите setup ещё раз.' }
         return file
       },
@@ -113,9 +155,9 @@ export function agents(home) {
       id: 'codex', label: 'Codex', bin: 'codex', dir: join(home, '.codex'),
       skills: [join(home, '.agents', 'skills')],
       async mcp({ url, token }) {
-        const file = join(home, '.codex', 'config.toml')
+        const file = files.codex
         const block = `[mcp_servers.${SERVER}]\nurl = ${tomlString(url)}\nhttp_headers = { Authorization = ${tomlString(`Bearer ${token}`)} }`
-        await writeConfig(file, (t) => upsertTomlServer(t, block))
+        await writeConfig(file, (t) => upsertTomlServer(t, block), withoutTomlServer)
         return file
       },
     },
@@ -123,9 +165,9 @@ export function agents(home) {
       id: 'antigravity', label: 'Antigravity', bin: 'antigravity', dir: gemini,
       skills: [join(gemini, 'config', 'skills'), join(gemini, 'antigravity-cli', 'skills')],
       async mcp({ url, token }) {
-        const file = join(gemini, 'config', 'mcp_config.json')
+        const file = files.antigravity
         // Antigravity понимает только serverUrl; url и httpUrl он не принимает.
-        await writeConfig(file, (t) => mergeServers(t, { serverUrl: url, headers: { Authorization: `Bearer ${token}` } }, file))
+        await writeConfig(file, (t) => mergeServers(t, { serverUrl: url, headers: { Authorization: `Bearer ${token}` } }, file), withoutServer)
         return file
       },
     },
@@ -134,25 +176,41 @@ export function agents(home) {
       // Cursor читает навыки и из ~/.agents/skills, общего с Codex.
       skills: [join(home, '.agents', 'skills')],
       async mcp({ url, token }) {
-        const file = join(home, '.cursor', 'mcp.json')
-        await writeConfig(file, (t) => mergeServers(t, { url, headers: { Authorization: `Bearer ${token}` } }, file))
+        const file = files.cursor
+        await writeConfig(file, (t) => mergeServers(t, { url, headers: { Authorization: `Bearer ${token}` } }, file), withoutServer)
         return file
       },
     },
   ]
 }
 
-// writeConfig правит файл настроек; прежняя версия остаётся рядом как .airlok-backup.
-async function writeConfig(file, edit) {
-  const before = await readFile(file, 'utf8').catch((err) => {
-    if (err.code === 'ENOENT') return null
-    throw err
-  })
+const readText = (file) => readFile(file, 'utf8').catch((err) => {
+  if (err.code === 'ENOENT') return null
+  throw err
+})
+
+// writePrivate — файл с токеном читает только владелец. mode у writeFile действует лишь при
+// создании, а у существующего файла права бывают 0644.
+async function writePrivate(file, text) {
+  await writeFile(file, text, { mode: 0o600 })
+  await chmod(file, 0o600)
+}
+
+// writeConfig правит файл настроек; прежняя версия без записи airlok остаётся рядом как .airlok-backup.
+async function writeConfig(file, edit, strip) {
+  const before = await readText(file)
   const after = edit(before)
-  if (after === before) return
-  await mkdir(dirname(file), { recursive: true })
-  if (before !== null) await writeFile(file + '.airlok-backup', before, { mode: 0o600 })
-  await writeFile(file, after, { mode: 0o600 })
+  const backup = file + '.airlok-backup'
+  if (after !== before) {
+    await mkdir(dirname(file), { recursive: true })
+    if (before !== null) await writePrivate(backup, strip(before))
+    await writePrivate(file, after)
+    return
+  }
+  await chmod(file, 0o600)
+  // Копии прежних версий CLI хранили токен целиком.
+  const old = await readText(backup)
+  if (old !== null && strip(old) !== old) await writePrivate(backup, strip(old))
 }
 
 // SKILLS — навыки для агентов: работа с airlok и подготовка airlok.yml проекта.

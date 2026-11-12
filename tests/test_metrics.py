@@ -2,11 +2,14 @@
 
 Шаблоны адресов должны совпадать с edge хостинга (internal/edge/routes_test.go в backend).
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location("metrics", os.path.join(os.path.dirname(__file__), "..", "recipes", "metrics.py"))
 metrics = importlib.util.module_from_spec(spec)
@@ -247,6 +250,61 @@ class BatchTest(unittest.TestCase):
         self.assertGreater(n, 0)
         self.assertLessEqual(len(json.dumps({"buckets": pending[:n]})), metrics.MAX_BATCH_BYTES + 1024)
         self.assertEqual(metrics.next_batch(pending[:3]), 3)
+
+
+class StrictSpeedTest(unittest.TestCase):
+    """Замер скорости в строгом режиме: дашборд не включает вставку скрипта в страницы."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.policy = os.path.join(tmp.name, "policy.env")
+        was_policy, was_apply = metrics.strict.POLICY, metrics.speed.apply
+        metrics.strict.POLICY = self.policy
+        self.applied = []
+        metrics.speed.apply = self.applied.append
+        self.addCleanup(lambda: setattr(metrics.strict, "POLICY", was_policy) or setattr(metrics.speed, "apply", was_apply))
+
+    def mode(self, value):
+        with open(self.policy, "w", encoding="utf-8") as f:
+            f.write("AIRLOK_MODE=%s\nALLOW_REPO=owner/shop\n" % value)
+
+    def test_normal_mode_follows_dashboard(self):
+        metrics.apply_speed({"shop"})
+        self.mode("normal")
+        metrics.apply_speed({"blog"})
+        metrics.apply_speed(None)
+        self.assertEqual(self.applied, [{"shop"}, {"blog"}], "без ответа дашборда nginx не трогается")
+
+    def test_strict_mode_turns_speed_off(self):
+        self.mode("strict")
+        metrics.apply_speed({"shop"})
+        metrics.apply_speed(None)
+        self.assertEqual(self.applied, [set(), set()], "включённый раньше замер снимается и без ответа дашборда")
+
+    def test_unreadable_policy_leaves_nginx_alone(self):
+        with open(self.policy, "wb") as f:
+            f.write(b"AIRLOK_MODE=\xff\xfe\n")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            metrics.apply_speed({"shop"})
+        self.assertEqual(self.applied, [])
+        self.assertIn(self.policy, err.getvalue())
+
+    def test_strict_server_without_dashboard_turns_speed_off(self):
+        self.mode("strict")
+        tmp = os.path.dirname(self.policy)
+        patches = {"STATE_DIR": tmp, "STATE_FILE": os.path.join(tmp, "state.json"),
+                   "PENDING_FILE": os.path.join(tmp, "pending.json"), "SALT_FILE": os.path.join(tmp, "salt.json"),
+                   "DASHBOARD_CONF": os.path.join(tmp, "dashboard.env")}
+        saved = {k: getattr(metrics, k) for k in patches}
+        self.addCleanup(lambda: [setattr(metrics, k, v) for k, v in saved.items()])
+        for k, v in patches.items():
+            setattr(metrics, k, v)
+        with mock.patch.object(metrics, "refresh_geoip"), mock.patch.object(metrics, "load_geoip"), \
+                mock.patch.object(metrics, "collect", return_value=[]), mock.patch.object(metrics, "send") as send:
+            metrics.main()
+        send.assert_not_called()
+        self.assertEqual(self.applied, [set()])
 
 
 if __name__ == "__main__":

@@ -60,9 +60,9 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "node": { "enum": ["20", "22", "24"], "description": "Версия Node.js; без неё — из engines, .nvmrc или .node-version." },
-        "python": { "enum": ["3.10", "3.11", "3.12", "3.13", "3.14"], "description": "Версия Python; без неё — из .python-version, runtime.txt или requires-python." },
-        "go": { "enum": ["1.25", "1.26", "1.27"], "description": "Версия Go; без неё — из директивы go в go.mod." },
+        "node": { "enum": ["20", "22", "24"], "description": "Версия Node.js; без неё — из engines, .nvmrc или .node-version: из диапазона вроде >=20 — 22, если подходит, иначе самая новая подходящая. 20 больше не получает исправлений безопасности." },
+        "python": { "enum": ["3.10", "3.11", "3.12", "3.13", "3.14"], "description": "Версия Python; без неё — из .python-version, runtime.txt или requires-python. 3.10 больше не получает исправлений безопасности." },
+        "go": { "enum": ["1.25", "1.26", "1.27"], "description": "Версия Go; без неё — 1.27 (директива go в go.mod — наименьшая версия). 1.25 больше не получает исправлений безопасности." },
         "php": { "enum": ["8.3", "8.4", "8.5"], "description": "Версия PHP, только на хостинге; без неё — по require.php из composer.json, по умолчанию 8.4." }
       }
     },

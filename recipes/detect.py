@@ -5,6 +5,7 @@
 одинаково и на хостинг, и на свой сервер.
 
     detect.py static-output КАТАЛОГ [ВЫХОД] [built]  — где после сборки лежит index.html
+    detect.py drop-links КАТАЛОГ                     — убрать ссылки за пределы каталога и перечислить их
 """
 import json
 import os
@@ -17,13 +18,50 @@ DEFAULT_GO = "1.27"
 NODE_VERSIONS = ["20", "22", "24"]
 PYTHON_VERSIONS = ["3.10", "3.11", "3.12", "3.13", "3.14"]
 GO_VERSIONS = ["1.25", "1.26", "1.27"]
+# Версии, которые больше не получают исправлений безопасности: их ещё можно выбрать, но
+# публикация об этом предупреждает. Тексты те же, что у сборщика хостинга.
+UNSUPPORTED_RUNTIMES = [
+    ("node", "Node.js", "20", "30.04.2026", "укажите 22 или 24 в .nvmrc, .node-version, engines.node в package.json или runtime.node"),
+    ("python", "Python", "3.10", "в октябре 2026", "укажите 3.12 или новее в .python-version, runtime.txt, requires-python в pyproject.toml или runtime.python"),
+    ("go", "Go", "1.25", "в августе 2026", 'укажите runtime.go: "1.27" или уберите runtime.go из airlok.yml'),
+]
+# Кодовые имена LTS-версий Node.js, как их пишут в .nvmrc: lts/jod.
+NODE_LTS = {"iron": "20", "jod": "22", "krypton": "24"}
 STACKS = ("static", "nextjs", "node", "python", "go")
 # Куда сборка кладёт программу Go-приложения.
 GO_BINARY = ".airlok/app"
 # Куда сборка ставит Bun: в образе Node его нет, а отдельный образ Bun не годится,
 # потому что без npm и Node многие пакеты не соберутся.
 BUN_BIN = "/app/.airlok/bun/node_modules/.bin"
-BUN_SETUP = f"npm install --no-audit --no-fund --prefix .airlok/bun bun@1 && export PATH={BUN_BIN}:$PATH"
+# Версии менеджеров пакетов, если проект не задал свою в packageManager: точные, чтобы сборка
+# не брала каждый раз новый выпуск из npm.
+PNPM_VERSION = "9.15.9"
+YARN_VERSION = "1.22.22"
+BUN_VERSION = "1.4.4"
+# Куда сборка ставит Yarn 2+.
+COREPACK_DIR = "/app/.airlok/corepack"
+# packageManager в package.json: имя, точная версия и, может быть, хеш.
+PACKAGE_MANAGER = re.compile(r"^(npm|pnpm|yarn|bun)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)(?:\+sha(?:1|224|256|384|512)\.[0-9a-f]+)?$", re.ASCII)
+# Версия формата yarn.lock, который пишет Yarn 2 и новее.
+BERRY_METADATA = re.compile(r'^__metadata:\s*\n\s+version:\s*"?(\d+)', re.M)
+# Последний Yarn, который пишет yarn.lock этого формата. Без packageManager Yarn ставится по нему:
+# более новый обновил бы формат, и yarn install --immutable упал бы.
+BERRY_VERSIONS = {"4": "2.4.3", "5": "3.1.1", "6": "3.8.7", "8": "4.13.0", "9": "4.14.1", "10": "4.18.1"}
+LATEST_BERRY_LOCK = "10"
+# Окружение Yarn 2+: corepack и скачанный им Yarn лежат в папке проекта, Yarn берётся из
+# реестра npm, как и все пакеты сборки. node-modules вместо PnP: иначе node server.js и
+# Next.js standalone не найдут модули.
+COREPACK_ENV = (f"export COREPACK_HOME={COREPACK_DIR}/home "
+                'COREPACK_NPM_REGISTRY="${COREPACK_NPM_REGISTRY:-https://registry.npmjs.org}" '
+                "COREPACK_ENABLE_DOWNLOAD_PROMPT=0 COREPACK_ENABLE_AUTO_PIN=0 COREPACK_ENABLE_STRICT=0 "
+                f"YARN_NODE_LINKER=node-modules YARN_ENABLE_TELEMETRY=0 PATH={COREPACK_DIR}/bin:$PATH")
+
+
+def bun_setup(version):
+    return f"npm install --no-audit --no-fund --prefix .airlok/bun bun@{version} && export PATH={BUN_BIN}:$PATH"
+
+
+BUN_SETUP = bun_setup(BUN_VERSION)
 # Сервер, который собирает Nitro (Nuxt, TanStack Start).
 NITRO_SERVER = "node .output/server/index.mjs"
 
@@ -76,6 +114,10 @@ ASTRO_MIDDLEWARE = re.compile(r"""\bmode\s*:\s*["']middleware["']""")
 PYTHON_ENTRIES = ["main.py", "app.py", "app/main.py", "src/main.py", "server.py", "api.py", "wsgi.py", "asgi.py", "streamlit_app.py"]
 SEGMENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$")
 MAJOR = re.compile(r"\d+(\.\d+)?")
+# Одно условие версии Node из engines или .nvmrc: >=20.19.0, ^22, 20.x, v24.1.0.
+NODE_CLAUSE = re.compile(r"^(>=|<=|>|<|=|\^|~>?)?v?(\d+|[xX*])(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?(?:[-+]\S*)?$")
+NODE_HYPHEN = re.compile(r"^(\S+)\s+-\s+(\S+)$")
+NODE_OP_SPACE = re.compile(r"(>=|<=|>|<|=|\^|~>?)\s+")
 # Ограничение версии Python из [project] в pyproject.toml.
 REQUIRES_PYTHON = re.compile(r"""^\s*requires-python\s*=\s*["']([^"']+)["']""", re.M)
 SPEC_CLAUSE = re.compile(r"^(>=|<=|==|!=|~=|>|<)\s*(\d+)(?:\.(\d+))?")
@@ -83,8 +125,8 @@ GO_DIRECTIVE = re.compile(r"^go\s+(\d+\.\d+)", re.M)
 GO_PACKAGE_MAIN = re.compile(r"^package\s+main\s*$", re.M)
 
 NPM_INSTALL = ("if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; "
-               "elif [ -f pnpm-lock.yaml ]; then npx --yes pnpm@9 install --frozen-lockfile; "
-               "elif [ -f yarn.lock ]; then npx --yes yarn@1 install --frozen-lockfile; "
+               f"elif [ -f pnpm-lock.yaml ]; then npx --yes pnpm@{PNPM_VERSION} install --frozen-lockfile; "
+               f"elif [ -f yarn.lock ]; then npx --yes yarn@{YARN_VERSION} install --frozen-lockfile; "
                "else npm install --no-audit --no-fund; fi")
 
 
@@ -110,10 +152,26 @@ class Package:
         self.deps = {**(data.get("dependencies") or {}), **(data.get("devDependencies") or {})}
         self.main = data.get("main") or ""
         self.module = data.get("module") or ""
-        self.engines = (data.get("engines") or {}).get("node") or ""
+        engines = data.get("engines")
+        node = engines.get("node") if isinstance(engines, dict) else None
+        # "engines": {"node": 20} — число вместо строки встречается в живых проектах.
+        self.engines = str(node) if isinstance(node, (str, int, float)) and not isinstance(node, bool) else ""
+        self.package_manager = data.get("packageManager")
 
     def has(self, dep):
         return dep in self.deps
+
+    def manager(self):
+        """Менеджер пакетов и его точная версия из packageManager. Версия попадает в команду
+        оболочки, поэтому значение не того вида не учитывается: (имя, версия, предупреждение)."""
+        spec = self.package_manager
+        if spec is None:
+            return "", "", ""
+        m = PACKAGE_MANAGER.match(spec) if isinstance(spec, str) else None
+        if m is None or m.end() != len(spec):
+            return "", "", ("packageManager в package.json не разобрать: нужны имя и точная версия, например yarn@4.5.0, — "
+                            "менеджер пакетов выбран по lock-файлу")
+        return m.group(1), m.group(2), ""
 
 
 def load_package(root):
@@ -192,11 +250,50 @@ def bun_entry(root, pkg):
     return next((f for f in (pkg.module, pkg.main, *BUN_ENTRIES) if f and exists(root, f)), "")
 
 
-def js_install(root, bun):
-    """Установка зависимостей. Bun ставится внутрь проекта через npm и остаётся доступен сборке."""
-    if not bun:
-        return NPM_INSTALL
-    return BUN_SETUP + " && bun install" + (" --frozen-lockfile" if has_bun_lock(root) else "")
+def js_install(root, pkg, bun):
+    """Установка зависимостей: {install, manager, corepack, warnings}. Менеджер выбирает lock-файл,
+    а версию — packageManager из package.json. Bun ставится внутрь проекта через npm и остаётся
+    доступен сборке."""
+    name, version, warning = pkg.manager() if pkg is not None else ("", "", "")
+    deps = {"install": NPM_INSTALL, "manager": "", "corepack": False, "warnings": [warning] if warning else []}
+    if bun:
+        setup = bun_setup(version if name == "bun" else BUN_VERSION)
+        deps["install"] = setup + " && bun install" + (" --frozen-lockfile" if has_bun_lock(root) else "")
+    elif exists(root, "package-lock.json"):
+        pass
+    elif exists(root, "pnpm-lock.yaml"):
+        deps["manager"] = "pnpm"
+        if name == "pnpm":
+            deps["install"] = f"npx --yes pnpm@{version} install --frozen-lockfile"
+    elif exists(root, "yarn.lock"):
+        deps["manager"] = "yarn"
+        lock = BERRY_METADATA.search(read_text(root, "yarn.lock"))
+        if name == "yarn" and not version.startswith("1."):
+            # corepack сам возьмёт версию из packageManager и сверит её хеш, если он указан.
+            deps.update(install=berry_install(""), corepack=True)
+        elif name == "yarn":
+            deps["install"] = f"npx --yes yarn@{version} install --frozen-lockfile"
+        elif lock:
+            yarn = BERRY_VERSIONS.get(lock.group(1))
+            if yarn is None:
+                yarn = BERRY_VERSIONS[LATEST_BERRY_LOCK]
+                deps["warnings"].append(f"yarn.lock записан незнакомой сборке версией Yarn — ставлю Yarn {yarn}. Если установка упадёт, "
+                                        "укажите свою версию в packageManager в package.json: её записывает yarn set version")
+            deps.update(install=berry_install(yarn), corepack=True)
+    return deps
+
+
+def berry_install(version):
+    """Установка Yarn 2+ через corepack; version — какой Yarn поставить, если packageManager его не задаёт."""
+    install = (f"{COREPACK_ENV} && mkdir -p {COREPACK_DIR}/bin && corepack enable --install-directory {COREPACK_DIR}/bin yarn")
+    if version:
+        install += f" && corepack install -g yarn@{version}"
+    return install + " && yarn install --immutable"
+
+
+def apply_js(plan, deps):
+    plan.update(install=deps["install"], manager=deps["manager"], corepack=deps["corepack"])
+    plan["warnings"] = plan["warnings"] + deps["warnings"]
 
 
 def detect(root, stack="", kind="", build_command="", build_output="", run_command="", node="", python="", go=""):
@@ -206,7 +303,7 @@ def detect(root, stack="", kind="", build_command="", build_output="", run_comma
     is_python = any(exists(root, f) for f in ("requirements.txt", "pyproject.toml", "Pipfile"))
 
     plan = {"stack": stack, "framework": "", "kind": kind, "node": "", "python": "", "go": "", "bun": False,
-            "install": "", "build": "", "output": "", "start": ""}
+            "install": "", "build": "", "output": "", "start": "", "manager": "", "corepack": False, "warnings": []}
     if not plan["stack"]:
         plan["stack"], plan["framework"] = guess_stack(root, pkg, is_python)
         if not plan["stack"]:
@@ -230,7 +327,8 @@ def detect(root, stack="", kind="", build_command="", build_output="", run_comma
     if plan["stack"] == "nextjs":
         if pkg is None:
             raise DetectError("для Next.js нужен package.json")
-        plan.update(install=js_install(root, plan["bun"]), build=build_command or "npm run build", kind="web")
+        apply_js(plan, js_install(root, pkg, plan["bun"]))
+        plan.update(build=build_command or "npm run build", kind="web")
         plan["framework"] = plan["framework"] or "Next.js"
         return plan
     if plan["stack"] == "node":
@@ -272,11 +370,11 @@ def guess_stack(root, pkg, is_python):
 def plan_static(root, pkg, build_command, build_output, plan):
     plan["output"] = build_output
     if build_command:
-        plan["install"], plan["build"] = js_install(root, plan["bun"]), build_command
+        plan["build"] = build_command
     elif pkg is not None and pkg.scripts.get("build"):
-        plan["install"], plan["build"] = js_install(root, plan["bun"]), "npm run build"
-    if pkg is None and build_command:
-        plan["install"] = ""
+        plan["build"] = "npm run build"
+    if pkg is not None and plan["build"]:
+        apply_js(plan, js_install(root, pkg, plan["bun"]))
     if not plan["output"] and plan["build"] and pkg is not None:
         plan["output"] = js_app(root, pkg)[2]
     if not plan["output"] and plan["build"] and pkg is not None:
@@ -357,7 +455,7 @@ def start_script(root, pkg, name, via_npm):
 def plan_node(root, pkg, build_command, run_command, plan):
     if pkg is None:
         raise DetectError("для Node-приложения нужен package.json")
-    plan["install"] = js_install(root, plan["bun"])
+    apply_js(plan, js_install(root, pkg, plan["bun"]))
     plan["build"] = build_command or ("npm run build" if pkg.scripts.get("build") else "")
     app_name, app_start, _, app_problem = js_app(root, pkg)
     start = run_command
@@ -545,20 +643,22 @@ def is_go_main(root, pkg):
 
 
 def go_version(root, wanted):
-    """Версия из директивы go в go.mod: это наименьшая подходящая версия, а новые сборщики
-    собирают и старый код, поэтому слишком старая директива получает последнюю версию."""
+    """Версия Go для директивы go в go.mod. Директива — наименьшая подходящая версия, а язык
+    и GODEBUG модуля задаёт она сама, поэтому код собирается версией по умолчанию или новее:
+    старые версии перестают получать исправления безопасности."""
     if wanted:
         if wanted not in GO_VERSIONS:
             raise DetectError(f"runtime.go — одна из версий {', '.join(GO_VERSIONS)}")
         return wanted
     m = GO_DIRECTIVE.search(read_text(root, "go.mod"))
-    if m is None:
+
+    def key(v):
+        return tuple(map(int, v.split(".")))
+    if m is None or key(m.group(1)) <= key(DEFAULT_GO):
         return DEFAULT_GO
-    if m.group(1) in GO_VERSIONS:
-        return m.group(1)
-    if tuple(map(int, m.group(1).split("."))) > tuple(map(int, GO_VERSIONS[-1].split("."))):
+    if key(m.group(1)) > key(GO_VERSIONS[-1]):
         raise DetectError(f"go.mod требует Go {m.group(1)}, а поддерживаются {GO_VERSIONS[0]}–{GO_VERSIONS[-1]}")
-    return DEFAULT_GO
+    return GO_VERSIONS[-1]
 
 
 def node_version(root, wanted, pkg):
@@ -566,11 +666,84 @@ def node_version(root, wanted, pkg):
         if wanted not in NODE_VERSIONS:
             raise DetectError(f"runtime.node — одна из версий {', '.join(NODE_VERSIONS)}")
         return wanted
-    for src in (read_text(root, ".nvmrc"), read_text(root, ".node-version"), pkg.engines if pkg else ""):
-        m = MAJOR.search(src)
-        if m and m.group(0).split(".")[0] in NODE_VERSIONS:
-            return m.group(0).split(".")[0]
+    for spec in (version_line(read_text(root, ".nvmrc")), version_line(read_text(root, ".node-version")),
+                 (pkg.engines if pkg else "").strip()):
+        if spec:
+            v = pick_node(spec)
+            if v:
+                return v
     return DEFAULT_NODE
+
+
+def pick_node(spec):
+    """Версия по умолчанию, если подходит, иначе самая новая подходящая. Ограничение, которое пускает
+    любую версию (lts/*, node, ">=20"), выбора не сужает: тогда решает следующий источник, а без него —
+    версия по умолчанию, так что engines ">=20" получает 22."""
+    fit = [v for v in NODE_VERSIONS if fits_node(v, spec)]
+    if not fit or len(fit) == len(NODE_VERSIONS):
+        return ""
+    return DEFAULT_NODE if DEFAULT_NODE in fit else fit[-1]
+
+
+def version_line(text):
+    """Версия из .nvmrc или .node-version: первая строка, кроме комментариев."""
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            return line
+    return ""
+
+
+def fits_node(version, spec):
+    """Подходит ли мажорная версия Node под ограничение в духе npm semver: "20",
+    "^20.19.0 || >=22.12.0", ">=20 <23", "18 - 22", "lts/jod". Сравниваются только мажорные
+    версии: в образе всегда последний выпуск своей ветки."""
+    spec = spec.strip()
+    if spec.lower().startswith("lts/"):
+        name = spec[4:].lower()
+        return NODE_LTS[name] == version if name in NODE_LTS else True
+    major = int(version)
+    return any(fits_node_range(major, alt.strip()) for alt in spec.split("||"))
+
+
+def fits_node_range(major, r):
+    h = NODE_HYPHEN.match(r)
+    if h:
+        return fits_node_clause(major, ">=" + h.group(1)) and fits_node_clause(major, "<=" + h.group(2))
+    return all(fits_node_clause(major, c) for c in NODE_OP_SPACE.sub(r"\1", r).split())
+
+
+def fits_node_clause(major, clause):
+    m = NODE_CLAUSE.match(clause)
+    if not m or not m.group(2).isdigit():
+        return True  # node, latest, *, x — не ограничение версии
+    want = int(m.group(2))
+    # >20.1 пускает новые выпуски 20.x, а >20 — только 21 и выше; <20.5 пускает ранние 20.x,
+    # а <20 и <20.0.0 — нет.
+    minor, patch = m.group(3) or "", m.group(4) or ""
+    specific = minor.isdigit()
+    above_branch = specific and (int(minor) > 0 or (patch.isdigit() and int(patch) > 0))
+    op = m.group(1) or ""
+    if op == ">=":
+        return major >= want
+    if op == ">":
+        return major >= want if specific else major > want
+    if op == "<=":
+        return major <= want
+    if op == "<":
+        return major <= want if above_branch else major < want
+    return major == want
+
+
+def runtime_warnings(plan):
+    """Предупреждения о версиях среды без исправлений безопасности и о том, что из настроек
+    проекта сборка не учла."""
+    versions = dict(plan)
+    # Без сборки статике Node не нужен.
+    if plan["stack"] == "static" and not plan.get("install") and not plan.get("build"):
+        versions["node"] = ""
+    return [f"{name} {version} больше не получает исправлений безопасности (поддержка закончилась {ended}) — {hint}"
+            for key, name, version, ended, hint in UNSUPPORTED_RUNTIMES if versions.get(key) == version] + plan.get("warnings", [])
 
 
 def python_version(root, wanted):
@@ -638,7 +811,32 @@ def static_output(root, output, built):
     raise DetectError("после сборки не нашли index.html в dist, build, out или public — укажите build.output в airlok.yml")
 
 
+def drop_outside_links(root):
+    """Удаляет ссылки, которые ведут за пределы каталога, и возвращает их пути. Код из репозитория
+    читают и собирают от root: ссылка на /etc отдала бы ему файлы сервера. Абсолютные ссылки тоже
+    удаляются: внутрь проекта на сервере они не ведут, путь у репозитория там другой."""
+    real_root = os.path.realpath(root)
+    links = [os.path.join(folder, name) for folder, dirs, files in os.walk(root) for name in dirs + files
+             if os.path.islink(os.path.join(folder, name))]
+    # Сначала решаем по всем, потом удаляем: ссылка на ссылку наружу иначе зависела бы от порядка обхода.
+    outside = [p for p in links
+               if os.path.isabs(os.readlink(p)) or os.path.commonpath([real_root, os.path.realpath(p)]) != real_root]
+    for path in outside:
+        os.unlink(path)
+    return sorted(os.path.relpath(p, root) for p in outside)
+
+
+def printable(text):
+    return "".join(c if c.isprintable() else "?" for c in text)
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "drop-links":
+        dropped = [printable(p) for p in drop_outside_links(sys.argv[2])]
+        if dropped:
+            more = f" и ещё {len(dropped) - 20}" if len(dropped) > 20 else ""
+            print(", ".join(dropped[:20]) + more)
+        return
     if len(sys.argv) >= 3 and sys.argv[1] == "static-output":
         output = sys.argv[3] if len(sys.argv) > 3 else ""
         try:
@@ -646,7 +844,7 @@ def main():
         except DetectError as e:
             sys.exit(f"Ошибка: {e}")
         return
-    sys.exit("использование: detect.py static-output КАТАЛОГ [ВЫХОД] [built]")
+    sys.exit("использование: detect.py static-output КАТАЛОГ [ВЫХОД] [built] | drop-links КАТАЛОГ")
 
 
 if __name__ == "__main__":

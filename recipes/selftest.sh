@@ -108,6 +108,9 @@ host_checks() {
 	if ((UPLOADS_ENABLED)); then
 		expect "папка загрузок смонтирована с noexec" ".*noexec.*" "$(findmnt -no OPTIONS --target "$APP_DIR/shared/uploads")"
 	fi
+	if ((UPLOADS_ENABLED && !UPLOADS_PUBLIC)); then
+		expect "закрытые загрузки недоступны nginx" "750 ${APP_UID}:$(id -g "$APP_USER")" "$(stat -c '%a %u:%g' "$APP_DIR/shared/uploads")"
+	fi
 }
 
 # get PATH [curl-аргументы] → код ответа; заголовки в $TMP/h
@@ -135,20 +138,27 @@ web_checks() {
 	printf '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>' | put airlok-selftest.svg
 	base64 -d <<<"$PNG_1PX" | put airlok-selftest.png
 	printf '%%PDF-1.4\n' | put airlok-selftest.pdf
+	# Ссылки от имени приложения: на файл root и на свой файл.
+	local ext=${UPLOAD_EXTS%% *}
+	ln -sfn /etc/hostname "$dir/airlok-selftest-foreign.${ext}"
+	ln -sfn airlok-selftest.png "$dir/airlok-selftest-own.png"
+	chown -h "$APP_USER" "$dir/airlok-selftest-foreign.${ext}" "$dir/airlok-selftest-own.png"
 
 	expect "листинг папки загрузок закрыт" "403|404" "$(get /uploads/)"
 	expect "загруженный HTML не открывается как страница" "404" "$(get /uploads/airlok-selftest.html)"
 	expect "загруженный SVG не отдаётся" "404" "$(get /uploads/airlok-selftest.svg)"
+	expect "ссылка в загрузках на чужой файл не отдаётся" "403|404" "$(get "/uploads/airlok-selftest-foreign.${ext}")"
 	if [[ " $UPLOAD_EXTS " == *" png "* ]]; then
 		expect "картинка из загрузок отдаётся" "200" "$(get /uploads/airlok-selftest.png)"
 		expect "картинка отдаётся с CSP sandbox" ".*sandbox.*" "$(hdr content-security-policy)"
 		expect "картинка отдаётся с nosniff" "nosniff" "$(hdr x-content-type-options)"
+		expect "ссылка приложения на свой файл отдаётся" "200" "$(get /uploads/airlok-selftest-own.png)"
 	fi
 	if [[ " $UPLOAD_EXTS " == *" pdf "* ]]; then
 		expect "PDF из загрузок отдаётся" "200" "$(get /uploads/airlok-selftest.pdf)"
 		expect "PDF только скачивается, а не открывается" "attachment" "$(hdr content-disposition)"
 	fi
-	rm -f "$dir"/airlok-selftest.*
+	rm -f "$dir"/airlok-selftest*
 
 	local big=$((UPLOAD_MAX_MB + 1))
 	head -c $((big * 1024 * 1024)) /dev/zero >"$TMP/big"

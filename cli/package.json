@@ -1,6 +1,6 @@
 {
   "name": "@airlok/cli",
-  "version": "0.7.6",
+  "version": "0.8.0",
   "description": "Публикация проекта на хостинге Airlok из терминала, подключение своего сервера и ИИ-агентов: npx @airlok/cli setup",
   "type": "module",
   "bin": {

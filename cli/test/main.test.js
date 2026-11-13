@@ -1,13 +1,41 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { gunzipSync } from 'node:zlib'
 
-import { appLimitText, duration, logUpdate, main, stageUpdates, suggestName } from '../src/main.js'
+import { ApiError, USER_AGENT } from '../src/api.js'
+import { saveSession } from '../src/config.js'
+import { agentToken, appLimitText, duration, errorText, logUpdate, main, projectFiles, stageUpdates, suggestName } from '../src/main.js'
 import { untar } from './untar.js'
+
+test('errorText explains what a token from the dashboard cannot do', () => {
+  const text = errorText(new ApiError(403, 'cli_login_required', 'this action needs a CLI login'))
+  assert.match(text, /npx @airlok\/cli login/)
+  assert.match(text, /AIRLOK_TOKEN/)
+})
+
+test('agentToken gives AI agents their own token, not the CLI login', async () => {
+  const io = captureIO()
+  const fake = (result) => ({
+    token: 'airlok_pat_login',
+    createAgentToken: async (client) => {
+      if (result instanceof Error) throw result
+      return { name: `ИИ-агенты ${client}`, token: result }
+    },
+  })
+  assert.equal(await agentToken(fake('airlok_pat_agents'), 'mac', io), 'airlok_pat_agents')
+  assert.equal(await agentToken(fake(new ApiError(403, 'cli_login_required', 'нет')), 'mac', io), 'airlok_pat_login',
+    'AIRLOK_TOKEN уже токен для агентов — его и пишем')
+  assert.deepEqual(io.errLines, [])
+  assert.equal(await agentToken(fake(new ApiError(404, 'not_found', 'нет')), 'mac', io), 'airlok_pat_login', 'старый дашборд')
+  assert.match(io.errLines.join('\n'), /записываю им вход CLI/)
+  await assert.rejects(agentToken(fake(new ApiError(0, 'network', 'нет связи')), 'mac', io), /нет связи/)
+})
 
 test('duration reads like the dashboard', () => {
   assert.equal(duration(0.3), '<1 с')
@@ -184,4 +212,195 @@ test('login, then deploy a folder into a new app and follow the build', { timeou
 test('appLimitText tells a missing plan from a full one', () => {
   assert.match(appLimitText('the current plan has no hosting: trial is not available: link Yandex ID to start the trial'), /settings\?tab=plan/)
   assert.match(appLimitText('hosting allows up to 3 apps per user'), /максимум приложений/)
+})
+
+test('projectFiles takes data files only with consent and refuses the home folder', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'airlok-data-'))
+  await writeFile(join(dir, 'index.html'), '<h1>hi</h1>')
+  await writeFile(join(dir, 'app.db'), 'd')
+  await writeFile(join(dir, 'server.key'), 'k')
+  const env = { HOME: await mkdtemp(join(tmpdir(), 'airlok-home-')) }
+  const paths = (r) => r.files.map((f) => f.path)
+
+  const quiet = captureIO()
+  const r = await projectFiles(dir, {}, quiet, env)
+  assert.deepEqual(paths(r), ['index.html'])
+  assert.deepEqual(r.excluded, { secrets: ['server.key'], data: ['app.db'] })
+  assert.match(quiet.errLines.join('\n'), /Не загружаю базы.*app\.db.*--include-data/)
+
+  const flagged = await projectFiles(dir, { 'include-data': true }, captureIO(), env)
+  assert.deepEqual(paths(flagged), ['index.html', 'app.db'])
+  assert.deepEqual(flagged.excluded, { secrets: ['server.key'], data: [] })
+
+  assert.deepEqual(paths(await projectFiles(dir, {}, captureIO(['да']), env)), ['index.html', 'app.db'], 'человек согласился')
+  assert.deepEqual(paths(await projectFiles(dir, {}, captureIO(['n']), env)), ['index.html'])
+  assert.deepEqual(paths(await projectFiles(dir, { json: true }, captureIO(['да']), env)), ['index.html'], 'с --json не спрашиваем')
+
+  await assert.rejects(projectFiles(dir, {}, captureIO(), { HOME: dir }), /домашняя/)
+  await assert.rejects(projectFiles(join(dir, '..'), {}, captureIO(), { HOME: dir }), /домашняя/)
+})
+
+test('deploy --new creates no app for a folder it cannot publish', { timeout: 30_000 }, async (t) => {
+  const dash = await fakeDashboard()
+  t.after(dash.close)
+  const env = { XDG_CONFIG_HOME: await mkdtemp(join(tmpdir(), 'airlok-home-')), AIRLOK_URL: dash.state.base, AIRLOK_TOKEN: 'airlok_pat_test' }
+  const linked = async (dir) => Boolean(await stat(join(dir, '.airlok', 'project.json')).catch(() => null))
+
+  const empty = await mkdtemp(join(tmpdir(), 'airlok-empty-'))
+  const io = captureIO()
+  assert.equal(await main(['deploy', empty, '--new', 'mysite'], io, env), 1)
+  assert.match(io.errLines.join('\n'), /нет файлов проекта/)
+
+  const heavy = await mkdtemp(join(tmpdir(), 'airlok-heavy-'))
+  await writeFile(join(heavy, 'video.bin'), randomBytes(51 << 20))
+  const big = captureIO()
+  assert.equal(await main(['deploy', heavy, '--new', 'mysite'], big, env), 1)
+  assert.match(big.errLines.join('\n'), /больше 50 МБ/)
+
+  assert.deepEqual(dash.state.created, [], 'приложение не создано')
+  assert.equal(await linked(empty), false)
+  assert.equal(await linked(heavy), false)
+})
+
+test('deploy --new publishes a build folder from .gitignore and then points to the linked app', { timeout: 30_000 }, async (t) => {
+  const dash = await fakeDashboard()
+  t.after(dash.close)
+  dash.state.commandPolls = 2
+  const env = { XDG_CONFIG_HOME: await mkdtemp(join(tmpdir(), 'airlok-home-')), AIRLOK_URL: dash.state.base, AIRLOK_TOKEN: 'airlok_pat_test' }
+  const repo = await mkdtemp(join(tmpdir(), 'airlok-repo-'))
+  await writeFile(join(repo, '.gitignore'), 'dist\n')
+  await mkdir(join(repo, 'dist', 'assets'), { recursive: true })
+  await writeFile(join(repo, 'dist', 'index.html'), '<h1>hi</h1>')
+  await writeFile(join(repo, 'dist', 'assets', 'app.js'), 'x')
+  execFileSync('git', ['init', '-q'], { cwd: repo })
+  const dist = join(repo, 'dist')
+
+  const io = captureIO()
+  assert.equal(await main(['deploy', dist, '--new', 'mysite', '--json'], io, env), 0)
+  assert.match(io.errLines.join('\n'), /dist в \.gitignore/)
+  assert.deepEqual(untar(gunzipSync(dash.state.archive)).map((e) => e.path), ['src/assets/app.js', 'src/index.html'])
+  assert.equal(dash.state.created.length, 1)
+
+  const again = captureIO()
+  assert.equal(await main(['deploy', dist, '--new', 'mysite'], again, env), 1)
+  assert.match(again.errLines.join('\n'), /mysite уже создано и привязано к этой папке/)
+  const other = captureIO()
+  assert.equal(await main(['deploy', repo, '--new', 'shop'], other, env), 1)
+  assert.match(other.errLines.join('\n'), /--app shop/)
+  assert.equal(dash.state.created.length, 1, 'повтор с --new не создаёт приложение')
+})
+
+// tokenDashboard записывает запросы: вход выдаёт airlok_pat_new и говорит, заменил ли прежний вход.
+async function tokenDashboard({ revoke = 204 } = {}) {
+  const state = { requests: [] }
+  const server = createServer(async (req, res) => {
+    const chunks = []
+    for await (const c of req) chunks.push(c)
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : null
+    state.requests.push({ method: req.method, path: req.url, auth: req.headers.authorization ?? '', ua: req.headers['user-agent'], body })
+    const send = (code, data) => {
+      res.writeHead(code, { 'Content-Type': 'application/json' })
+      res.end(data === undefined ? '' : JSON.stringify(data))
+    }
+    if (req.url === '/api/cli/v1/login') return send(201, { device_code: 'dev', user_code: 'BCDF-GHJK', url: 'http://x/cli', expires_in: 60, interval: 0 })
+    if (req.url === '/api/cli/v1/login/token') return send(200, { token: 'airlok_pat_new', login: 'anna', replaced: Boolean(body.previous_token) })
+    if (req.method === 'DELETE' && req.url === '/api/cli/v1/token') return send(revoke, revoke === 204 ? undefined : { error: { code: 'x', message: 'сбой' } })
+    send(404, { error: { code: 'not_found', message: req.url } })
+  })
+  await new Promise((ok) => server.listen(0, '127.0.0.1', ok))
+  return { state, url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((ok) => server.close(ok)) }
+}
+
+test('login replaces the previous login of this computer, but shows it only to its own dashboard', async (t) => {
+  const dash = await tokenDashboard()
+  t.after(dash.close)
+  const home = await mkdtemp(join(tmpdir(), 'airlok-home-'))
+  const env = { XDG_CONFIG_HOME: home, AIRLOK_URL: dash.url }
+
+  await saveSession({ url: dash.url, token: 'airlok_pat_old', login: 'anna' }, env)
+  const io = captureIO()
+  assert.equal(await main(['login'], io, env), 0)
+  const poll = dash.state.requests.find((r) => r.path === '/api/cli/v1/login/token')
+  assert.equal(poll.body.previous_token, 'airlok_pat_old')
+  assert.match(io.errLines.join('\n'), /Прежний вход этого компьютера отозван/)
+  assert.equal(poll.ua, USER_AGENT)
+  assert.match(USER_AGENT, /^airlok-cli\/\d+\.\d+\.\d+ node\/\S+ \S+$/, 'по версии дашборд видит, какие CLI ещё в ходу')
+
+  dash.state.requests = []
+  await saveSession({ url: 'https://other.example', token: 'airlok_pat_other', login: 'anna' }, env)
+  const other = captureIO()
+  assert.equal(await main(['login'], other, env), 0)
+  const fresh = dash.state.requests.find((r) => r.path === '/api/cli/v1/login/token')
+  assert.equal(fresh.body.previous_token, undefined, 'токен другого дашборда сюда не уходит')
+  assert.doesNotMatch(other.errLines.join('\n'), /Прежний вход/)
+})
+
+test('logout revokes the saved login and keeps tokens it did not issue', async (t) => {
+  const dash = await tokenDashboard()
+  t.after(dash.close)
+  const home = await mkdtemp(join(tmpdir(), 'airlok-home-'))
+  const env = { XDG_CONFIG_HOME: home, AIRLOK_URL: dash.url }
+  const cfg = join(home, 'airlok', 'config.json')
+  const deletes = () => dash.state.requests.filter((r) => r.method === 'DELETE')
+
+  await saveSession({ url: dash.url, token: 'airlok_pat_saved', login: 'anna' }, env)
+  const io = captureIO()
+  assert.equal(await main(['logout'], io, { ...env, AIRLOK_TOKEN: 'airlok_pat_ci' }), 0)
+  assert.deepEqual(deletes().map((r) => r.auth), ['Bearer airlok_pat_saved'], 'отзывается сохранённый вход, а не AIRLOK_TOKEN')
+  await assert.rejects(stat(cfg))
+  assert.match(io.errLines.join('\n'), /токен входа отозван[\s\S]*AIRLOK_TOKEN по-прежнему действует/)
+
+  dash.state.requests = []
+  assert.equal(await main(['logout'], captureIO(), { ...env, AIRLOK_TOKEN: 'airlok_pat_ci' }), 0)
+  assert.deepEqual(deletes(), [], 'без сохранённого входа отзывать нечего')
+
+  await saveSession({ url: dash.url, token: 'airlok_pat_saved', login: 'anna' }, env)
+  const keep = captureIO()
+  assert.equal(await main(['logout', '--keep-token'], keep, env), 0)
+  assert.deepEqual(deletes(), [])
+  await assert.rejects(stat(cfg))
+  assert.match(keep.errLines.join('\n'), /токен действует/)
+})
+
+test('login and logout keep a token that AI agents still use', async (t) => {
+  const dash = await tokenDashboard()
+  t.after(dash.close)
+  const home = await mkdtemp(join(tmpdir(), 'airlok-home-'))
+  const env = { XDG_CONFIG_HOME: home, HOME: home, AIRLOK_URL: dash.url }
+  // Так setup CLI до 0.8.0 записывал агенту сам вход CLI.
+  await mkdir(join(home, '.cursor'), { recursive: true })
+  await writeFile(join(home, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { airlok: { url: dash.url + '/mcp', headers: { Authorization: 'Bearer airlok_pat_old' } } } }))
+
+  await saveSession({ url: dash.url, token: 'airlok_pat_old', login: 'anna' }, env)
+  const io = captureIO()
+  assert.equal(await main(['login'], io, env), 0)
+  const poll = dash.state.requests.find((r) => r.path === '/api/cli/v1/login/token')
+  assert.equal(poll.body.previous_token, undefined, 'токен агентов не отзывается при новом входе')
+  assert.match(io.errLines.join('\n'), /Прежний вход не отозван[\s\S]*~\/\.cursor\/mcp\.json[\s\S]*setup/)
+
+  await saveSession({ url: dash.url, token: 'airlok_pat_old', login: 'anna' }, env)
+  const deletes = () => dash.state.requests.filter((r) => r.method === 'DELETE')
+  const out = captureIO()
+  assert.equal(await main(['logout'], out, env), 1)
+  assert.deepEqual(deletes(), [], 'без --force токен агентов не отзывается')
+  assert.match(out.errLines.join('\n'), /записан в настройках ИИ-агентов[\s\S]*--force/)
+  await stat(join(home, 'airlok', 'config.json'))
+
+  assert.equal(await main(['logout', '--force'], captureIO(), env), 0)
+  assert.deepEqual(deletes().map((r) => r.auth), ['Bearer airlok_pat_old'])
+})
+
+test('logout keeps the login when the token could not be revoked', async (t) => {
+  for (const [revoke, code, kept] of [[500, 1, true], [404, 0, false], [401, 0, false]]) {
+    const dash = await tokenDashboard({ revoke })
+    t.after(dash.close)
+    const home = await mkdtemp(join(tmpdir(), 'airlok-home-'))
+    const env = { XDG_CONFIG_HOME: home, AIRLOK_URL: dash.url }
+    await saveSession({ url: dash.url, token: 'airlok_pat_saved', login: 'anna' }, env)
+    const io = captureIO()
+    assert.equal(await main(['logout'], io, env), code, `${revoke}: ${io.errLines.join('\n')}`)
+    assert.equal(Boolean(await stat(join(home, 'airlok', 'config.json')).catch(() => null)), kept, `${revoke}`)
+    if (revoke === 500) assert.match(io.errLines.join('\n'), /--keep-token/)
+    if (revoke === 404) assert.match(io.errLines.join('\n'), /отзовите его в дашборде/, 'старый дашборд без отзыва')
+  }
 })

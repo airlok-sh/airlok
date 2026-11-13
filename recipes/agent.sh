@@ -119,7 +119,13 @@ def save_env(env):
 
 
 kind = cmd.get("kind")
+# Хеш версии необязателен: без него ставится последняя подписанная. Что коммит из main и подписан, проверяет
+# update.sh, а хеш не того вида просто не передаётся.
 if kind == "update":
+    u = cmd.get("update")
+    sha = u.get("sha") if isinstance(u, dict) else None
+    if isinstance(sha, str) and SHA.fullmatch(sha):
+        emit("ok", cid, "update", sha)
     emit("ok", cid, "update")
 if kind == "db_query":
     q = cmd.get("db_query")
@@ -680,10 +686,10 @@ resume_os_job() {
 # run_update — обновление агента, которое человек подтвердил в дашборде. После отчёта агент
 # перезапускается: так он продолжит на новом коде, даже если сам agent.sh не менялся.
 run_update() {
-	local id=$1 log=$STATE_DIR/command.log rc message=""
-	echo "команда ${id}: обновление агента"
+	local id=$1 sha=${2:-} log=$STATE_DIR/command.log rc message=""
+	echo "команда ${id}: обновление агента${sha:+ до ${sha}}"
 	install -m 600 /dev/null "$log"
-	timeout --kill-after=60 "$UPDATE_TIMEOUT" "$RECIPES_DIR/update.sh" </dev/null >"$log" 2>&1
+	timeout --kill-after=60 "$UPDATE_TIMEOUT" "$RECIPES_DIR/update.sh" ${sha:+--to "$sha"} </dev/null >"$log" 2>&1
 	rc=$?
 	if ((rc == 124 || rc == 137)); then
 		message="обновление не уложилось в $((UPDATE_TIMEOUT / 60)) минут и было остановлено"
@@ -738,6 +744,7 @@ handle() {
 		return
 	fi
 	case ${f[2]:-} in
+	update) details="sha=${f[3]:-}" ;;
 	deploy) details="app=${f[3]} repo=${f[4]} sha=${f[5]} domain=${f[10]}" ;;
 	restart) details="app=${f[3]}" ;;
 	remove) details="app=${f[3]} with_data=${f[4]}" ;;
@@ -764,7 +771,7 @@ handle() {
 		esac
 	fi
 	case ${f[2]:-} in
-	update) run_update "${f[1]}" ;;
+	update) run_update "${f[1]}" "${f[3]:-}" ;;
 	restart) run_restart "${f[1]}" "${f[3]}" "${f[4]}" ;;
 	remove) run_remove "${f[1]}" "${f[3]}" "${f[4]}" ;;
 	db_query) run_db_query "${f[1]}" ;;
@@ -794,7 +801,7 @@ main() {
 	fi
 	[[ -r $DASHBOARD_CONF ]] && resume_os_job
 	while :; do
-		# git pull заменяет файл новым: между командами перезапускаемся на свежем коде.
+		# Обновление заменяет файл новым: между командами перезапускаемся на свежем коде.
 		if [[ $(stat -c %i "$SELF" 2>/dev/null) != "$SELF_INODE" ]]; then
 			echo "рецепты обновились, перезапуск"
 			exec "$SELF"

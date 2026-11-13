@@ -114,6 +114,45 @@ class InBranchTest(unittest.TestCase):
             self.assertFalse(self.in_branch(fork))
 
 
+class AppTailTest(unittest.TestCase):
+    """app_tail из lib.sh: вывод упавшего приложения в строгом режиме не уходит в дашборд."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.policy = os.path.join(self.tmp.name, "policy.env")
+        self.log = os.path.join(self.tmp.name, "deploy.log")
+
+    def tail(self, mode):
+        with open(self.policy, "w", encoding="utf-8") as f:
+            f.write(f"AIRLOK_MODE={mode}\n")
+        compose = 'compose() { echo "Error: connect ECONNREFUSED postgres://app:secret@db:5432/app" >&2; }'
+        script = f'source "$1"; POLICY_CONF=$2; {compose}\nwhere=$(app_tail "$3"); echo "$where"'
+        return subprocess.run(["bash", "-c", script, "bash", os.path.join(RECIPES, "lib.sh"), self.policy, self.log],
+                              capture_output=True, text=True)
+
+    def test_strict_keeps_app_output_on_server(self):
+        out = self.tail("strict")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("secret", out.stdout + out.stderr)
+        with open(self.log, encoding="utf-8") as f:
+            self.assertIn("secret", f.read())
+        self.assertEqual(out.stdout, f"в {self.log} на сервере\n")
+
+    def test_normal_mode_shows_output(self):
+        out = self.tail("normal")
+        self.assertIn("secret", out.stderr)
+        self.assertEqual(out.stdout, "в логе выше\n")
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_recipes_show_app_output_only_through_app_tail(self):
+        for name in ("app-deploy.sh", "app-restart.sh"):
+            with open(os.path.join(RECIPES, name), encoding="utf-8") as f:
+                source = f.read()
+            self.assertIn("app_tail ", source, name)
+            self.assertNotIn("compose logs", source, name)
+
+
 def server_shell():
     return subprocess.run(["bash", "-c", "((BASH_VERSINFO[0] >= 4))"], capture_output=True).returncode == 0
 

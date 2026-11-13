@@ -35,22 +35,33 @@ last_backup() {
 	fi
 }
 
+# stop_containers — только свои контейнеры и том базы: в проекте compose с тем же именем могут быть
+# контейнеры, которые человек поднял сам (foreign_containers в lib.sh). Тогда compose down не зовём — он
+# остановил бы и их, а сеть и том проекта общие с ними.
 stop_containers() {
-	local down=(down --remove-orphans) ids=()
+	local down=(down) ids=() foreign
 	((WITH_DATA)) && down+=(--volumes)
-	if [[ -f $APP_DIR/compose.yml ]]; then
+	foreign=$(foreign_containers "$NAME" "$APP_DIR" | awk -F'\t' '{printf "%s%s", sep, $2; sep = ", "}') || die "Docker не ответил, какие контейнеры есть у приложения — причина выше"
+	if [[ -n $foreign ]]; then
+		note "контейнеры ${foreign} из проекта Docker Compose ${NAME} запущены не Airlok — их не трогаем"
+	elif [[ -f $APP_DIR/compose.yml ]]; then
 		compose "${down[@]}" || die "контейнеры приложения не остановились — причина выше"
 	fi
 	# Разовые контейнеры задач и остатки прошлой попытки compose.yml уже не знает.
-	mapfile -t ids < <(docker ps -aq --filter "label=com.docker.compose.project=${NAME}")
+	mapfile -t ids < <(own_containers "$NAME" "$APP_DIR")
 	((${#ids[@]} == 0)) || docker rm -f "${ids[@]}" >/dev/null || die "не удалось удалить контейнеры приложения"
-	docker network rm "${NAME}_default" >/dev/null 2>&1 || true
+	[[ -n $foreign ]] || docker network rm "${NAME}_default" >/dev/null 2>&1 || true
 	# Образы, собранные по Dockerfile проекта: без приложения они только занимают диск.
 	mapfile -t ids < <(docker images -q "airlok-${NAME}" | sort -u)
 	((${#ids[@]} == 0)) || docker image rm -f "${ids[@]}" >/dev/null 2>&1 || true
+	# Том ИМЯ_pgdata наш, только если Airlok заводил приложению базу (shared/db.env): app-deploy.sh
+	# не публикует приложение с базой поверх чужого тома.
 	if ((WITH_DATA)); then
-		mapfile -t ids < <(docker volume ls -q --filter "label=com.docker.compose.project=${NAME}")
-		((${#ids[@]} == 0)) || docker volume rm "${ids[@]}" >/dev/null || die "не удалось удалить том базы"
+		if [[ -n $foreign ]]; then
+			note "том ${NAME}_pgdata оставлен: проект ${NAME} использует и другой Docker Compose"
+		elif [[ -s $APP_DIR/shared/db.env ]] && docker volume inspect "${NAME}_pgdata" >/dev/null 2>&1; then
+			docker volume rm "${NAME}_pgdata" >/dev/null || die "не удалось удалить том базы"
+		fi
 	fi
 	ok "контейнеры остановлены и удалены"
 }

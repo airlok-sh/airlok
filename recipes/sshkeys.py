@@ -154,10 +154,35 @@ def line_fingerprint(line):
         return None
 
 
-def render(text, keys, remove=frozenset()):
+def line_options(line):
+    """Опции строки authorized_keys (command=…, from=…, restrict) — всё, что стоит перед типом ключа."""
+    m = LINE_KEY.search(line)
+    return line[:m.start(1)].strip() if m else ""
+
+
+def key_options(texts, own_only=False):
+    """Опции, с которыми ключ уже лежит в файлах: {(тип, base64): опции первой строки}. Есть строка
+    без опций — у ключа и так полный вход, и опции пустые."""
+    out = {}
+    for line in "\n".join(texts).split("\n"):
+        if line.lstrip().startswith("#") or (own_only and not MARK.search(line.rstrip())):
+            continue
+        key = line_key(line)
+        if not key:
+            continue
+        opts = line_options(line)
+        if key not in out or not opts:
+            out[key] = opts
+    return out
+
+
+def render(text, keys, remove=frozenset(), carried=None):
     """Новое содержимое authorized_keys: чужие строки на месте, кроме remove (отпечатки), ключи
-    устройств — в конце."""
+    устройств — в конце. Ключ устройства сохраняет опции строки, которую он заменил, а без неё —
+    опции из carried (его строки у другого пользователя): иначе «Сделать устройством» превратило бы
+    ключ с command= или from= в полный вход."""
     wanted = {(t, b) for _, t, b in keys}
+    options = {**(carried or {}), **key_options([text])}
     kept = []
     for line in text.split("\n"):
         comment = line.lstrip().startswith("#")
@@ -166,7 +191,7 @@ def render(text, keys, remove=frozenset()):
         kept.append(line)
     while kept and not kept[-1].strip():
         kept.pop()
-    lines = kept + [f"{t} {b} airlok-device:{i}" for i, t, b in keys]
+    lines = kept + [" ".join(filter(None, (options.get((t, b)), t, b, f"airlok-device:{i}"))) for i, t, b in keys]
     return "".join(line + "\n" for line in lines)
 
 
@@ -229,7 +254,7 @@ def own(path, account):
         os.chown(path, account.uid, account.gid)
 
 
-def apply(path, keys, password_login, account=ROOT, remove=frozenset()):
+def apply(path, keys, password_login, account=ROOT, remove=frozenset(), carried=None):
     """Переписывает файл, если что-то поменялось; возвращает True, если поменялось."""
     check_owned(path, account)
     try:
@@ -237,7 +262,7 @@ def apply(path, keys, password_login, account=ROOT, remove=frozenset()):
             old = f.read()
     except FileNotFoundError:
         old = ""
-    new = render(old, keys, remove)
+    new = render(old, keys, remove, carried)
     if new == old:
         return False
     if has_keys(old) and not has_keys(new) and not password_login:
@@ -269,7 +294,10 @@ def fingerprint(b64):
 
 
 def device_fingerprints(text):
-    return {fingerprint(k[1]) for line in text.split("\n") if MARK.search(line.rstrip()) and (k := line_key(line))}
+    """Отпечатки строк устройств без опций: вход ключом с command= (скрипт копий, например) не
+    доказывает, что человек сам может войти на сервер."""
+    return {fingerprint(k[1]) for line in text.split("\n")
+            if MARK.search(line.rstrip()) and not line_options(line) and (k := line_key(line))}
 
 
 def device_login(journal, allowed):
@@ -294,7 +322,7 @@ def wait_login(since, seconds):
     conf = sshd_conf()
     allowed = {(a.name, fp) for a in accounts() for fp in device_fingerprints(read_keys(keys_path(conf, a)))}
     if not allowed:
-        raise Failed("на сервере нет ключей устройств — вход по ключу проверить нечем")
+        raise Failed("на сервере нет ключей устройств без ограничений (command=, from=) — вход по ключу проверить нечем")
     deadline = time.monotonic() + seconds
     while True:
         r = subprocess.run(["journalctl", "--since", f"@{since}", "-t", "sshd", "-t", "sshd-session", "-o", "cat", "--no-pager"],
@@ -318,7 +346,10 @@ def main_wait(args):
 
 
 def inventory(text, user="root"):
-    """Ключи authorized_keys для дашборда: ключ без опций, комментарий и устройство, если строка его."""
+    """Ключи authorized_keys для дашборда: ключ, комментарий, устройство, если строка его, и есть ли
+    у ключа ограничения — опции на всех его строках в файле. Сами опции не уходят: в command= бывают
+    пути и пароли."""
+    options = key_options([text])
     out = []
     for line in text.split("\n"):
         m = None if line.lstrip().startswith("#") else LINE_KEY.search(line)
@@ -327,7 +358,7 @@ def inventory(text, user="root"):
         mark = MARK.search(line.rstrip())
         comment = "" if mark else "".join(ch for ch in line[m.end():] if ch.isprintable()).strip()[:MAX_COMMENT]
         out.append({"user": user, "key": f"{m.group(1)} {m.group(2)}", "comment": comment,
-                    "device": mark.group(0).rsplit(":", 1)[1] if mark else None})
+                    "device": mark.group(0).rsplit(":", 1)[1] if mark else None, "restricted": bool(options.get((m.group(1), m.group(2))))})
         if len(out) >= MAX_INVENTORY:
             break
     return out
@@ -432,22 +463,42 @@ def sync(req, conf, accs):
     if unknown:
         raise Failed(f"на сервере нет пользователя {sorted(unknown)[0]}, у которого надо убрать ключ")
     path = keys_path(conf, target)
-    changed = apply(path, keys, password_login(conf, user), target, removals.get(user, frozenset()))
-    left = []
+    # Ключ переезжает к выбранному пользователю с опциями только из файлов root и учёток с тем же uid:
+    # чужой command= выполнился бы от имени выбранного пользователя. Ключ, который в остальных файлах
+    # лежит только с опциями, остаётся на месте: без опций он стал бы полным входом. Строки без пометки
+    # тоже в счёт: ключ могли сделать устройством и сменить пользователя до того, как агент её пометил.
+    texts = {a.name: read_keys(keys_path(conf, a)) for a in accs}
+    carried = key_options([texts[a.name] for a in accs if a.name != user and a.uid in (0, target.uid)])
+    foreign = key_options([texts[a.name] for a in accs if a.uid not in (0, target.uid)])
+    present = key_options([texts[user]])
+    stuck = {(t, b) for _, t, b in keys if foreign.get((t, b)) and (t, b) not in present and (t, b) not in carried}
+    changed = apply(path, [k for k in keys if (k[1], k[2]) not in stuck], password_login(conf, user), target,
+                    removals.get(user, frozenset()), carried)
+    left, holders = [], []
     for a in accs:
+        if a.name == user:
+            continue
         other = keys_path(conf, a)
         drop = removals.get(a.name, frozenset())
-        if a.name == user or (not drop and "airlok-device:" not in read_keys(other)):
+        current = read_keys(other)
+        if stuck & key_options([current]).keys():
+            holders.append(a.name)
+        if not drop and "airlok-device:" not in current:
             continue
+        theirs = key_options([current], own_only=True)
+        keep = [k for k in keys if (k[1], k[2]) in stuck and (k[1], k[2]) in theirs]
         try:
-            changed = apply(other, [], password_login(conf, a.name), a, drop) or changed
+            changed = apply(other, keep, password_login(conf, a.name), a, drop) or changed
         except Failed:
             # Просьбу человека убрать ключ нельзя молча оставить невыполненной.
             if drop:
                 raise
             left.append(a.name)
     state = "обновлены" if changed else "уже на месте"
-    msg = f"Готово: ключи устройств ({len(keys)}) {state} в {path}"
+    msg = f"Готово: ключи устройств ({len(keys) - len(stuck)}) {state} в {path}"
+    if stuck:
+        msg += (f"; ключей устройств с ограничениями (command=, from=) оставлено у {', '.join(holders)}: {len(stuck)} — "
+                f"к {user} они переехали бы без ограничений, перенесите строки руками")
     if removals:
         msg += f"; убрано ключей не из «Устройств»: {sum(len(v) for v in removals.values())}"
     if left:

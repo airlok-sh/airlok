@@ -17,7 +17,7 @@ import sys
 import yaml
 
 from cron import CronError, parse_jobs
-from detect import STACKS, DetectError, detect, shell_exec, subprojects
+from detect import STACKS, DetectError, detect, runtime_warnings, shell_exec, subprojects
 from dockerfile import DockerfileError, find_source
 
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
@@ -291,6 +291,7 @@ def parse(data, root):
         "DOCKER_ARGS": "\n".join(f"{k}={v}" for k, v in literal_args(docker).items()),
         "DOCKER_DEFAULTS": "\n".join(f"{k}={v}" for k, v in sorted(docker["defaults"].items()) if "\n" not in v) if docker else "",
         "DOCKER_WARNINGS": "\n".join(docker["warnings"]) if docker else "",
+        "RUNTIME_WARNINGS": "\n".join(runtime_warnings(plan)),
     }
 
 

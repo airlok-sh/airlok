@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # База сервера: обновления, Docker, файрвол, nginx, SSH по ключу.
-# Повторный запуск безопасен: каждый шаг сначала смотрит, не сделан ли он уже.
+# Повторный запуск безопасен: каждый шаг сначала смотрит, не сделан ли он уже. Его делают
+# install.sh и каждое обновление агента, поэтому настройки человека шаги дополняют, а не
+# переписывают: свой Docker, daemon.json, выключенный ufw и свой сайт nginx остаются как есть.
 #
 #   server-base.sh             — настроить сервер
 #   server-base.sh --skip-ssh  — всё, кроме SSH (так запускает install.sh)
@@ -8,25 +10,42 @@
 #   server-base.sh confirm-ssh — подтвердить, что вход по ключу работает, и отменить откат
 #   server-base.sh ssh-open    — вернуть вход по паролю, который закрыл airlok
 #   server-base.sh letsencrypt [EMAIL] — выпускать для сайтов сертификаты Let's Encrypt
+#
+# AIRLOK_FIREWALL=off — при первой установке не включать ufw (опция --no-firewall установщика).
 
 source "$(dirname "$0")/lib.sh"
 
 SSH_DROPIN=/etc/ssh/sshd_config.d/00-airlok.conf
 SSH_ROLLBACK_UNIT=airlok-ssh-rollback
+SSH_PENDING=/var/lib/airlok/ssh-pending
+SSH_GUARD_UNIT=airlok-ssh-guard.service
 # Агенту нужно окно дольше: человек идёт в терминал по подсказке из дашборда.
 SSH_ROLLBACK_SECONDS=${AIRLOK_SSH_ROLLBACK_SECONDS:-180}
 [[ $SSH_ROLLBACK_SECONDS =~ ^[1-9][0-9]{1,3}$ ]] || die "AIRLOK_SSH_ROLLBACK_SECONDS — число секунд от 10 до 9999"
 APT_LOG=/var/log/airlok-apt.log
 APT_LOCK_WAIT=${AIRLOK_APT_LOCK_WAIT:-600}
 
+# Сервер уже готовили раньше: так повторный запуск узнаётся без новых флагов, ведь update.sh
+# прежней версии вызывает server-base.sh по-старому.
+installed_before() {
+	[[ -e /etc/nginx/snippets/airlok-security-headers.conf || -e $DASHBOARD_CONF || -e $SERVER_CONF ]]
+}
+
 preflight() {
 	step "Предварительная проверка"
 	local os mem disk
 	os=$(. /etc/os-release && echo "${ID}-${VERSION_ID}")
 	[[ $os == ubuntu-24.04 || $os == ubuntu-26.04 ]] || die "рецепт проверен только на Ubuntu 24.04 и 26.04, здесь ${os}"
+	disk=$(df -Pm / | awk 'NR==2{print $4}')
+	# Обновление агента не должно падать оттого, что сервер с тех пор обжили: место кончается,
+	# а на 443 встал VPN.
+	if [[ $FIRST_RUN == no ]]; then
+		((disk >= 5000)) || note "на диске свободно ${disk} МБ: сборкам и копиям базы может не хватить места"
+		ok "Ubuntu ${os#ubuntu-}, ${disk} МБ на диске"
+		return
+	fi
 	mem=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
 	((mem >= 700)) || die "нужно хотя бы 1 ГБ памяти, здесь ${mem} МБ"
-	disk=$(df -Pm / | awk 'NR==2{print $4}')
 	((disk >= 5000)) || die "нужно хотя бы 5 ГБ свободного места, здесь ${disk} МБ"
 	local busy
 	busy=$(ss -H -tlnp '( sport = :80 or sport = :443 )' | grep -v nginx || true)
@@ -53,11 +72,49 @@ apt_install() {
 	done
 }
 
+pkg_installed() { [[ $(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null) == ii* ]]; }
+apt_candidate() { [[ $(apt-cache policy "$1" 2>/dev/null) =~ Candidate:\ [^\(] ]]; }
+
+# docker_packages — какие пакеты Docker ставить (DOCKER_PKGS) и что о нём сказать (DOCKER_NOTE).
+# Второй Docker рядом с уже стоящим не ставим: docker.io из Ubuntu удалил бы docker-ce и
+# containerd.io с download.docker.com.
+docker_packages() {
+	DOCKER_PKGS=() DOCKER_NOTE=docker
+	if pkg_installed docker-ce; then
+		DOCKER_NOTE="Docker CE оставлен как был"
+		if ! docker compose version >/dev/null 2>&1; then
+			apt_candidate docker-compose-plugin || die "у Docker CE нет docker compose, а пакета docker-compose-plugin в источниках apt не нашлось: поставьте его и запустите команду ещё раз"
+			DOCKER_PKGS+=(docker-compose-plugin)
+		fi
+		# Без buildx сборка по Dockerfile идёт старым сборщиком, поэтому его отсутствие не ошибка.
+		if ! docker buildx version >/dev/null 2>&1 && apt_candidate docker-buildx-plugin; then
+			DOCKER_PKGS+=(docker-buildx-plugin)
+		fi
+		return
+	fi
+	# snap смотрим до command -v docker: под sudo /snap/bin есть в PATH, и snap-версию нашло бы как «свой» Docker.
+	if [[ -e /snap/bin/docker ]] && ! pkg_installed docker.io; then
+		die "Docker стоит из snap, а Airlok работает с Docker из apt. Второй Docker рядом ставить не будем: перенесите контейнеры и уберите snap-версию (sudo snap remove docker) или возьмите чистый сервер"
+	fi
+	if pkg_installed docker.io || ! command -v docker >/dev/null; then
+		# Рядом с уже стоящим docker.io snap-версия ничего нового не добавляет, и ночное обновление
+		# агента на таком сервере останавливать незачем.
+		if [[ -e /snap/bin/docker ]]; then
+			note "Рядом с Docker из apt стоит Docker из snap: Airlok работает с первым, snap-версию лучше убрать (sudo snap remove docker)"
+		fi
+		DOCKER_PKGS=(docker.io docker-compose-v2 docker-buildx)
+		return
+	fi
+	docker compose version >/dev/null 2>&1 || die "Docker на сервере поставлен не из пакетов docker.io или docker-ce и без docker compose. Второй Docker рядом ставить не будем: добавьте к нему docker compose или возьмите чистый сервер"
+	DOCKER_NOTE="Docker оставлен как был"
+}
+
 packages() {
 	step "Пакеты и обновления"
-	apt_install пакеты docker.io docker-compose-v2 docker-buildx nginx ufw fail2ban \
+	docker_packages
+	apt_install пакеты "${DOCKER_PKGS[@]}" nginx ufw fail2ban \
 		unattended-upgrades python3-yaml openssl rsync
-	ok "docker, nginx, ufw, fail2ban установлены"
+	ok "${DOCKER_NOTE}, nginx, ufw, fail2ban установлены"
 
 	if write_if_changed /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'EOF'; then
 APT::Periodic::Update-Package-Lists "1";
@@ -86,37 +143,116 @@ swap() {
 	ok "создан swap 2 ГБ"
 }
 
+# docker_daemon дописывает в daemon.json ротацию логов и live-restore, только если их не задали
+# сами: data-root, зеркала и прочие ключи человека остаются. Битый файл не трогаем.
 docker_daemon() {
 	step "Docker"
-	if write_if_changed /etc/docker/daemon.json 0644 <<'EOF'; then
-{
-  "log-driver": "json-file",
-  "log-opts": { "max-size": "10m", "max-file": "3" },
-  "no-new-privileges": true,
-  "live-restore": true
-}
-EOF
-		systemctl restart docker
-		ok "ротация логов и no-new-privileges для всех контейнеров"
-	else
-		ok "настройки демона уже на месте"
+	local conf=/etc/docker/daemon.json backup="" added="" rc=0 containers args=()
+	args+=("--dockerd-flags=$(systemctl show docker.service -p ExecStart --value 2>/dev/null || true)")
+	[[ $(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null) == active ]] && args+=(--swarm)
+	containers=$(docker ps -aq 2>/dev/null) || containers=unknown
+	# Запрет повышать права для всех контейнеров — только на чистом сервере: он закрывает и шаги RUN
+	# при сборке по Dockerfile, но сломал бы чужие контейнеры с sudo или setuid. Свои контейнеры
+	# Airlok и так запускает с no-new-privileges.
+	if [[ $FIRST_RUN == yes && ! -s $conf && -z $containers ]]; then
+		args+=(--no-new-privileges)
 	fi
+	if [[ -e $conf ]]; then
+		backup=$(mktemp)
+		cp -p "$conf" "$backup"
+	fi
+	added=$(python3 "$RECIPES_DIR/serverbase.py" daemon-json "$conf" "${args[@]}") || rc=$?
+	case $rc in
+	0)
+		if ! docker_apply; then
+			if [[ -n $backup ]]; then cp -p "$backup" "$conf"; else rm -f "$conf"; fi
+			rm -f "$backup"
+			systemctl restart docker || true
+			die "Docker не запустился с дополненным ${conf}, вернули прежний; подробности: journalctl -u docker"
+		fi
+		ok "в ${conf} дописано: ${added}; остальные настройки не тронуты"
+		;;
+	10) ok "настройки демона уже на месте" ;;
+	11) note "${conf} не разобрать как JSON — оставили как есть, ротацию логов не добавили" ;;
+	*)
+		rm -f "$backup"
+		die "не удалось дополнить ${conf}"
+		;;
+	esac
+	rm -f "$backup"
 	systemctl enable --now docker >/dev/null 2>&1
 }
 
+# docker_apply — применить новый daemon.json. Перезапуск Docker без live-restore останавливает
+# контейнеры, поэтому при запущенных сначала включаем live-restore перечитыванием настроек: оно
+# обходится без остановки, и после него контейнеры переживут перезапуск.
+docker_apply() {
+	if [[ -n $(docker ps -q 2>/dev/null) ]] && ! live_restore_on; then
+		systemctl reload docker || return 1
+		local tries=10
+		while ((tries--)) && ! live_restore_on; do sleep 1; done
+		if ! live_restore_on; then
+			note "ротация логов заработает после перезапуска Docker (sudo systemctl restart docker): сейчас его не перезапускали, чтобы не остановить контейнеры"
+			return 0
+		fi
+	fi
+	systemctl restart docker
+}
+
+live_restore_on() { [[ $(docker info --format '{{.LiveRestoreEnabled}}' 2>/dev/null) == true ]]; }
+
+# hub_check — предупредить заранее, если Docker Hub с сервера не отвечает: с него публикации берут
+# образы сборки, nginx и Postgres. Установку и обновление это не останавливает.
+hub_check() {
+	local mirrors code
+	mirrors=$(docker info --format '{{range .RegistryConfig.Mirrors}}{{.}} {{end}}' 2>/dev/null) || mirrors=""
+	if [[ -n ${mirrors// /} ]]; then
+		ok "образы Docker Hub — через зеркало ${mirrors% }"
+		return 0
+	fi
+	command -v curl >/dev/null || return 0
+	# Без входа реестр отвечает 401 — значит, он доступен. Слои образов Hub отдаёт с Cloudflare по
+	# адресам, которые меняются, поэтому их скачивание проверит уже первая публикация.
+	code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://registry-1.docker.io/v2/ 2>/dev/null) || true
+	if [[ $code == 401 ]]; then
+		ok "реестр Docker Hub отвечает"
+		return 0
+	fi
+	if [[ $code =~ ^[1-9] ]]; then code="код ${code}"; else code="нет ответа"; fi
+	note "внимание: Docker Hub с сервера не отвечает (${code}), публикации могут не скачать образы. ${HUB_MIRROR_ADVICE}"
+}
+
+# firewall включает ufw только при первой установке и открывает в нём всё, что уже слушает снаружи:
+# VPN и чужие сервисы на сервере должны работать и дальше. Потом во включённый ufw только добавляются
+# SSH, 80 и 443, а выключенный человеком больше не включается. FIREWALL в server.env: airlok — ufw
+# включён, off — выключен.
 firewall() {
 	step "Файрвол"
-	local ssh_port
-	ssh_port=$(awk '$1=="port"{print $2; exit}' <<<"$(sshd -T 2>/dev/null)")
-	ssh_port=${ssh_port:-22}
-	# SSH разрешаем до включения: иначе ufw enable оборвёт текущее подключение.
-	ufw allow "${ssh_port}/tcp" >/dev/null
-	ufw allow 80/tcp >/dev/null
-	ufw allow 443/tcp >/dev/null
+	local state ports port
+	state=$(conf_value "$SERVER_CONF" FIREWALL)
+	if [[ $(ufw status 2>/dev/null) == "Status: active"* ]]; then
+		ports=$(python3 "$RECIPES_DIR/serverbase.py" firewall-ports)
+		for port in $ports; do ufw allow "$port" >/dev/null; done
+		[[ -n $state ]] || conf_set "$SERVER_CONF" FIREWALL airlok
+		ok "ufw включён, открыты ${ports//$'\n'/, }; остальные правила не тронуты"
+		note "контейнеры публикуют порты только на 127.0.0.1, поэтому Docker не обходит ufw"
+		return
+	fi
+	if [[ -n $state || $FIRST_RUN == no || ${AIRLOK_FIREWALL:-} == off ]]; then
+		conf_set "$SERVER_CONF" FIREWALL off
+		ok "ufw выключен, Airlok его не включает"
+		note "включить: сначала разрешите нужные порты (sudo ufw allow ПОРТ/tcp), затем sudo ufw enable"
+		return
+	fi
+	ports=$(python3 "$RECIPES_DIR/serverbase.py" firewall-ports --listening)
+	# Разрешаем до включения: иначе ufw enable оборвёт текущее подключение по SSH.
+	for port in $ports; do ufw allow "$port" >/dev/null; done
 	ufw default deny incoming >/dev/null
 	ufw default allow outgoing >/dev/null
 	ufw --force enable >/dev/null
-	ok "открыты ${ssh_port}, 80, 443, остальное закрыто"
+	conf_set "$SERVER_CONF" FIREWALL airlok
+	ok "ufw включён, открыты ${ports//$'\n'/, }; остальное закрыто"
+	note "открыть ещё порт: sudo ufw allow ПОРТ/tcp"
 	note "контейнеры публикуют порты только на 127.0.0.1, поэтому Docker не обходит ufw"
 }
 
@@ -149,16 +285,49 @@ add_header X-Content-Type-Options nosniff always;
 add_header X-Frame-Options SAMEORIGIN always;
 add_header Referrer-Policy strict-origin-when-cross-origin always;
 EOF
-	if [[ -e /etc/nginx/sites-enabled/default ]]; then
-		rm -f /etc/nginx/sites-enabled/default
+	# Сайты, опубликованные раньше, получают запрет ссылок в загрузках без новой публикации.
+	local sites="" rc=0
+	sites=$(python3 "$RECIPES_DIR/serverbase.py" nginx-uploads) || rc=$?
+	case $rc in
+	0)
 		changed=yes
+		ok "загрузки сайтов ${sites} больше не отдаются по ссылкам на чужие файлы"
+		;;
+	10) ;;
+	*) note "запрет ссылок в загрузках заработает после следующей публикации сайтов" ;;
+	esac
+	local default=""
+	if [[ -e /etc/nginx/sites-enabled/default ]]; then
+		if default_site_pristine; then
+			rm -f /etc/nginx/sites-enabled/default
+			changed=yes
+			default=", стандартная страница убрана"
+		else
+			note "сайт nginx по умолчанию (/etc/nginx/sites-enabled/default) изменён или отдаёт ваши файлы — оставили его: запросы по IP сервера и к доменам без своего сайта пойдут в него"
+		fi
 	fi
 	if [[ $changed == yes ]]; then
 		nginx -t -q
 		systemctl reload nginx
 	fi
 	systemctl enable --now nginx >/dev/null 2>&1
-	ok "версия скрыта, общие заголовки безопасности готовы, стандартная страница убрана"
+	ok "версия скрыта, общие заголовки безопасности готовы${default}"
+}
+
+# default_site_pristine — сайт по умолчанию такой, каким его поставил пакет nginx, и отдаёт только
+# его приветственную страницу: убрать его ничего не сломает.
+default_site_pristine() {
+	local link=/etc/nginx/sites-enabled/default site=/etc/nginx/sites-available/default www=/var/www/html
+	local pkg sum f
+	[[ -L $link && $(readlink -f "$link") == "$site" && -f $site ]] || return 1
+	pkg=$(dpkg -S "$site" 2>/dev/null) || return 1
+	pkg=${pkg%%:*}
+	sum=$(dpkg-query -W -f='${Conffiles}\n' "$pkg" 2>/dev/null | awk -v f="$site" '$1 == f {print $2}')
+	[[ -n $sum && $(md5sum <"$site" | cut -d' ' -f1) == "$sum" ]] || return 1
+	for f in "$www"/* "$www"/.[!.]*; do
+		[[ -e $f ]] || continue
+		[[ ${f##*/} == index.nginx-debian.html ]] || return 1
+	done
 }
 
 # letsencrypt [EMAIL] — включить выпуск сертификатов: дальше их выпускает app-deploy.sh
@@ -200,6 +369,29 @@ authorized_keys_present() {
 	return 1
 }
 
+# Таймер отката systemd-run живёт в /run и пропадает при перезагрузке. Пока закрытие пароля
+# не подтверждено, лежит отметка, и этот юнит при загрузке, ещё до sshd, убирает настройки airlok.
+ssh_guard() {
+	if write_if_changed "/etc/systemd/system/$SSH_GUARD_UNIT" 0644 <<EOF; then
+[Unit]
+Description=airlok: вернуть вход по паролю, если его закрытие не подтвердили до перезагрузки
+ConditionPathExists=$SSH_PENDING
+DefaultDependencies=no
+After=local-fs.target
+Before=ssh.service ssh.socket
+
+[Service]
+Type=oneshot
+ExecStart=/bin/rm -f $SSH_DROPIN $SSH_PENDING
+
+[Install]
+WantedBy=multi-user.target
+EOF
+		systemctl daemon-reload || return 1
+	fi
+	systemctl is-enabled --quiet "$SSH_GUARD_UNIT" 2>/dev/null || systemctl enable --quiet "$SSH_GUARD_UNIT"
+}
+
 ssh_hardening() {
 	step "SSH"
 	if ! authorized_keys_present; then
@@ -213,6 +405,9 @@ ssh_hardening() {
 		ok "вход только по ключу уже настроен"
 		return
 	fi
+	ssh_guard || die "не удалось поставить откат SSH на случай перезагрузки, вход по паролю не трогали"
+	mkdir -p "${SSH_PENDING%/*}"
+	echo $(($(date +%s) + SSH_ROLLBACK_SECONDS)) >"$SSH_PENDING"
 	# Имя с 00-: sshd берёт первое найденное значение, а хостер кладёт свои
 	# PasswordAuthentication yes в 50-cloud-init.conf и подобные файлы.
 	cat >"$SSH_DROPIN" <<'EOF'
@@ -222,14 +417,14 @@ PermitRootLogin prohibit-password
 EOF
 	chmod 644 "$SSH_DROPIN"
 	if ! sshd -t; then
-		rm -f "$SSH_DROPIN"
+		rm -f "$SSH_DROPIN" "$SSH_PENDING"
 		die "sshd не принял настройки, вернули как было"
 	fi
 	systemctl reset-failed "$SSH_ROLLBACK_UNIT" 2>/dev/null || true
 	# AccuracySec: без него systemd вправе сдвинуть срабатывание на минуту.
 	systemd-run --quiet --unit="$SSH_ROLLBACK_UNIT" --on-active="$SSH_ROLLBACK_SECONDS" \
 		--timer-property=AccuracySec=1s \
-		/bin/sh -c "rm -f '$SSH_DROPIN' && systemctl reload ssh"
+		/bin/sh -c "rm -f '$SSH_DROPIN' '$SSH_PENDING' && systemctl reload ssh"
 	systemctl reload ssh
 	ok "вход по паролю выключен, root входит только по ключу"
 	# CLI проверяет вход по ключу сам, новым SSH-соединением, а агент ждёт такой вход в журнале sshd.
@@ -245,6 +440,7 @@ EOF
 confirm_ssh() {
 	need_root
 	if systemctl stop "${SSH_ROLLBACK_UNIT}.timer" 2>/dev/null; then
+		rm -f "$SSH_PENDING"
 		ok "откат SSH отменён, вход только по ключу закреплён"
 	else
 		note "таймер отката не найден: либо уже подтверждено, либо настройки уже откатились"
@@ -256,6 +452,7 @@ confirm_ssh() {
 ssh_open() {
 	step "SSH"
 	systemctl stop "${SSH_ROLLBACK_UNIT}.timer" 2>/dev/null || true
+	rm -f "$SSH_PENDING"
 	if [[ -e $SSH_DROPIN ]]; then
 		rm -f "$SSH_DROPIN"
 		sshd -t || die "sshd не принимает свои настройки без файла airlok: проверьте /etc/ssh/sshd_config"
@@ -270,10 +467,13 @@ ssh_open() {
 
 main() {
 	need_root
+	FIRST_RUN=yes
+	installed_before && FIRST_RUN=no
 	preflight
 	packages
 	swap
 	docker_daemon
+	hub_check
 	firewall
 	bruteforce
 	web

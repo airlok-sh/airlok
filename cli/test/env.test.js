@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { findApp, parseDotEnv } from '../src/env.js'
+import { findApp, parseDotEnv, placeholders } from '../src/env.js'
 import { keyId, seal } from '../src/envseal.js'
 import { main } from '../src/main.js'
 
@@ -181,4 +181,51 @@ test('env on a strict server points to the file on the server', { timeout: 30_00
   assert.equal(await main(['env', 'list', '--app', 'blog'], list, dash.env), 0)
   assert.match(list.errLines.join('\n'), /строгий режим/)
   assert.doesNotMatch(list.errLines.join('\n'), /не прислал ключ/)
+})
+
+test('env set refuses an empty value unless --allow-empty', { timeout: 30_000 }, async (t) => {
+  const key = await agentKey()
+  const dash = await fakeDashboard(key)
+  t.after(dash.close)
+
+  for (const stdin of ['', '\n', '\r\n']) {
+    const io = captureIO({ stdin })
+    assert.equal(await main(['env', 'set', 'BOT_TOKEN', '--app', 'hosting/shop'], io, dash.env), 1)
+    assert.match(io.errLines.join('\n'), /BOT_TOKEN пустое.*heredoc/s)
+    assert.match(io.errLines.join('\n'), /env rm BOT_TOKEN/)
+  }
+  const server = captureIO({ stdin: '' })
+  assert.equal(await main(['env', 'set', 'BOT_TOKEN', '--app', 'blog'], server, dash.env), 1)
+  const asked = captureIO({ tty: true, answers: ['v1', ''] })
+  assert.equal(await main(['env', 'set', 'A', 'B', '--app', 'blog'], asked, dash.env), 1)
+  assert.match(asked.errLines.join('\n'), /B пустое \(ничего не введено\)/)
+  assert.equal(dash.state.hostedPut, null)
+  assert.equal(dash.state.put, null, 'и частично ничего не отправлено')
+
+  const dir = await mkdtemp(join(tmpdir(), 'airlok-env-'))
+  await writeFile(join(dir, '.env'), 'A=1\nB=\nC=""\n')
+  const file = captureIO()
+  assert.equal(await main(['env', 'set', '--app', 'hosting/shop', '--from', join(dir, '.env')], file, dash.env), 1)
+  assert.match(file.errLines.join('\n'), /пустые: B, C/)
+  assert.equal(dash.state.hostedPut, null)
+  const onlyA = captureIO()
+  assert.equal(await main(['env', 'set', 'A', '--app', 'hosting/shop', '--from', join(dir, '.env')], onlyA, dash.env), 0)
+  assert.deepEqual(dash.state.hostedPut, { vars: { A: '1' } }, 'пустые строки, которые не выбраны, не мешают')
+
+  const allowed = captureIO()
+  assert.equal(await main(['env', 'set', '--app', 'hosting/shop', '--from', join(dir, '.env'), '--allow-empty'], allowed, dash.env), 0)
+  assert.deepEqual(dash.state.hostedPut, { vars: { A: '1', B: '', C: '' } })
+  const piped = captureIO({ stdin: '' })
+  assert.equal(await main(['env', 'set', 'E', '--app', 'blog', '--allow-empty'], piped, dash.env), 0, piped.errLines.join('\n'))
+  assert.equal(await open(key.priv, 'blog', 'E', dash.state.put.vars.E), '')
+})
+
+test('env set warns about placeholder values but still sets them', { timeout: 30_000 }, async (t) => {
+  assert.deepEqual(placeholders({ A: 'your_token_here', B: 'changeme', C: 'xxxx', D: '<token>', E: 'sk-live-123', F: 'yourapp', G: 'TODO' }), ['A', 'B', 'C', 'D', 'G'])
+  const dash = await fakeDashboard(await agentKey())
+  t.after(dash.close)
+  const io = captureIO({ stdin: 'your_token_here\n' })
+  assert.equal(await main(['env', 'set', 'BOT_TOKEN', '--app', 'hosting/shop'], io, dash.env), 0)
+  assert.match(io.errLines.join('\n'), /заглушку.*BOT_TOKEN/)
+  assert.deepEqual(dash.state.hostedPut, { vars: { BOT_TOKEN: 'your_token_here' } })
 })

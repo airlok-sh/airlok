@@ -40,6 +40,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import speed  # noqa: E402
+import strict  # noqa: E402
 
 LOG_GLOB = "/var/log/nginx/airlok-*.access.log"
 LOG_NAME = re.compile(r"^airlok-([a-z][a-z0-9-]{1,30})\.access\.log$")
@@ -641,6 +642,7 @@ def main():
         save_json(PENDING_FILE, pending)
         save_json(STATE_FILE, state)
         if not os.path.exists(DASHBOARD_CONF):
+            apply_speed(None)
             return
         apps = None
         # Пустая отправка тоже нужна: в ответе — у каких приложений включён замер скорости.
@@ -660,11 +662,27 @@ def main():
                 if pending:
                     continue
             break
-        if apps is not None:
-            try:
-                speed.apply(apps)
-            except OSError as e:
-                print("speed: не удалось настроить nginx для замера скорости: %s" % e, file=sys.stderr)
+        apply_speed(apps)
+
+
+def apply_speed(apps):
+    """Приводит nginx к списку apps из ответа дашборда; None — ответа нет, ничего не меняется.
+    В строгом режиме дашборд не меняет отдачу сайтов: замер выключен, что бы тот ни прислал,
+    а включённый раньше снимается."""
+    try:
+        strict_mode = strict.read_policy(strict.POLICY)[0]
+    except (OSError, ValueError) as e:
+        # Режим неизвестен: список дашборда мог бы включить замер на строгом сервере.
+        print("speed: не удалось прочитать %s, nginx не трогаем: %s" % (strict.POLICY, e), file=sys.stderr)
+        return
+    if strict_mode:
+        apps = set()
+    if apps is None:
+        return
+    try:
+        speed.apply(apps)
+    except OSError as e:
+        print("speed: не удалось настроить nginx для замера скорости: %s" % e, file=sys.stderr)
 
 
 if __name__ == "__main__":

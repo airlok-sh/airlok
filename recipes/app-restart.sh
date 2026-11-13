@@ -39,7 +39,7 @@ wait_started() {
 
 main() {
 	need_root
-	local name=${1:-} port="" path release
+	local name=${1:-} port="" path release where
 	[[ $name =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "некорректное имя приложения: ${name}"
 	APP_DIR=$APPS_ROOT/$name
 	[[ -f $APP_DIR/compose.yml && -L $APP_DIR/current ]] || die "приложение ${name} на этом сервере ещё не публиковали"
@@ -65,8 +65,8 @@ main() {
 	release=$(readlink -f "$APP_DIR/current")
 	path=$(release_health "$release")
 	if ! wait_started "$port" "$path"; then
-		compose logs --tail 30 app >&2 || true
-		die "приложение не запустилось после перезапуска — причина в логе выше. Если ему не хватает переменных окружения, задайте их на странице приложения в дашборде airlok"
+		where=$(app_tail "$APP_DIR/shared/deploy.log")
+		die "приложение не запустилось после перезапуска — причина ${where}. Если ему не хватает переменных окружения, задайте их на странице приложения в дашборде airlok"
 	fi
 	printf '\n%sГотово:%s приложение %s перезапущено\n' "$C_B" "$C_0" "$name"
 }

@@ -226,6 +226,10 @@ deploy() {
 	fi
 	# git archive, а не checkout: в релиз попадает только содержимое коммита, без .git и истории.
 	git --git-dir="$GIT_DIR_PATH" archive "$tree" | tar -x -C "$src"
+	# До чтения airlok.yml и сборки: всё дальше идёт от root, и ссылка на /etc отдала бы ему файлы сервера.
+	local links
+	links=$(python3 "$RECIPES_DIR/detect.py" drop-links "$src") || die "не удалось проверить ссылки в коде"
+	[[ -z $links ]] || note "ссылки за пределы проекта не копируются, как и на хостинге: ${links}"
 	local subject
 	subject=$(git --git-dir="$GIT_DIR_PATH" log -1 --format='%s' "$SHA")
 	ok "${REF_KIND}: ${SHA:0:12} «${subject}»"

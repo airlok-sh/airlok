@@ -73,7 +73,26 @@ class RenderTest(unittest.TestCase):
     def test_adopts_copy_of_device_key(self):
         old = f"{key(1)} airlok@laptop\ncommand=\"/bin/true\" {key(1)} old\n# {key(1)} в комментарии\n"
         self.assertEqual(sshkeys.render(old, self.keys((ID1, key(1)))), f"# {key(1)} в комментарии\n{key(1)} airlok-device:{ID1}\n",
-                         "иначе отключение устройства не закрыло бы ему доступ")
+                         "иначе отключение устройства не закрыло бы ему доступ; копия без опций и так давала полный вход")
+
+    def test_keeps_options_of_restricted_key(self):
+        borg = 'command="borg serve --restrict-to-path /backup",restrict,from="10.0.0.5"'
+        old = f"{key(9)} hoster\n{borg} {key(1)} backup@nas\n"
+        new = sshkeys.render(old, self.keys((ID1, key(1))))
+        self.assertEqual(new, f"{key(9)} hoster\n{borg} {key(1)} airlok-device:{ID1}\n", "ограничения ключа не снимаются")
+        self.assertEqual(sshkeys.render(new, self.keys((ID1, key(1)))), new, "повторный запуск ничего не меняет")
+        self.assertEqual(sshkeys.render(new, self.keys((ID1, key(1)), (ID2, key(2)))),
+                         f"{key(9)} hoster\n{borg} {key(1)} airlok-device:{ID1}\n{key(2)} airlok-device:{ID2}\n")
+
+    def test_options_of_first_restricted_copy(self):
+        old = f'from="10.0.0.5" {key(1)} a\nno-pty {key(1)} b\n'
+        self.assertEqual(sshkeys.render(old, self.keys((ID1, key(1)))), f'from="10.0.0.5" {key(1)} airlok-device:{ID1}\n')
+
+    def test_carried_options(self):
+        carried = {("ssh-ed25519", blob("ssh-ed25519", 1)): "restrict"}
+        self.assertEqual(sshkeys.render("", self.keys((ID1, key(1))), carried=carried), f"restrict {key(1)} airlok-device:{ID1}\n")
+        self.assertEqual(sshkeys.render(f"{key(1)} me\n", self.keys((ID1, key(1))), carried=carried), f"{key(1)} airlok-device:{ID1}\n",
+                         "в самом файле ключ уже без ограничений")
 
     def test_has_keys(self):
         self.assertFalse(sshkeys.has_keys(f"\n# {key(1)}\n"))
@@ -106,6 +125,11 @@ class LoginTest(unittest.TestCase):
         journal += f"Accepted publickey for root from 1.2.3.4 port 3 ssh2: ED25519 {mine}\n"
         self.assertEqual(sshkeys.device_login(journal, fps), mine)
 
+    def test_restricted_device_key_does_not_confirm_login(self):
+        text = f'command="borg serve",restrict {key(1)} airlok-device:{ID1}\n{key(2)} airlok-device:{ID2}\n'
+        self.assertEqual(sshkeys.device_fingerprints(text), {sshkeys.fingerprint(blob("ssh-ed25519", 2))},
+                         "вход скрипта копий не доказывает, что человек сам войдёт на сервер")
+
 
 class ReportTest(unittest.TestCase):
     """Опись ключей и входы для дашборда."""
@@ -114,10 +138,14 @@ class ReportTest(unittest.TestCase):
         text = (f"# {key(7)} старый\n{key(9)} hoster@panel\x07\n"
                 f"from=\"10.0.0.1\" {key(8)} backup key\n{key(1)} airlok-device:{ID1}\n\n")
         self.assertEqual(sshkeys.inventory(text), [
-            {"user": "root", "key": key(9), "comment": "hoster@panel", "device": None},
-            {"user": "root", "key": key(8), "comment": "backup key", "device": None},
-            {"user": "root", "key": key(1), "comment": "", "device": ID1},
-        ], "комментарии в файле не ключи, опции не уходят, управляющие символы вырезаны")
+            {"user": "root", "key": key(9), "comment": "hoster@panel", "device": None, "restricted": False},
+            {"user": "root", "key": key(8), "comment": "backup key", "device": None, "restricted": True},
+            {"user": "root", "key": key(1), "comment": "", "device": ID1, "restricted": False},
+        ], "комментарии в файле не ключи, опции не уходят — только признак, управляющие символы вырезаны")
+        restricted = sshkeys.inventory(f'command="borg serve",restrict {key(1)} airlok-device:{ID1}\n')
+        self.assertEqual(restricted, [{"user": "root", "key": key(1), "comment": "", "device": ID1, "restricted": True}])
+        both = sshkeys.inventory(f'from="10.0.0.1" {key(8)} a\n{key(8)} b\n')
+        self.assertEqual([k["restricted"] for k in both], [False, False], "есть копия без опций — у ключа полный вход")
 
     def test_parse_logins(self):
         fp = sshkeys.fingerprint(blob("ssh-ed25519", 1))
@@ -201,6 +229,63 @@ class UserSyncTest(unittest.TestCase):
         self.assertTrue(msg.startswith("Готово:"), msg)
         self.assertEqual(self.read(self.ubuntu), f"{key(1)} airlok-device:{ID1}\n")
         self.assertEqual(self.read(self.root), f"{key(9)} hoster\n", "у root строка устройства убрана, ключ хостера на месте")
+
+    def test_moves_options_from_root(self):
+        self.write(self.root, f'{key(9)} hoster\nfrom="10.0.0.5" {key(1)} airlok-device:{ID1}\n')
+        sshkeys.sync({"user": "ubuntu", "keys": [{"id": ID1, "key": key(1)}]}, self.conf, self.accs)
+        self.assertEqual(self.read(self.ubuntu), f'from="10.0.0.5" {key(1)} airlok-device:{ID1}\n', "ограничения переехали вместе с ключом")
+        self.assertEqual(self.read(self.root), f"{key(9)} hoster\n")
+
+    def test_restricted_key_of_other_user_stays(self):
+        ubuntu = self.ubuntu._replace(uid=1000)
+        restricted = f'command="sh /home/ubuntu/x" {key(1)} airlok-device:{ID1}\n'
+        self.write(ubuntu, f"{key(9)} me\n{restricted}{key(2)} airlok-device:{ID2}\n")
+        self.write(self.root, f"{key(8)} hoster\n")
+        req = {"user": "root", "keys": [{"id": ID1, "key": key(1)}, {"id": ID2, "key": key(2)}]}
+        msg = sshkeys.sync(req, self.conf, [self.root, ubuntu])
+        self.assertEqual(self.read(self.root), f"{key(8)} hoster\n{key(2)} airlok-device:{ID2}\n",
+                         "без опций ключ стал бы полным входом root, а с command= из чужого файла — выполнил бы его у root")
+        self.assertEqual(self.read(ubuntu), f"{key(9)} me\n{restricted}", "ограниченный ключ остался у ubuntu, обычный переехал")
+        self.assertIn("с ограничениями (command=, from=) оставлено у ubuntu: 1", msg)
+        self.assertEqual(sshkeys.sync(req, self.conf, [self.root, ubuntu]), msg.replace("обновлены", "уже на месте"), "повторный запуск ничего не меняет")
+        sshkeys.sync({"user": "root", "keys": [{"id": ID2, "key": key(2)}]}, self.conf, [self.root, ubuntu])
+        self.assertEqual(self.read(ubuntu), f"{key(9)} me\n", "закрыли устройству сервер — строка убрана")
+
+    def test_moves_options_from_root_to_other_uid(self):
+        root, ubuntu = self.root._replace(uid=0), self.ubuntu._replace(uid=1000)
+        self.write(root, f'{key(9)} hoster\nfrom="10.0.0.5" {key(1)} airlok-device:{ID1}\n')
+        sshkeys.sync({"user": "ubuntu", "keys": [{"id": ID1, "key": key(1)}]}, self.conf, [root, ubuntu])
+        self.assertEqual(self.read(ubuntu), f'from="10.0.0.5" {key(1)} airlok-device:{ID1}\n')
+        self.assertEqual(self.read(root), f"{key(9)} hoster\n")
+
+    def test_unmarked_restricted_key_of_previous_user(self):
+        # «Сделать устройством» и смена пользователя дошли до агента одной синхронизацией.
+        root, ubuntu = self.root._replace(uid=0), self.ubuntu._replace(uid=1000)
+        borg = f'command="borg serve",restrict,from="10.0.0.5" {key(1)} backup@nas\n'
+        self.write(ubuntu, f"{key(9)} me\n{borg}")
+        self.write(root, f"{key(8)} hoster\n")
+        msg = sshkeys.sync({"user": "root", "keys": [{"id": ID1, "key": key(1)}]}, self.conf, [root, ubuntu])
+        self.assertEqual(self.read(root), f"{key(8)} hoster\n", "ключ NAS не стал полным входом root")
+        self.assertEqual(self.read(ubuntu), f"{key(9)} me\n{borg}")
+        self.assertIn("оставлено у ubuntu: 1", msg)
+
+    def test_unmarked_restricted_key_of_root_keeps_options(self):
+        root, ubuntu = self.root._replace(uid=0), self.ubuntu._replace(uid=1000)
+        borg = f'command="borg serve",restrict {key(1)} backup@nas\n'
+        self.write(root, f"{key(8)} hoster\n{borg}")
+        self.write(ubuntu, f"{key(9)} me\n")
+        sshkeys.sync({"user": "ubuntu", "keys": [{"id": ID1, "key": key(1)}]}, self.conf, [root, ubuntu])
+        self.assertEqual(self.read(ubuntu), f'{key(9)} me\ncommand="borg serve",restrict {key(1)} airlok-device:{ID1}\n',
+                         "у ubuntu ключ получил опции строки root, а не полный вход")
+        self.assertEqual(self.read(root), f"{key(8)} hoster\n{borg}", "строку без пометки у root агент не трогает")
+
+    def test_bare_copy_moves_restricted_key(self):
+        ubuntu = self.ubuntu._replace(uid=1000)
+        self.write(ubuntu, f'{key(9)} me\ncommand="x" {key(1)} airlok-device:{ID1}\n')
+        self.write(self.root, f"{key(1)} hoster\n")
+        sshkeys.sync({"user": "root", "keys": [{"id": ID1, "key": key(1)}]}, self.conf, [self.root, ubuntu])
+        self.assertEqual(self.read(self.root), f"{key(1)} airlok-device:{ID1}\n", "у root ключ и так давал полный вход")
+        self.assertEqual(self.read(ubuntu), f"{key(9)} me\n")
 
     def test_keeps_last_key_of_previous_user(self):
         self.write(self.root, f"{key(1)} airlok-device:{ID1}\n")

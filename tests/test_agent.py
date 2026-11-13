@@ -5,6 +5,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,10 +27,15 @@ def parse(cmd, env_path=os.devnull, query_path=os.devnull, keys_path=os.devnull)
 
 
 class ParseTest(unittest.TestCase):
-    def test_update_has_no_parameters(self):
+    def test_update_takes_only_sha(self):
+        sha = "a" * 40
         self.assertEqual(parse({"id": CID, "kind": "update"}), ["ok", CID, "update"])
+        self.assertEqual(parse({"id": CID, "kind": "update", "update": {"sha": sha}}), ["ok", CID, "update", sha])
         self.assertEqual(parse({"id": CID, "kind": "update", "deploy": {"app": "x; rm -rf /"}}), ["ok", CID, "update"],
-                         "поля у обновления не используются, что бы ни прислал дашборд")
+                         "другие поля у обновления не используются, что бы ни прислал дашборд")
+        for bad in ("a" * 39, "A" * 40, sha + "\n", "--upload-pack=x", ["a" * 40], None, 7):
+            self.assertEqual(parse({"id": CID, "kind": "update", "update": {"sha": bad}}), ["ok", CID, "update"], bad)
+        self.assertEqual(parse({"id": CID, "kind": "update", "update": sha}), ["ok", CID, "update"])
 
     def test_os_upgrade_action_is_checked(self):
         self.assertEqual(parse({"id": CID, "kind": "os_upgrade", "os_upgrade": {"action": "upgrade"}}), ["ok", CID, "os_upgrade", "upgrade"])
@@ -291,10 +297,10 @@ def server_shell():
 
 @unittest.skipUnless(server_shell(), "нужны bash 4+ и GNU coreutils, как на сервере")
 class RemoveTest(unittest.TestCase):
-    """app-remove.sh: без --with-data данные приложения не трогаются."""
+    """app-remove.sh: без --with-data данные приложения не трогаются, а чужие контейнеры проекта — никогда."""
 
     STUBS = {
-        "docker": 'echo "docker $*" >>"$CALLS"\ncase "$1 $2" in "ps -aq") echo c0ffee ;; "volume ls") echo shop_pgdata ;; esac',
+        "docker": 'echo "docker $*" >>"$CALLS"\ncase "$1 $2" in "ps -a") cat "$PS" ;; esac',
         "systemd-escape": "echo srv-apps-shop-shared-uploads.mount",
         "systemctl": 'echo "systemctl $*" >>"$CALLS"',
         "userdel": 'echo "userdel $*" >>"$CALLS"',
@@ -321,14 +327,22 @@ class RemoveTest(unittest.TestCase):
         for name in ("compose.yml", "shared/db.env", "shared/cron.json", "shared/backups/1.sql.gz", "shared/uploads/a.png"):
             open(os.path.join(self.app, name), "w").close()
         os.symlink(os.path.join(self.app, "releases/abc"), os.path.join(self.app, "current"))
+        with open(os.path.join(self.app, "shared/db.env"), "w") as f:
+            f.write("POSTGRES_USER=app\n")
         self.calls = os.path.join(self.tmp.name, "calls")
+        self.ps = os.path.join(self.tmp.name, "ps")
+        self.containers(("c0ffee", "shop-app-1", self.app), ("cafe", "shop-app-run-1", self.app))
 
     def tearDown(self):
         self.tmp.cleanup()
 
+    def containers(self, *rows):
+        with open(self.ps, "w") as f:
+            f.writelines("\t".join(row) + "\n" for row in rows)
+
     def remove(self, with_data):
         script = 'source "$1"; eval "$2"; APP_DIR=$3 NAME=shop WITH_DATA=$4; stop_containers; remove_files'
-        env = {**os.environ, "PATH": self.bin + ":" + os.environ["PATH"], "CALLS": self.calls}
+        env = {**os.environ, "PATH": self.bin + ":" + os.environ["PATH"], "CALLS": self.calls, "PS": self.ps}
         out = subprocess.run(["bash", "-c", script, "bash", LIB, self.funcs, self.app, with_data], env=env, capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stderr)
         with open(self.calls) as f:
@@ -336,9 +350,10 @@ class RemoveTest(unittest.TestCase):
 
     def test_keeps_data(self):
         calls = self.remove("0")
-        self.assertIn("down --remove-orphans", calls[0])
-        self.assertNotIn("--volumes", calls[0])
-        self.assertIn("docker rm -f c0ffee", calls, "разовые контейнеры задач тоже убираются")
+        down = [c for c in calls if c.startswith("docker compose")]
+        self.assertEqual(len(down), 1)
+        self.assertTrue(down[0].endswith(" down"), "--remove-orphans убрал бы контейнеры чужого проекта с тем же именем")
+        self.assertIn("docker rm -f c0ffee cafe", calls, "разовые контейнеры задач тоже убираются")
         self.assertFalse([c for c in calls if c.startswith("docker volume")], "том базы не трогается")
         self.assertFalse([c for c in calls if c.startswith("userdel")], "uid владельца загрузок остаётся занятым")
         for gone in ("compose.yml", "current", "releases"):
@@ -348,10 +363,234 @@ class RemoveTest(unittest.TestCase):
 
     def test_with_data(self):
         calls = self.remove("1")
-        self.assertIn("--volumes", calls[0])
-        self.assertIn("docker volume rm shop_pgdata", calls)
+        self.assertTrue([c for c in calls if c.startswith("docker compose") and c.endswith(" down --volumes")], calls)
+        self.assertEqual([c for c in calls if c.startswith("docker volume rm")], ["docker volume rm shop_pgdata"],
+                         "удаляется только том базы приложения, а не все тома с меткой проекта")
         self.assertIn("userdel app-shop", calls)
         self.assertFalse(os.path.exists(self.app))
+
+    def test_foreign_project(self):
+        self.containers(("c0ffee", "shop-app-1", self.app), ("dead", "shop-db-1", "/home/u/shop"), ("beef", "shop-bot-1", ""))
+        calls = self.remove("1")
+        self.assertFalse([c for c in calls if c.startswith("docker compose")], "compose down остановил бы и чужие службы")
+        self.assertIn("docker rm -f c0ffee", calls, "удаляются только свои контейнеры")
+        self.assertFalse([c for c in calls if c.startswith(("docker volume rm", "docker network rm"))],
+                         "том и сеть проекта общие с чужим compose")
+        self.assertFalse(os.path.exists(self.app))
+
+    def test_no_database(self):
+        os.remove(os.path.join(self.app, "shared/db.env"))
+        calls = self.remove("1")
+        self.assertFalse([c for c in calls if c.startswith("docker volume")],
+                         "базы Airlok у приложения не было — том ИМЯ_pgdata не его")
+
+
+class ProjectFreeTest(unittest.TestCase):
+    """app-deploy.sh: публикация не идёт поверх проекта Docker Compose, который человек поднял сам под тем же именем."""
+
+    def setUp(self):
+        with open(os.path.join(os.path.dirname(AGENT), "app-deploy.sh"), encoding="utf-8") as f:
+            src = f.read()
+        self.func = re.search(r"^ensure_project_free\(\) \{\n.*?\n\}\n", src, re.M | re.S).group(0)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.app = os.path.join(self.tmp.name, "shop")
+        os.makedirs(os.path.join(self.app, "shared"))
+        self.ps = os.path.join(self.tmp.name, "ps")
+        self.volumes = os.path.join(self.tmp.name, "volumes")
+        open(self.ps, "w").close()
+        open(self.volumes, "w").close()
+        bin_dir = os.path.join(self.tmp.name, "bin")
+        os.makedirs(bin_dir)
+        with open(os.path.join(bin_dir, "docker"), "w") as f:
+            f.write('#!/bin/sh\ncase "$1 $2" in\n"ps -a") [ -e "$PS" ] && cat "$PS" ;;\n'
+                    '"volume inspect") grep -qx "$3" "$VOLUMES" ;;\n*) exit 2 ;;\nesac\n')
+        os.chmod(os.path.join(bin_dir, "docker"), 0o755)
+        self.env = {**os.environ, "PATH": bin_dir + ":" + os.environ["PATH"], "PS": self.ps, "VOLUMES": self.volumes}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def check(self, *rows, volume=False, db=True, db_env=False):
+        with open(self.ps, "w") as f:
+            f.writelines("\t".join(row) + "\n" for row in rows)
+        with open(self.volumes, "w") as f:
+            f.write("shop_pgdata\n" if volume else "")
+        if db_env:
+            with open(os.path.join(self.app, "shared", "db.env"), "w") as f:
+                f.write("POSTGRES_USER=app\n")
+        script = 'source "$1"; eval "$2"; APP_NAME=shop APP_DIR=$3 DB_ENABLED=$4; ensure_project_free'
+        return subprocess.run(["bash", "-c", script, "bash", LIB, self.func, self.app, "1" if db else "0"],
+                              env=self.env, capture_output=True, text=True)
+
+    def test_own_project_passes(self):
+        out = self.check(("c0ffee", "shop-app-1", self.app), ("cafe", "shop-db-1", self.app), volume=True, db_env=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.check().returncode, 0, "первая публикация: ни контейнеров, ни тома")
+
+    def test_foreign_containers(self):
+        out = self.check(("c0ffee", "shop-app-1", self.app), ("dead", "shop-db-1", "/home/u/shop"), ("beef", "shop-bot-1", ""))
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("shop-db-1 (из /home/u/shop)", out.stderr)
+        self.assertIn("shop-bot-1 (папка неизвестна)", out.stderr, "без метки папки контейнер считается чужим")
+        self.assertNotIn("shop-app-1", out.stderr)
+
+    def test_foreign_volume(self):
+        out = self.check(volume=True)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("shop_pgdata", out.stderr)
+        self.assertEqual(self.check(volume=True, db=False).returncode, 0, "без базы приложение этот том не подключает")
+
+    def test_docker_fails(self):
+        os.remove(self.ps)
+        self.env["PS"] = os.path.join(self.tmp.name, "missing")
+        out = subprocess.run(["bash", "-c", 'source "$1"; eval "$2"; APP_NAME=shop APP_DIR=$3 DB_ENABLED=0; ensure_project_free',
+                              "bash", LIB, self.func, self.app], env=self.env, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("Docker не ответил", out.stderr)
+
+
+class ReleaseLinksTest(unittest.TestCase):
+    """app-deploy.sh: сборка от root не уходит по ссылкам из кода за пределы релиза."""
+
+    def setUp(self):
+        with open(os.path.join(os.path.dirname(AGENT), "app-deploy.sh"), encoding="utf-8") as f:
+            src = f.read()
+        self.funcs = "\n".join(re.search(r"^%s\(\) \{\n.*?\n\}\n" % name, src, re.M | re.S).group(0)
+                               for name in ("release_path", "next_cache"))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.release = os.path.join(self.tmp.name, "release")
+        self.outside = os.path.join(self.tmp.name, "outside")
+        os.makedirs(os.path.join(self.release, "sub"))
+        os.makedirs(self.outside)
+        open(os.path.join(self.release, "sub", "Dockerfile"), "w").close()
+        self.env = dict(os.environ)
+        if subprocess.run(["realpath", "-e", "/"], capture_output=True).returncode != 0:
+            # На macOS realpath без -e: подставляем тот же смысл — путь должен существовать.
+            bin_dir = os.path.join(self.tmp.name, "bin")
+            os.makedirs(bin_dir)
+            with open(os.path.join(bin_dir, "realpath"), "w") as f:
+                f.write('#!/bin/sh\n[ "$1" = -e ] && shift\nexec python3 -c \'import os, sys\n'
+                        'p = os.path.realpath(sys.argv[1])\nsys.exit(1) if not os.path.exists(p) else print(p)\' "$1"\n')
+            os.chmod(os.path.join(bin_dir, "realpath"), 0o755)
+            self.env["PATH"] = bin_dir + ":" + self.env["PATH"]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_func(self, call):
+        script = 'source "$1"; eval "$2"; RELEASE=$3; ' + call
+        return subprocess.run(["bash", "-c", script, "bash", LIB, self.funcs, self.release], env=self.env, capture_output=True, text=True)
+
+    def test_release_path(self):
+        os.symlink("sub", os.path.join(self.release, "ctx"))
+        os.symlink(self.outside, os.path.join(self.release, "etc"))
+        os.symlink("../outside", os.path.join(self.release, "up"))
+        real = os.path.realpath(self.release)
+        for name, want in (("", real), ("sub", real + "/sub"), ("ctx", real + "/sub"), ("ctx/Dockerfile", real + "/sub/Dockerfile")):
+            out = self.run_func(f'release_path "{name}"')
+            self.assertEqual((out.returncode, out.stdout), (0, want), name)
+        for name in ("etc", "up", "..", "missing"):
+            self.assertNotEqual(self.run_func(f'release_path "{name}"').returncode, 0, name)
+
+    def test_next_cache(self):
+        out = self.run_func("next_cache")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(os.path.isdir(os.path.join(self.release, ".next", "cache")))
+        for link in (".next", ".next/cache"):
+            shutil.rmtree(os.path.join(self.release, ".next"))
+            if link == ".next/cache":
+                os.makedirs(os.path.join(self.release, ".next"))
+            os.symlink(self.outside, os.path.join(self.release, link))
+            out = self.run_func("next_cache")
+            self.assertEqual(out.returncode, 1, link)
+            self.assertIn(".next ссылкой", out.stderr)
+            self.assertEqual(os.listdir(self.outside), [], "за пределами релиза ничего не создано")
+            os.unlink(os.path.join(self.release, link))
+            os.makedirs(os.path.join(self.release, ".next"), exist_ok=True)
+
+
+class UploadsLayoutTest(unittest.TestCase):
+    """app-deploy.sh: закрытые загрузки не принадлежат группе nginx, открытые — принадлежат."""
+
+    def setUp(self):
+        with open(os.path.join(os.path.dirname(AGENT), "app-deploy.sh"), encoding="utf-8") as f:
+            src = f.read()
+        self.funcs = "\n".join(re.search(r"^%s\(\) \{\n.*?\n\}\n" % name, src, re.M | re.S).group(0)
+                               for name in ("layout", "uploads_private"))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app_dir = os.path.join(self.tmp.name, "apps", "shop")
+        self.uploads = os.path.join(self.app_dir, "shared", "uploads")
+        self.bin = os.path.join(self.tmp.name, "bin")
+        self.calls = os.path.join(self.tmp.name, "calls")
+        self.group = os.path.join(self.tmp.name, "group")
+        os.makedirs(self.bin)
+        fakes = {
+            # Каталоги создаём по-настоящему: layout смотрит, есть ли уже загрузки.
+            "install": 'for a; do last=$a; done; mkdir -p "$last"',
+            "stat": 'cat "%s"' % self.group,
+            "python3": "",
+            "chgrp": "",
+            "chmod": "",
+        }
+        for name, body in fakes.items():
+            path = os.path.join(self.bin, name)
+            with open(path, "w") as f:
+                f.write('#!/bin/bash\necho "%s $*" >>"%s"\n%s\n' % (name, self.calls, body))
+            os.chmod(path, 0o755)
+
+    def run_layout(self, public, existing_group=None):
+        if existing_group:
+            os.makedirs(self.uploads)
+            with open(self.group, "w") as f:
+                f.write(existing_group + "\n")
+        script = ('source "$1"; eval "$2"; mount_noexec() { :; }; APPS_ROOT=$3/apps APP_DIR=$3/apps/shop APP_USER=app-shop '
+                  'APP_GID=1234 UPLOADS_ENABLED=1 UPLOADS_PUBLIC=$4 DATA_ENABLED=0; layout; uploads_private')
+        out = subprocess.run(["bash", "-c", script, "bash", LIB, self.funcs, self.tmp.name, str(int(public))],
+                             env={**os.environ, "PATH": self.bin + os.pathsep + os.environ["PATH"]}, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        with open(self.calls) as f:
+            return [line.replace(self.tmp.name, "") for line in f.read().splitlines()]
+
+    def test_private_is_created_without_nginx_group(self):
+        calls = self.run_layout(False)
+        self.assertIn("install -d -m 750 -o app-shop -g 1234 /apps/shop/shared/uploads", calls)
+        self.assertNotIn("www-data", " ".join(calls))
+        self.assertEqual(calls[-2:], ["chgrp 1234 /apps/shop/shared/uploads", "chmod 00750 /apps/shop/shared/uploads"])
+
+    def test_private_existing_is_closed_only_after_site(self):
+        calls = self.run_layout(False, existing_group="www-data")
+        self.assertFalse([c for c in calls if c.endswith("/shared/uploads") and c.startswith("install")],
+                         "до нового конфига сайта прежний ещё может отдавать загрузки")
+        self.assertEqual(calls[-2:], ["chgrp 1234 /apps/shop/shared/uploads", "chmod 00750 /apps/shop/shared/uploads"])
+
+    def test_public_is_served_by_nginx(self):
+        calls = self.run_layout(True)
+        self.assertIn("install -d -m 2750 -o app-shop -g www-data /apps/shop/shared/uploads", calls)
+        self.assertFalse([c for c in calls if c.split()[0] in ("python3", "chgrp", "chmod")])
+
+    def test_public_after_private_regroups_files(self):
+        calls = self.run_layout(True, existing_group="app-shop")
+        regroup = calls.index("python3 %s/serverbase.py uploads-group /apps/shop/shared/uploads www-data"
+                               % os.path.realpath(os.path.dirname(AGENT)))
+        self.assertLess(regroup, calls.index("install -d -m 2750 -o app-shop -g www-data /apps/shop/shared/uploads"))
+
+    def test_public_already_served_is_not_walked(self):
+        calls = self.run_layout(True, existing_group="www-data")
+        self.assertFalse([c for c in calls if c.startswith("python3")])
+
+
+class HeartbeatTest(unittest.TestCase):
+    def test_reports_caps(self):
+        with open(os.path.join(os.path.dirname(AGENT), "healthcheck.sh"), encoding="utf-8") as f:
+            code = re.search(r"HEARTBEAT_PY='\n(.*?)\n'\n", f.read(), re.S).group(1)
+        compile(code, "HEARTBEAT_PY", "exec")
+        self.assertIn('"caps": ["release_links"]', code)
+        if not os.path.exists("/proc/meminfo"):
+            self.skipTest("отметка читает /proc, как на сервере")
+        out = subprocess.run([sys.executable, "-c", code, "v", "null", "false", "", os.devnull, os.devnull, "0"],
+                             capture_output=True, text=True, check=True)
+        self.assertIn("release_links", json.loads(out.stdout)["caps"])
 
 
 class StageMarkTest(unittest.TestCase):
@@ -444,3 +683,58 @@ class HealthTest(unittest.TestCase):
             with open(rel + ".health", "w") as f:
                 f.write("/healthz")
             self.assertEqual(run(), "[/healthz]")
+
+
+class StoreLinkTest(unittest.TestCase):
+    """app-data.sh: временная ссылка хранилища уходит в curl через stdin, а не аргументом — иначе её видно в ps."""
+
+    LINK = "https://s3.example/b/x.sql.gz?X-Amz-Signature=abc&X-Amz-Expires=7200"
+
+    def setUp(self):
+        with open(os.path.join(os.path.dirname(AGENT), "app-data.sh"), encoding="utf-8") as f:
+            src = f.read()
+        self.funcs = "\n".join([re.search(r"^STORE_URL_RE=.*$", src, re.M).group(0),
+                                re.search(r"^check_store_url\(\) \{.*\}$", src, re.M).group(0)] + [
+            re.search(r"^%s\(\) \{\n.*?\n\}\n" % name, src, re.M | re.S).group(0) for name in ("put", "get")])
+        self.tmp = tempfile.TemporaryDirectory()
+        self.bin = os.path.join(self.tmp.name, "bin")
+        os.makedirs(self.bin)
+        with open(os.path.join(self.bin, "curl"), "w") as f:
+            f.write('#!/bin/sh\nprintf "%s\\n" "$@" >"$ARGV"\ncat >"$STDIN"\n')
+        os.chmod(os.path.join(self.bin, "curl"), 0o755)
+        self.argv = os.path.join(self.tmp.name, "argv")
+        self.stdin = os.path.join(self.tmp.name, "stdin")
+        self.file = os.path.join(self.tmp.name, "db.sql.gz")
+        open(self.file, "w").close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_func(self, call, link):
+        env = {**os.environ, "PATH": self.bin + ":" + os.environ["PATH"], "ARGV": self.argv, "STDIN": self.stdin}
+        return subprocess.run(["bash", "-c", 'source "$1"; eval "$2"; ' + call, "bash", LIB, self.funcs, self.file, link],
+                              env=env, capture_output=True, text=True)
+
+    def read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def test_link_not_in_argv(self):
+        for call in ('put "$3" "$4"', 'get "$4" "$3"'):
+            with self.subTest(call=call):
+                out = self.run_func(call, self.LINK)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                argv = self.read(self.argv).splitlines()
+                self.assertNotIn(self.LINK, self.read(self.argv))
+                self.assertIn("-K", argv)
+                self.assertEqual(self.read(self.stdin), 'url = "%s"\n' % self.LINK)
+
+    def test_rejects_link_that_breaks_config(self):
+        for link in ('https://s3.example/x"\nupload-file = "/etc/shadow', "https://s3.example/x\\y", "https://s3.example/x'y",
+                     "http://s3.example/x", ""):
+            for call in ('put "$3" "$4"', 'get "$4" "$3"'):
+                with self.subTest(link=link, call=call):
+                    out = self.run_func(call, link)
+                    self.assertNotEqual(out.returncode, 0)
+                    self.assertIn("некорректная ссылка хранилища", out.stderr)
+                    self.assertFalse(os.path.exists(self.argv), "curl не должен запускаться")

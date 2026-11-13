@@ -1,5 +1,12 @@
 // Клиент API дашборда для CLI: /api/cli/v1 с личным токеном.
 
+import { readFileSync } from 'node:fs'
+
+const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+
+// По версии в User-Agent дашборд видит в журнале, какие CLI ещё в ходу, и может попросить старые обновиться.
+export const USER_AGENT = `airlok-cli/${pkg.version} node/${process.versions.node} ${process.platform}`
+
 export class ApiError extends Error {
   constructor(status, code, message) {
     super(message)
@@ -16,7 +23,7 @@ export class Api {
   }
 
   async request(method, path, body, { raw = false, okStatuses = [] } = {}) {
-    const headers = { 'User-Agent': 'airlok-cli' }
+    const headers = { 'User-Agent': USER_AGENT }
     if (this.token) headers.Authorization = `Bearer ${this.token}`
     if (body !== undefined && !raw) headers['Content-Type'] = 'application/json'
     if (raw) headers['Content-Type'] = 'application/gzip'
@@ -37,14 +44,37 @@ export class Api {
     return this.request('POST', '/api/cli/v1/login', { client }).then((r) => r.data)
   }
 
-  // pollLogin — токен, когда вход подтверждён, или null, пока человек не подтвердил.
-  async pollLogin(deviceCode) {
-    const { status, data } = await this.request('POST', '/api/cli/v1/login/token', { device_code: deviceCode }, { okStatuses: [202] })
+  // pollLogin — токен, когда вход подтверждён, или null, пока человек не подтвердил. previousToken —
+  // прежний вход этого компьютера: дашборд отзывает его, когда выдаёт новый.
+  async pollLogin(deviceCode, previousToken = '') {
+    const body = { device_code: deviceCode, ...(previousToken && { previous_token: previousToken }) }
+    const { status, data } = await this.request('POST', '/api/cli/v1/login/token', body, { okStatuses: [202] })
     return status === 202 ? null : data
+  }
+
+  // revokeToken отзывает токен, с которым пришёл запрос: им больше никто не войдёт.
+  revokeToken() {
+    return this.request('DELETE', '/api/cli/v1/token')
   }
 
   me() {
     return this.request('GET', '/api/cli/v1/me').then((r) => r.data)
+  }
+
+  // tokenScope — 'cli' у входа CLI, 'mcp' у токена из настроек; '' — дашборд старше областей токенов.
+  async tokenScope() {
+    try {
+      const { data } = await this.request('GET', '/api/cli/v1/token')
+      return data?.scope ?? ''
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return ''
+      throw err
+    }
+  }
+
+  // createAgentToken — отдельный токен для конфигов ИИ-агентов: выпускает его только вход CLI.
+  createAgentToken(client) {
+    return this.request('POST', '/api/cli/v1/tokens', { client }).then((r) => r.data)
   }
 
   // apps — приложения на хостинге: архивом выкатывают только туда.

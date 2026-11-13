@@ -48,6 +48,20 @@ conf_value() { [[ -r $1 ]] || return 0; sed -n "s/^$2=//p" "$1" | tail -1; }
 
 strict_mode() { [[ $(conf_value "$POLICY_CONF" AIRLOK_MODE) == strict ]]; }
 
+# app_tail ЛОГ показывает последние строки упавшего приложения (compose задаёт сам рецепт) и печатает,
+# где их искать. В строгом режиме они остаются только в файле на сервере: вывод рецепта уходит
+# в дашборд, а в выводе приложений бывают адреса баз с паролями.
+app_tail() {
+	if strict_mode; then
+		compose logs --tail 30 app >>"$1" 2>&1 || true
+		note "строгий режим: последние строки приложения — в $1, на сервере" >&2
+		echo "в $1 на сервере"
+		return
+	fi
+	compose logs --tail 30 app >&2 || true
+	echo "в логе выше"
+}
+
 # conf_set ФАЙЛ КЛЮЧ ЗНАЧЕНИЕ — заменить или добавить KEY=value, остальное не трогать.
 # Значение проверяет вызывающий: переводов строк и мусора в файле быть не должно.
 conf_set() {
@@ -101,6 +115,52 @@ release_health() { cat "$1.health" 2>/dev/null || true; }
 # Версия рецептов для дашборда: дата и хеш коммита /opt/airlok, без git — dev.
 agent_version() {
 	git -C "$RECIPES_DIR" log -1 --format='%cd+%h' --date=format:'%Y.%m.%d' 2>/dev/null || echo dev
+}
+
+# Открытые ключи, которыми подписаны версии Airlok. Файл лежит вне клона: новая версия из GitHub
+# не назначает себе ключ сама, а сменить ключи может только версия, подписанная прежним.
+SIGNERS_CONF=/etc/airlok/allowed_signers
+
+has_signers() { [[ -r $1 ]] && grep -Eqv '^[[:space:]]*(#|$)' "$1"; }
+
+# install_signers ФАЙЛ — ключи из ФАЙЛА на сервер. Файл без ключей не стирает те, что уже есть.
+install_signers() {
+	has_signers "$1" || return 0
+	write_if_changed "$SIGNERS_CONF" 0644 <"$1" || true
+}
+
+# signed_commit КЛОН КОММИТ — коммит подписан SSH-ключом из SIGNERS_CONF. Подписи GPG и X.509 не
+# принимаются: их проверка зависела бы от связки ключей root, которую Airlok не ведёт.
+signed_commit() {
+	git -C "$1" -c gpg.ssh.allowedSignersFile="$SIGNERS_CONF" -c gpg.program=false -c gpg.x509.program=false \
+		verify-commit "$2" >/dev/null 2>&1
+}
+
+# latest_signed КЛОН — самый новый коммит main после стоящей версии, подписанный ключом из
+# SIGNERS_CONF. Идёт по первым родителям: так это вершины main после слияний, а не коммиты веток.
+latest_signed() {
+	local rev
+	while read -r rev; do
+		signed_commit "$1" "$rev" && echo "$rev" && return 0
+	done < <(git -C "$1" rev-list --first-parent --ancestry-path HEAD..FETCH_HEAD 2>/dev/null)
+	return 1
+}
+
+# update_code КЛОН КОММИТ — перевести клон на коммит из только что полученной ветки main. Пока на
+# сервере нет ключей (агент пришёл со старой версии, которая их не знала), подпись не проверяется.
+update_code() {
+	local dir=$1 rev short
+	# Хеш разрешаем один раз: проверяется и ставится один и тот же объект, даже если короткий хеш
+	# совпал с именем тега.
+	rev=$(git -C "$dir" rev-parse -q --verify "${2}^{commit}") || die "коммита ${2} нет в ветке main"
+	git -C "$dir" merge-base --is-ancestor "$rev" FETCH_HEAD 2>/dev/null || die "коммита ${2} нет в ветке main"
+	# Версия уже стоит или старше стоящей: ставить нечего, и проверять подпись незачем.
+	git -C "$dir" merge-base --is-ancestor "$rev" HEAD 2>/dev/null && return 0
+	short=$(git -C "$dir" rev-parse --short "$rev")
+	if has_signers "$SIGNERS_CONF" && ! signed_commit "$dir" "$rev"; then
+		die "новая версия ${short} не подписана ключом Airlok, и сервер её не поставил: работает прежняя версия. Напишите в поддержку: https://app.airlok.ru/support"
+	fi
+	git -C "$dir" merge -q --ff-only "$rev" || die "не удалось перейти на версию ${short}: в ${dir} локальные правки или она не продолжает текущую. git -C ${dir} status"
 }
 
 # notify ТЕКСТ — сообщение в Telegram, если бот подключён (notify.sh setup).
@@ -282,4 +342,47 @@ start_cron_timers() {
 	local timers
 	timers=$(systemctl list-unit-files "airlok-cron@${1}_*.timer" --state=enabled --no-legend 2>/dev/null | awk '{print $1}') || true
 	[[ -z $timers ]] || echo "$timers" | xargs systemctl start
+}
+
+# Контейнеры проекта Docker Compose ИМЯ: «id<TAB>имя<TAB>папка проекта». Airlok зовёт compose только
+# с --project-directory /srv/apps/ИМЯ, а Compose без name: называет проект по папке, так что проект,
+# поднятый руками из ~/ИМЯ, совпадает с приложением по имени. Свои контейнеры отличаем по папке.
+project_containers() {
+	docker ps -a --no-trunc --filter "label=com.docker.compose.project=$1" \
+		--format $'{{.ID}}\t{{.Names}}\t{{.Label "com.docker.compose.project.working_dir"}}'
+}
+
+# foreign_containers ИМЯ КАТАЛОГ — чужие контейнеры проекта (те же три поля); без метки папки — чужой.
+foreign_containers() {
+	local out
+	out=$(project_containers "$1") || return 1
+	awk -F'\t' -v dir="$2" 'NF && $3 != dir' <<<"$out"
+}
+
+# own_containers ИМЯ КАТАЛОГ — id своих контейнеров проекта, в том числе разовых контейнеров задач.
+own_containers() {
+	local out
+	out=$(project_containers "$1") || return 1
+	awk -F'\t' -v dir="$2" '$3 == dir {print $1}' <<<"$out"
+}
+
+# Совет, если образы с Docker Hub не скачиваются. Зеркала Docker перечитывает по reload, без остановки
+# контейнеров, а обновление агента дописывает в daemon.json только свои ключи.
+HUB_MIRROR_ADVICE='Настройте зеркало: добавьте в /etc/docker/daemon.json "registry-mirrors": ["https://mirror.gcr.io"] (или зеркало вашего хостера), выполните sudo systemctl reload docker и проверьте, что зеркало видно в docker info (Registry Mirrors): если нет — в файле ошибка, и после перезагрузки сервера Docker не запустится. Обновления агента зеркало сохранят'
+
+# hub_failed ЛОГ — в логе отказ Docker Hub: лимит запросов, запрет или нет связи. «Образ не найден» и
+# «нет доступа» сюда не входят: это ошибка в имени или версии образа, зеркало её не исправит. Слои и
+# конфиги образов Hub отдаёт с Cloudflare R2, и dockerd пишет об их сбое без имени хоста: «error
+# pulling image configuration», «download failed after attempts», а у docker run — строкой «docker: …».
+hub_failed() {
+	local lines
+	lines=$(grep -iE 'toomanyrequests|pull rate limit|Docker is a US company|(registry-1|auth|index)\.docker\.io|production\.cloudflare\.docker\.com|r2\.cloudflarestorage\.com|failed to resolve source metadata for docker\.io/|error pulling image configuration|download failed after attempts|failed to register layer|^docker: (read tcp|unexpected EOF|net/http|dial tcp)' "$1" 2>/dev/null |
+		grep -viE 'pull access denied|manifest unknown|not found|repository does not exist|requested access to the resource is denied|\b401\b|unauthorized') || return 1
+	grep -qiE 'toomanyrequests|pull rate limit|US company|\b(429|403|50[234])\b|forbidden|timeout|timed out|connection reset|connection refused|no such host|misbehaving|name resolution|deadline exceeded|network is unreachable|failed to do request|EOF' <<<"$lines"
+}
+
+# hub_hint ЛОГ — продолжение текста ошибки публикации, если виноват Docker Hub, иначе пусто.
+hub_hint() {
+	hub_failed "$1" || return 0
+	printf '. Причина — Docker Hub: с этого сервера он недоступен или упёрся в лимит запросов, проект тут ни при чём. %s' "$HUB_MIRROR_ADVICE"
 }

@@ -37,6 +37,8 @@ SIGNERS_CONF=/etc/airlok/allowed_signers
 # ключ себе сама.
 release_signers() {
 	cat <<'EOF'
+release@airlok.ru namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFGAhkr+98tbe46uG6U2pnhbW8Becfd4UKPiZK+BG3Hl airlok release
+release@airlok.ru namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIElRX3o4/WMNxDEEBm3Cdci2wacdC8DFTWW71KHFyK7G airlok release backup
 EOF
 }
 

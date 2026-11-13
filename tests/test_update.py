@@ -302,6 +302,9 @@ class InstallScriptTest(unittest.TestCase):
         with open(INSTALL, encoding="utf-8") as f:
             s = f.read()
         embedded = UpdateScriptTest.signers(self, *keys).replace("# ключи Airlok\n", "")
+        # Настоящие ключи релизов уступают место тестовым.
+        s, n = re.subn(r"(release_signers\(\) \{\n\tcat <<'EOF'\n).*?EOF\n", lambda m: m.group(1) + "EOF\n", s, flags=re.S)
+        self.assertEqual(n, 1, "release_signers")
         for old, new in (
             ('[[ $EUID -eq 0 ]] || die "запустите через sudo"\n', ""),
             ("[[ -r /etc/os-release ]] &&", "true ||"),

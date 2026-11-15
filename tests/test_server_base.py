@@ -38,7 +38,7 @@ def func(*names):
     return "\n".join(out)
 
 
-FUNC = func("apt_install")
+FUNC = func("apt_install", "apt_update", "apt_lists_fresh")
 # conf_set пишет через install -D, которого нет в BSD install на macOS.
 PORTABLE_WRITE = ('write_if_changed() { local tmp; tmp=$(mktemp); cat >"$tmp"; '
                   'if [[ -f $1 ]] && cmp -s "$tmp" "$1"; then rm -f "$tmp"; return 1; fi; mv "$tmp" "$1"; }')
@@ -65,10 +65,50 @@ class AptCase(unittest.TestCase):
 
 
 class AptInstallTest(AptCase):
+    def setUp(self):
+        super().setUp()
+        self.stamp = os.path.join(os.path.dirname(self.bin), "state", "apt-lists.stamp")
+
     def install(self, wait=600):
-        script = 'source "$1"; eval "$2"; APT_LOG=$3 APT_LOCK_WAIT=$4; sleep() { :; }; apt_install certbot certbot; echo done'
-        return subprocess.run(["bash", "-c", script, "bash", LIB, FUNC, self.log, str(wait)], capture_output=True, text=True,
-                              env={**os.environ, "PATH": self.bin + os.pathsep + os.environ["PATH"]})
+        script = ('source "$1"; eval "$2"; APT_LOG=$3 APT_LOCK_WAIT=$4 APT_STAMPS=("$5") APT_FRESH_MINUTES=10; sleep() { :; }; '
+                  'apt_install certbot certbot; echo done')
+        return subprocess.run(["bash", "-c", script, "bash", LIB, FUNC, self.log, str(wait), self.stamp], capture_output=True,
+                              text=True, env={**os.environ, "PATH": self.bin + os.pathsep + os.environ["PATH"]})
+
+    def fresh_stamp(self, age=0):
+        os.makedirs(os.path.dirname(self.stamp), exist_ok=True)
+        open(self.stamp, "w").close()
+        t = time.time() - age
+        os.utime(self.stamp, (t, t))
+
+    def test_update_leaves_stamp(self):
+        self.fake("python3", "exit 0")
+        self.fake("apt-get", "exit 0")
+        self.assertEqual(self.install().stdout, "done\n")
+        self.assertTrue(os.path.exists(self.stamp))
+
+    def test_fresh_lists_are_not_downloaded_again(self):
+        self.fresh_stamp()
+        self.fake("python3", "exit 0")
+        self.fake("apt-get", "exit 0")
+        self.assertEqual(self.install().stdout, "done\n")
+        self.assertEqual([c for c in self.called() if c.startswith("apt-get")], ["apt-get install -y -qq certbot"])
+
+    def test_old_lists_are_downloaded(self):
+        self.fresh_stamp(age=3600)
+        self.fake("python3", "exit 0")
+        self.fake("apt-get", "exit 0")
+        self.install()
+        self.assertEqual([c.split()[1] for c in self.called() if c.startswith("apt-get")], ["update", "install"])
+
+    def test_failure_with_fresh_lists_is_retried_with_update(self):
+        self.fresh_stamp()
+        self.fake("python3", "exit 0")
+        self.fake("apt-get", 'grep -q "apt-get update" "%s" && exit 0\n'
+                  "echo 'E: Unable to locate package certbot'; exit 100" % self.calls)
+        out = self.install()
+        self.assertEqual(out.stdout, "done\n", out.stderr)
+        self.assertEqual([c.split()[1] for c in self.called() if c.startswith("apt-get")], ["install", "update", "install"])
 
     def test_waits_for_lock_before_apt(self):
         self.fake("python3", "exit 0")
@@ -444,6 +484,23 @@ class DockerPackagesTest(AptCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue(out.stdout.endswith("docker.io docker-compose-v2 docker-buildx|docker\n"))
         self.assertIn("snap", out.stdout)
+
+    def install_packages(self, installed):
+        self.docker()
+        funcs = func("pkg_installed", "apt_candidate", "docker_packages", "packages").replace("/snap/bin/docker", "/nonexistent")
+        script = ('source "$1"; eval "$2"; write_if_changed() { cat >/dev/null; return 1; }; '
+                  'apt_install() { echo "apt_install $*"; }; packages')
+        return subprocess.run(["bash", "-c", script, "bash", LIB, funcs], capture_output=True, text=True,
+                              env={**os.environ, "PATH": self.bin + os.pathsep + os.environ["PATH"], "INSTALLED": installed})
+
+    def test_installed_packages_do_not_touch_apt(self):
+        everything = "docker.io docker-compose-v2 docker-buildx nginx ufw fail2ban unattended-upgrades python3-yaml openssl rsync"
+        out = self.install_packages(everything)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("apt_install", out.stdout, "обновление агента не скачивает списки пакетов зря")
+        out = self.install_packages(everything.replace(" rsync", ""))
+        self.assertIn("apt_install пакеты docker.io docker-compose-v2 docker-buildx nginx ufw fail2ban unattended-upgrades "
+                      "python3-yaml openssl rsync\n", out.stdout, out.stderr)
 
     def test_docker_ce_is_left_alone(self):
         self.docker()

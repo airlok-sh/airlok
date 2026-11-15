@@ -239,6 +239,16 @@ class ReconcileTest(unittest.TestCase):
             logs.spool("shop", [], spool_dir)
         self.assertEqual(len(os.listdir(spool_dir)), 1, "служба логов не разбирает очередь — она не растёт")
 
+    def test_quiet_when_nothing_to_collect(self):
+        self.assertEqual(logs.send_every({"blog"}, {"blog"}), logs.LIVE_EVERY)
+        self.assertEqual(logs.send_every({"blog"}, set()), logs.IDLE_EVERY)
+        pauses = {logs.send_every(set(), set()) for _ in range(20)}
+        self.assertTrue(all(logs.QUIET_EVERY <= p <= logs.QUIET_EVERY * 1.5 for p in pauses) and len(pauses) > 1,
+                        "логи выключены у всех — дашборд спрашиваем редко и не в одни и те же секунды")
+        self.assertEqual(logs.scan_every(set(), True), logs.QUIET_EVERY)
+        self.assertEqual(logs.scan_every({"blog"}, True), logs.SCAN_EVERY)
+        self.assertEqual(logs.scan_every(set(), False), logs.SCAN_EVERY, "пока дашборд не ответил, смотрим как обычно")
+
     def test_prune_positions(self):
         now = 10 * logs.KEEP_POSITION_NS
         kept = logs.prune_positions({"old": now - logs.KEEP_POSITION_NS, "new": now - 1}, now)

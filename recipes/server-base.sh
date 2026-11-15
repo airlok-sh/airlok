@@ -24,6 +24,10 @@ SSH_ROLLBACK_SECONDS=${AIRLOK_SSH_ROLLBACK_SECONDS:-180}
 [[ $SSH_ROLLBACK_SECONDS =~ ^[1-9][0-9]{1,3}$ ]] || die "AIRLOK_SSH_ROLLBACK_SECONDS — число секунд от 10 до 9999"
 APT_LOG=/var/log/airlok-apt.log
 APT_LOCK_WAIT=${AIRLOK_APT_LOCK_WAIT:-600}
+# Установка зовёт apt два-три раза подряд: списки пакетов моложе этого заново не скачиваем. Отметку
+# ставит и install.sh, когда ставит git, и ежедневное обновление списков самой Ubuntu.
+APT_STAMPS=(/var/lib/airlok/apt-lists.stamp /var/lib/apt/periodic/update-success-stamp)
+APT_FRESH_MINUTES=10
 
 # Сервер уже готовили раньше: так повторный запуск узнаётся без новых флагов, ведь update.sh
 # прежней версии вызывает server-base.sh по-старому.
@@ -57,19 +61,38 @@ preflight() {
 # Проверка не исключает гонку: apt могут занять сразу после неё, а его DPkg::Lock::Timeout на
 # блокировку списков пакетов не действует. Поэтому на занятый apt отвечаем новой попыткой.
 apt_install() {
-	local what=$1 deadline=$((SECONDS + APT_LOCK_WAIT)) busy
+	local what=$1 deadline=$((SECONDS + APT_LOCK_WAIT)) busy fresh=0
 	shift
 	busy="система занята другой установкой уже $((APT_LOCK_WAIT / 60)) мин (часто это автообновления). Ничего не сломалось: подождите несколько минут и запустите команду ещё раз"
+	apt_lists_fresh && fresh=1
 	while :; do
 		python3 "$RECIPES_DIR/osupdates.py" wait-lock "$((deadline - SECONDS))" || [[ $? != 3 ]] || die "$busy"
-		{ apt-get update -qq && apt-get install -y -qq "$@"; } >"$APT_LOG" 2>&1 && return 0
+		{ { ((fresh)) || apt_update; } && apt-get install -y -qq "$@"; } >"$APT_LOG" 2>&1 && return 0
 		if ! grep -qE 'Could not get lock|Unable to acquire the dpkg frontend lock' "$APT_LOG"; then
+			# Пакета могло не оказаться в недавних, но уже устаревших списках: один раз — с их обновлением.
+			if ((fresh)); then
+				fresh=0
+				continue
+			fi
 			tail -20 "$APT_LOG" >&2
 			die "не удалось установить ${what}, полный лог: ${APT_LOG}"
 		fi
 		((SECONDS < deadline)) || die "$busy"
 		sleep 5
 	done
+}
+
+apt_update() {
+	apt-get update -qq || return
+	{ mkdir -p "${APT_STAMPS[0]%/*}" && touch "${APT_STAMPS[0]}"; } 2>/dev/null || true
+}
+
+apt_lists_fresh() {
+	local f
+	for f in "${APT_STAMPS[@]}"; do
+		[[ -n $(find "$f" -maxdepth 0 -mmin "-${APT_FRESH_MINUTES}" 2>/dev/null) ]] && return 0
+	done
+	return 1
 }
 
 pkg_installed() { [[ $(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null) == ii* ]]; }
@@ -112,9 +135,18 @@ docker_packages() {
 packages() {
 	step "Пакеты и обновления"
 	docker_packages
-	apt_install пакеты "${DOCKER_PKGS[@]}" nginx ufw fail2ban \
-		unattended-upgrades python3-yaml openssl rsync
-	ok "${DOCKER_NOTE}, nginx, ufw, fail2ban установлены"
+	local pkgs=("${DOCKER_PKGS[@]}" nginx ufw fail2ban unattended-upgrades python3-yaml openssl rsync) p missing=0
+	for p in "${pkgs[@]}"; do
+		pkg_installed "$p" || missing=1
+	done
+	# Всё уже стоит — apt не трогаем: обновление агента не должно каждый раз скачивать списки пакетов.
+	# Новые версии этих пакетов ставят автообновления безопасности и обновление системы из дашборда.
+	if ((missing)); then
+		apt_install пакеты "${pkgs[@]}"
+		ok "${DOCKER_NOTE}, nginx, ufw, fail2ban установлены"
+	else
+		ok "${DOCKER_NOTE}, nginx, ufw, fail2ban уже установлены"
+	fi
 
 	if write_if_changed /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'EOF'; then
 APT::Periodic::Update-Package-Lists "1";
@@ -265,6 +297,7 @@ bruteforce() {
 web() {
 	step "nginx"
 	local changed=no
+	nginx_lock
 	# В nginx.conf из Ubuntu 26.04 уже стоит server_tokens build, и вторую такую директиву
 	# на уровне http nginx не примет. Сам nginx.conf не правим: изменённый пакетный конфиг
 	# останавливает автообновления nginx. Версию тогда прячет сниппет в каждом server.
@@ -311,6 +344,7 @@ EOF
 		systemctl reload nginx
 	fi
 	systemctl enable --now nginx >/dev/null 2>&1
+	nginx_unlock
 	ok "версия скрыта, общие заголовки безопасности готовы${default}"
 }
 
@@ -458,7 +492,9 @@ ssh_open() {
 		sshd -t || die "sshd не принимает свои настройки без файла airlok: проверьте /etc/ssh/sshd_config"
 		systemctl reload ssh
 	fi
-	if sshd -T | grep -qxE '(passwordauthentication|kbdinteractiveauthentication) yes'; then
+	# Сначала весь вывод, потом grep: grep -q выходит на первом совпадении, sshd получает SIGPIPE, и
+	# под pipefail проверка открытого входа проваливалась бы как «закрыт».
+	if grep -qxE '(passwordauthentication|kbdinteractiveauthentication) yes' <<<"$(sshd -T)"; then
 		ok "вход по паролю открыт"
 		return
 	fi

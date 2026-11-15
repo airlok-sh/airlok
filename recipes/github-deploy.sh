@@ -331,6 +331,7 @@ EOF
 	systemctl enable --now airlok-webhook.service airlok-deploy-queue.path >/dev/null 2>&1
 	[[ $changed == yes ]] && systemctl restart airlok-webhook.service
 
+	nginx_lock
 	if write_if_changed /etc/nginx/snippets/airlok-webhook.conf 0644 <<'EOF'; then
 location ^~ /_airlok/hook/ {
     proxy_pass http://127.0.0.1:9417;
@@ -340,6 +341,7 @@ EOF
 		nginx -t -q || die "nginx не принял настройку webhook"
 		systemctl reload nginx
 	fi
+	nginx_unlock
 	ok "приёмник работает от ${HOOK_USER}, публикации выполняет очередь от root"
 }
 

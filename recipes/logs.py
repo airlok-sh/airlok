@@ -6,7 +6,8 @@
 Вывод берётся через docker logs каждого контейнера приложения — stdout и stderr
 по отдельности, как на хостинге. Вывод задач по расписанию и команды перед запуском
 приходит от cron.py файлами из очереди. Пока логи приложения открыты в дашборде, пачки уходят
-каждые 200 мс, иначе — раз в 5 секунд.
+каждые 200 мс, иначе — раз в 5 секунд. Если логи выключены у всех приложений, служба
+спрашивает дашборд и смотрит контейнеры раз в полминуты.
 
 Приложение, которое пишет больше 200 строк в секунду, прореживается: лишние строки
 отбрасываются, а в логи уходит строка о том, сколько пропущено. Если дашборд недоступен,
@@ -18,6 +19,7 @@ import collections
 import http.client
 import json
 import os
+import random
 import re
 import signal
 import subprocess
@@ -39,6 +41,10 @@ TIMESTAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?Z$")
 LIVE_EVERY = 0.2
 IDLE_EVERY = 5.0
 SCAN_EVERY = 5.0
+# Собирать нечего: ответ дашборда нужен только чтобы узнать, не включили ли логи. Новое приложение
+# включает их сразу, но его контейнер появится только после сборки, а начало вывода служба всё
+# равно возьмёт (FIRST_TAIL): задержка видна, лишь когда логи включают уже работающему приложению.
+QUIET_EVERY = 30.0
 SAVE_EVERY = 10.0
 RATE = 200
 BURST = 1000
@@ -301,6 +307,24 @@ def reconcile(apps, running, followers, positions, start, off_since=None):
             followers[cid] = start(app, cid, service, positions.get(cid, 0))
 
 
+def jittered(pause):
+    """Пауза со случайной добавкой до половины: после перезапуска дашборда службы всех серверов
+    не должны приходить в одни и те же секунды."""
+    return pause + random.uniform(0, pause / 2)
+
+
+def send_every(apps, live):
+    if live:
+        return LIVE_EVERY
+    if apps:
+        return IDLE_EVERY
+    return jittered(QUIET_EVERY)
+
+
+def scan_every(apps, apps_known):
+    return SCAN_EVERY if apps or not apps_known else QUIET_EVERY
+
+
 def prune_positions(positions, now_ns):
     return {cid: ns for cid, ns in positions.items() if now_ns - ns < KEEP_POSITION_NS}
 
@@ -377,7 +401,7 @@ def main():
                 reconcile(apps, running, followers, positions, start, time.time_ns() if apps_known else None)
             if apps_known:
                 drain_spool(apps, buf)
-            next_scan = now + SCAN_EVERY
+            next_scan = now + scan_every(apps, apps_known)
         if now >= next_save:
             for cid, f in followers.items():
                 positions[cid] = f.position() or positions.get(cid, 0)
@@ -394,14 +418,13 @@ def main():
                 apps, live = parsed
                 apps_known = True
                 backoff = 0.0
-                every = LIVE_EVERY if live else IDLE_EVERY
                 # Накопилось больше пачки — досылаем сразу, не ждём следующего тика.
-                next_send = now + (0 if len(buf) >= MAX_BATCH else every)
+                next_send = now + (0 if len(buf) >= MAX_BATCH else send_every(apps, live))
             elif code == 404:
                 apps, live = set(), set()
                 apps_known = True
                 next_scan = 0.0
-                next_send = now + OLD_DASHBOARD_WAIT
+                next_send = now + jittered(OLD_DASHBOARD_WAIT)
             elif code in (400, 413):
                 print("дашборд не принял логи (код %d), пачка отброшена" % code, file=sys.stderr)
                 next_send = now + IDLE_EVERY
@@ -411,7 +434,7 @@ def main():
                     dash = None
                 buf.requeue(batch)
                 backoff = min(max(backoff * 2, IDLE_EVERY), 60.0)
-                next_send = now + backoff
+                next_send = now + jittered(backoff)
         stop.wait(max(0.0, min(next_send, next_scan) - time.monotonic()))
 
     for cid, f in followers.items():

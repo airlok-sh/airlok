@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Убирает приложение с сервера: останавливает его контейнеры, снимает сайт nginx, выключает
-# задачи по расписанию и бэкапы, удаляет код. Данные остаются: том базы ИМЯ_pgdata и
+# задачи по расписанию и бэкапы, удаляет код и кэш сборки. Данные остаются: том базы ИМЯ_pgdata и
 # /srv/apps/ИМЯ/shared с бэкапами, загрузками и секретами — выкатка под тем же именем их подхватит.
 #
 #   app-remove.sh ИМЯ [--with-data]
@@ -68,6 +68,7 @@ stop_containers() {
 
 remove_site() {
 	local enabled=/etc/nginx/sites-enabled/airlok-${NAME}.conf available=/etc/nginx/sites-available/airlok-${NAME}.conf conf domain=""
+	nginx_lock
 	for conf in "$enabled" "$available"; do
 		[[ -f $conf ]] && domain=$(awk '$1=="server_name"{gsub(";", "", $2); print $2; exit}' "$conf") && break
 	done
@@ -86,6 +87,7 @@ remove_site() {
 			note "сертификат Let's Encrypt для ${domain} не удалился: certbot будет пытаться его продлить"
 		fi
 	fi
+	nginx_unlock
 }
 
 remove_files() {
@@ -135,6 +137,8 @@ main() {
 	remove_site
 	remove_files
 	rm -f "/var/lib/airlok/health/${NAME}"
+	# Кэш сборки — не данные: без приложения он только занимает диск.
+	rm -rf --one-file-system "/var/lib/airlok/cache/${NAME}" "/var/lib/airlok/cache/${NAME}.used" "/var/lib/airlok/cache/${NAME}.deps"
 
 	if ((WITH_DATA)); then
 		printf '\n%sГотово:%s приложение %s убрано с сервера вместе с данными\n' "$C_B" "$C_0" "$NAME"

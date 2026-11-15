@@ -2,13 +2,17 @@
 
 Значения команды доходят до команд от root, поэтому агент проверяет их сам.
 """
+import glob
 import json
 import os
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 AGENT = os.path.join(os.path.dirname(__file__), "..", "recipes", "agent.sh")
@@ -653,6 +657,584 @@ echo "rc=$?"
         out, _, urls = self.run_wait("1")
         self.assertEqual(out, "rc=1")
         self.assertEqual(len(urls), 1)
+
+
+class ResultQueueTest(unittest.TestCase):
+    """Итог команды не теряется, пока дашборд недоступен, и не держит агента."""
+
+    FUNCS = "\n".join((re.search(r"^%s\(\) \{ .*\}$" % name, SOURCE, re.M)
+                       or re.search(r"^%s\(\) [{(]\n.*?^[})]$" % name, SOURCE, re.S | re.M)).group(0)
+                      for name in ("jitter", "send_result", "result_file", "results_pending", "uptime_cs", "result_age", "drop_result",
+                                   "flush_results", "results_hold"))
+    ID = CID
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = os.path.join(self.tmp.name, "results")
+        self.code("204")
+        self.uptime(100000)
+
+    def uptime(self, seconds):
+        with open(os.path.join(self.tmp.name, "uptime"), "w") as f:
+            f.write("%d.42 1234.56\n" % seconds)
+
+    def put(self, age, suffix="", cid=CID):
+        """Итог, пролежавший в очереди age секунд (по часам с загрузки)."""
+        os.makedirs(self.dir, exist_ok=True)
+        name = "%015d-%s-success%s.json" % ((100000 - age) * 100, cid, suffix)
+        with open(os.path.join(self.dir, name), "w") as f:
+            f.write("{}")
+        return name
+
+    def code(self, code):
+        with open(os.path.join(self.tmp.name, "code"), "w") as f:
+            f.write(code)
+
+    def run_sh(self, body, kind=""):
+        t = self.tmp.name
+        script = f"""
+set -u
+RESULTS_DIR={self.dir} RESULT_KEEP=3600 RESULT_HOLD=600 MAX_RESULTS=3 CMD_KIND={kind} UPTIME={t}/uptime
+flock() {{ return 0; }}
+dashboard_fetch() {{ echo "$2" >>{t}/urls; cp "${{4#@}}" {t}/body; cat {t}/code; }}
+{self.FUNCS}
+{body}
+"""
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30,
+                              env={**os.environ, "PAYLOAD_PY": PAYLOAD_PY})
+
+    def queued(self):
+        return sorted(n for n in os.listdir(self.dir) if not n.startswith(".")) if os.path.isdir(self.dir) else []
+
+    def urls(self):
+        path = os.path.join(self.tmp.name, "urls")
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return f.read().split()
+
+    def send(self, status="success", kind="restart"):
+        return self.run_sh(f'send_result {self.ID} {status} "сообщение"', kind)
+
+    def test_delivered_at_once(self):
+        out = self.send()
+        self.assertIn(f"команда {self.ID}: success", out.stdout, out.stderr)
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.urls(), [f"/agent/v1/commands/{self.ID}/result"])
+        with open(os.path.join(self.tmp.name, "body"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["message"], "сообщение")
+
+    def test_dashboard_down_keeps_result_and_does_not_wait(self):
+        self.code("000")
+        out = self.send(status="failed")
+        self.assertIn("пока не доставлен", out.stdout, out.stderr)
+        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(len(self.urls()), 1, "одна попытка, без пауз: агент свободен для следующей команды")
+        self.code("204")
+        out = self.run_sh("flush_results")
+        self.assertIn(f"команда {self.ID}: failed", out.stdout, out.stderr)
+        self.assertEqual(self.queued(), [])
+
+    def test_rejected_result_is_dropped(self):
+        self.code("400")
+        self.send()
+        self.assertEqual(self.queued(), [])
+
+    def test_stops_on_first_failure_and_keeps_order(self):
+        self.code("503")
+        for i in range(2):
+            self.run_sh(f'send_result 0192e000-0000-7000-8000-00000000000{i} success ""')
+        self.assertEqual(len(self.queued()), 2)
+        os.remove(os.path.join(self.tmp.name, "urls"))
+        self.run_sh("flush_results")
+        self.assertEqual(self.urls(), ["/agent/v1/commands/0192e000-0000-7000-8000-000000000000/result"])
+
+    def test_old_and_extra_results_are_dropped(self):
+        old = self.put(7200)
+        for age in range(4):
+            self.put(age, cid=CID[:-1] + str(age + 2))
+        self.code("000")
+        self.run_sh("flush_results")
+        self.assertEqual(len(self.queued()), 3, "очередь не растёт без предела")
+        self.assertNotIn(old, self.queued())
+
+    def test_hold_only_for_deploy(self):
+        self.code("000")
+        self.send(kind="restart")
+        self.assertEqual(self.run_sh("results_hold").returncode, 1, "итог перезапуска не мешает брать команды")
+        self.uptime(100001)
+        self.send(kind="deploy")
+        self.assertEqual(self.run_sh("results_hold").returncode, 0, "итог выкатки — сначала его, потом новые команды")
+        self.uptime(100002)
+        self.send(kind="unknown")
+        self.assertEqual([n.endswith("-hold.json") for n in self.queued()], [False, True, True])
+
+    def test_hold_and_keep_expire(self):
+        self.put(900, suffix="-hold")
+        self.assertEqual(self.run_sh("results_hold").returncode, 1)
+        self.put(300, suffix="-hold")
+        self.assertEqual(self.run_sh("results_hold").returncode, 0)
+        self.uptime(100000 + 400)
+        self.assertEqual(self.run_sh("results_hold").returncode, 1, "через RESULT_HOLD агент снова берёт команды")
+
+    def test_age_does_not_depend_on_wall_clock(self):
+        self.put(30, suffix="-hold")
+        out = self.run_sh('date() { echo 1000000000; }; results_hold; echo "hold=$?"; result_age "$(ls "$RESULTS_DIR")"')
+        self.assertEqual(out.stdout.split(), ["hold=0", "30"], out.stderr)
+
+    def test_impossible_age_counts_as_expired(self):
+        self.put(-50, suffix="-hold")
+        self.assertEqual(self.run_sh("results_hold").returncode, 1, "итог «из будущего» не держит агента вечно")
+        self.run_sh("flush_results")
+        self.assertEqual(self.queued(), [], "заведомо старые итоги отбрасываются без отправки")
+        self.assertEqual(self.urls(), [])
+        self.put(10, suffix="-hold")
+        os.remove(os.path.join(self.tmp.name, "uptime"))
+        self.assertEqual(self.run_sh("results_hold").returncode, 1, "без часов с загрузки не держим")
+
+    def test_reissued_command_drops_its_old_result(self):
+        self.code("000")
+        self.send(kind="deploy")
+        other = self.put(5, cid="0192e000-0000-7000-8000-0000000000ff")
+        out = self.run_sh(f"drop_result {self.ID}")
+        self.assertIn("пришла снова", out.stdout, out.stderr)
+        self.assertEqual(self.queued(), [other], "итог прежнего запуска не закроет новый, чужие итоги остаются")
+
+    def test_handle_drops_old_result_before_running(self):
+        handle = re.search(r"^handle\(\) \{\n(.*?)^\}$", SOURCE, re.S | re.M).group(1)
+        self.assertLess(handle.index('drop_result "${f[1]}"'), handle.index("case ${f[2]:-} in"))
+
+    def test_unsaved_result_is_logged(self):
+        os.makedirs(self.dir)
+        out = self.run_sh(f'python3() {{ return 1; }}; send_result {self.ID} failed ""')
+        self.assertIn("не удалось сохранить", out.stdout, out.stderr)
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_jitter(self):
+        values = {int(v) for v in self.run_sh("for i in $(seq 50); do jitter 10; done").stdout.split()}
+        self.assertTrue(values <= set(range(10, 16)) and len(values) > 1, values)
+
+
+def term_tree(pid):
+    """TERM процессу и всем его потомкам разом — как systemd всей группе службы."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
+    children = {}
+    for line in out.splitlines():
+        if line.strip():
+            p, parent = map(int, line.split())
+            children.setdefault(parent, []).append(p)
+    tree, i = [pid], 0
+    while i < len(tree):
+        tree += children.get(tree[i], [])
+        i += 1
+    for p in tree:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+def agent_globals(run_dir):
+    """Глобальные переменные agent.sh — как он их задаёт до любой функции, но с каталогами во временном."""
+    paths = {"RUN_DIR": run_dir, "STATE_DIR": run_dir, "RESULTS_DIR": os.path.join(run_dir, "results"),
+             "AUDIT_LOG": os.path.join(run_dir, "audit.log")}
+    lines = []
+    for line in SOURCE[:SOURCE.index("\nPARSE_PY='")].splitlines():
+        m = re.match(r"^([A-Z_][A-Z0-9_]*)=", line)
+        if not m or m.group(1) in ("SELF", "SELF_INODE"):
+            continue
+        lines.append("%s=%s" % (m.group(1), shlex.quote(paths[m.group(1)])) if m.group(1) in paths else line)
+    return "\n".join(lines)
+
+
+HANDLE_FUNCS = ("handle", "drop_result", "results_pending", "results_flusher", "jitter", "long_running", "reap_long",
+                "wait_long", "must_wait_long", "long_job", "stop_recipe", "recipe_wait", "start_long", "stop_agent")
+
+
+def agent_funcs(*names):
+    """Текст функций agent.sh: однострочных и многострочных."""
+    return "\n".join((re.search(r"^%s\(\) \{ .*\}$" % name, SOURCE, re.M)
+                      or re.search(r"^%s\(\) [{(]\n.*?^[})]$" % name, SOURCE, re.S | re.M)).group(0) for name in names)
+
+
+class LongCommandTest(unittest.TestCase):
+    """Долгая команда идёт в фоне, а агент тем временем берёт только быстрые и только у дашборда, который это умеет."""
+
+    FUNCS = agent_funcs("long_running", "reap_long", "wait_long", "must_wait_long", "long_job", "stop_recipe", "recipe_wait", "start_long",
+                        "stop_agent",
+                        "side_poll", "poll_once")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.t = self.tmp.name
+        open(os.path.join(self.t, "conf"), "w").close()
+
+    def run_sh(self, body, codes=(), timeout=30):
+        """codes — ответы дашборда по порядку (200 — с командой «cmd-N»), дальше 204."""
+        t = self.t
+        script = f"""
+set -u
+T={t}
+RUN_DIR=$T STATE_DIR=$T WAIT=25 SIDE_WAIT=10 SIDE_RECHECK=600 QUICK_KINDS=db_query,ssh_keys,ssh_password,restart,remove
+LONG_PID="" LONG_APP="" LONG_ID="" LONG_KIND="" LONG_CHILD="" STOP_GRACE=40 SIDE_POLL=list SIDE_POLL_AT=0 BACKOFF=5
+RESULTS_DIR=$T/results
+ENV_JSON=$T/env.json PANEL_ENV=$T/panel.env ENV_ERR=$T/env.err
+LONG_ENV_JSON=$T/long-env.json LONG_PANEL_ENV=$T/long-panel.env LONG_ENV_ERR=$T/long-env.err
+DASHBOARD_CONF=$T/conf SELF=$T/self SELF_INODE=same
+CODES=({' '.join(codes)})
+stat() {{ echo same; }}
+flush_results() {{ :; }}
+results_pending() {{ return 1; }}
+send_result() {{ echo "main result $1 $2 stop=${{LONG_STOP:-0}} kind=${{CMD_KIND:-}}" >>$T/events; }}
+results_hold() {{ [[ -e $T/hold ]]; }}
+jitter() {{ echo "$1"; }}
+sleep() {{ echo "sleep $1" >>$T/events; }}
+dashboard_fetch() {{
+	echo "$2" >>$T/urls
+	local n
+	n=$(wc -l <$T/urls)
+	n=${{n// /}}
+	local c=${{CODES[n-1]:-204}}
+	[[ $c == 200 ]] && echo "cmd-$n" >"$3"
+	echo "$c"
+}}
+handle() {{ echo "handle $(cat "$1") long=$(long_running && echo yes || echo no)" >>$T/events; rm -f "$1"; }}
+fake_long() {{ /bin/sleep "$1" & recipe_wait $!; echo "long done ENV_JSON=${{ENV_JSON##*/}} stop=${{LONG_STOP:-0}}" >>$T/events; }}
+{self.FUNCS}
+{body}
+"""
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=timeout)
+
+    def read(self, name):
+        path = os.path.join(self.t, name)
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return f.read().splitlines()
+
+    def test_quick_command_runs_while_long_one_does(self):
+        out = self.run_sh("start_long id-1 shop fake_long 1; poll_once; wait_long; poll_once", codes=("200",))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        urls = self.read("urls")
+        self.assertEqual(urls[0], "/agent/v1/commands/next?wait=10&only=db_query,ssh_keys,ssh_password,restart,remove&busy_app=shop")
+        self.assertEqual(urls[1], "/agent/v1/commands/next?wait=25", "после долгой — обычный опрос, и только тогда")
+        events = self.read("events")
+        self.assertEqual(events[0], "handle cmd-1 long=yes", "быструю команду не ждали")
+        self.assertIn("long done ENV_JSON=long-env.json stop=0", events, "у долгой свои файлы переменных")
+
+    def test_finished_long_command_is_reaped(self):
+        out = self.run_sh("start_long id-1 shop fake_long 0; /bin/sleep 1; poll_once; echo \"pid=[$LONG_PID]\"")
+        self.assertIn("pid=[]", out.stdout, out.stderr)
+        self.assertEqual(self.read("urls"), ["/agent/v1/commands/next?wait=25"])
+
+    def test_old_dashboard_without_kinds_list(self):
+        out = self.run_sh("start_long id-1 shop fake_long 1; poll_once; poll_once; echo \"mode=$SIDE_POLL\"; poll_once; "
+                          "echo \"pid=[$LONG_PID]\"", codes=("400", "400"))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual([u.split("&", 1)[1] for u in self.read("urls")],
+                         ["only=db_query,ssh_keys,ssh_password,restart,remove&busy_app=shop", "only=ssh_keys"],
+                         "список не знают — проверенный опрос ключей, не знают и его — не опрашиваем")
+        self.assertIn("mode=none", out.stdout)
+        self.assertIn("pid=[]", out.stdout, "без опроса просто ждём долгую, как раньше")
+        self.assertIn("long done ENV_JSON=long-env.json stop=0", self.read("events"))
+
+    def test_kinds_list_is_tried_again_later(self):
+        self.run_sh("start_long id-1 shop fake_long 1; SIDE_POLL=none SIDE_POLL_AT=-700; poll_once; wait_long")
+        self.assertIn("only=db_query", self.read("urls")[0])
+
+    def test_held_deploy_result_allows_only_quick_commands(self):
+        open(os.path.join(self.t, "hold"), "w").close()
+        self.run_sh("poll_once")
+        self.assertEqual(self.read("urls"), ["/agent/v1/commands/next?wait=10&only=db_query,ssh_keys,ssh_password,restart,remove"],
+                         "пока итог выкатки не доставлен, дашборд не должен вернуть её в очередь")
+
+    def test_what_waits_for_the_long_command(self):
+        script = ('LONG_PID=1 LONG_APP=shop; for c in "deploy blog" "data_move blog" "update" "os_upgrade" "restart shop" '
+                  '"remove shop" "restart blog" "remove blog" "db_query shop" "ssh_keys" "ssh_password"; do '
+                  'set -- $c; must_wait_long "$1" "${2:-}" && echo "$c: wait" || echo "$c: now"; done; '
+                  'LONG_PID=""; must_wait_long deploy blog || echo "idle: now"')
+        self.assertEqual(self.run_sh(script).stdout.splitlines(), [
+            "deploy blog: wait", "data_move blog: wait", "update: wait", "os_upgrade: wait", "restart shop: wait",
+            "remove shop: wait", "restart blog: now", "remove blog: now", "db_query shop: now", "ssh_keys: now",
+            "ssh_password: now", "idle: now"])
+
+    def test_stop_lets_long_command_report(self):
+        started = time.monotonic()
+        out = self.run_sh("start_long id-1 shop fake_long 30; /bin/sleep 0.5; stop_agent; echo not-reached", timeout=20)
+        self.assertLess(time.monotonic() - started, 10, "рецепт обрывается, а не дорабатывает")
+        self.assertNotIn("not-reached", out.stdout)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("long done ENV_JSON=long-env.json stop=1", self.read("events"), "итог «прервано» успевает уйти")
+
+    def test_interrupted_result_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            funcs = ResultQueueTest.FUNCS
+            script = f"""
+set -u
+RESULTS_DIR={tmp}/results RESULT_KEEP=3600 RESULT_HOLD=600 MAX_RESULTS=3 CMD_KIND=deploy UPTIME={tmp}/uptime LONG_STOP=1
+echo "100.00 1.0" >{tmp}/uptime
+flock() {{ return 0; }}
+dashboard_fetch() {{ cp "${{4#@}}" {tmp}/body; echo 204; }}
+{funcs}
+send_result {CID} failed ""
+"""
+            subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30, env={**os.environ, "PAYLOAD_PY": PAYLOAD_PY},
+                           check=True)
+            with open(os.path.join(tmp, "body"), encoding="utf-8") as f:
+                self.assertIn("прервано", json.load(f)["message"])
+
+
+@unittest.skipUnless(shutil.which("flock"), "нужен flock, как на сервере")
+class NginxLockTest(unittest.TestCase):
+    """Публикация одного приложения и удаление другого идут разом: правки nginx и certbot — по очереди."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lock = os.path.join(self.tmp.name, "nginx.lock")
+
+    def hold(self, seconds):
+        """Другой процесс держит замок seconds секунд; вернуть, когда он его взял."""
+        ready = os.path.join(self.tmp.name, "ready")
+        proc = subprocess.Popen(["bash", "-c", 'source "$1"; NGINX_LOCK=$2; nginx_lock; : >"$3"; sleep "$4"; nginx_unlock',
+                                 "bash", LIB, self.lock, ready, str(seconds)])
+        self.addCleanup(proc.wait)
+        deadline = time.monotonic() + 10
+        while not os.path.exists(ready) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return proc
+
+    def locked(self, body, wait=1):
+        return subprocess.run(["bash", "-c", 'source "$1"; NGINX_LOCK=$2 NGINX_LOCK_WAIT=$3; ' + body, "bash", LIB, self.lock, str(wait)],
+                              capture_output=True, text=True, timeout=30)
+
+    def test_waits_and_fails_loudly(self):
+        self.hold(3)
+        out = self.locked("nginx_lock; echo inside")
+        self.assertEqual(out.returncode, 1)
+        self.assertNotIn("inside", out.stdout, "без замка конфиги nginx не трогаем")
+        self.assertIn("занят", out.stderr)
+        self.assertIn("inside", self.locked("nginx_lock; echo inside", wait=10).stdout, "дождались — правим")
+
+    def test_unlock_releases_at_once(self):
+        ready = os.path.join(self.tmp.name, "ready")
+        proc = subprocess.Popen(["bash", "-c", 'source "$1"; NGINX_LOCK=$2; nginx_lock; nginx_unlock; : >"$3"; sleep 3',
+                                 "bash", LIB, self.lock, ready])
+        self.addCleanup(proc.wait)
+        while not os.path.exists(ready):
+            time.sleep(0.02)
+        self.assertIn("inside", self.locked("nginx_lock; echo inside").stdout)
+
+    def test_remove_site_keeps_files_until_lock(self):
+        with open(os.path.join(os.path.dirname(AGENT), "app-remove.sh"), encoding="utf-8") as f:
+            src = f.read()
+        root = self.tmp.name
+        func = re.search(r"^remove_site\(\) \{\n.*?\n\}\n", src, re.M | re.S).group(0).replace("/etc/", root + "/etc/") \
+            .replace("/var/log/", root + "/var/log/")
+        for d in ("etc/nginx/sites-available", "etc/nginx/sites-enabled", "bin"):
+            os.makedirs(os.path.join(root, d))
+        site = os.path.join(root, "etc/nginx/sites-available/airlok-shop.conf")
+        with open(site, "w") as f:
+            f.write("server {\n    server_name shop.example.ru;\n}\n")
+        for tool in ("nginx", "systemctl"):
+            with open(os.path.join(root, "bin", tool), "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(os.path.join(root, "bin", tool), 0o755)
+        self.hold(3)
+        env = {**os.environ, "PATH": os.path.join(root, "bin") + os.pathsep + os.environ["PATH"]}
+        script = 'source "$1"; eval "$2"; NGINX_LOCK=$3 NGINX_LOCK_WAIT=1 NAME=shop DOMAIN_RE=x; remove_site'
+        out = subprocess.run(["bash", "-c", script, "bash", LIB, func, self.lock], capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(out.returncode, 1)
+        self.assertTrue(os.path.exists(site), "сайт снимаем только под замком: иначе nginx -t увидел бы чужой недопроверенный конфиг")
+        script = script.replace("NGINX_LOCK_WAIT=1", "NGINX_LOCK_WAIT=10")
+        out = subprocess.run(["bash", "-c", script, "bash", LIB, func, self.lock], capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(os.path.exists(site))
+
+
+@unittest.skipUnless(server_shell() and shutil.which("flock"), "нужны bash 4+, GNU coreutils и flock, как на сервере")
+class HandleLongTest(unittest.TestCase):
+    """Настоящий handle: выкатка уходит в фон, быстрая команда идёт рядом, а вторая выкатка, обновление агента
+    и перезапуск собираемого приложения ждут её конца; остановка службы обрывает выкатку с итогом «прервано»."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.t = self.tmp.name
+        with open(os.path.join(self.t, "strict.py"), "w") as f:
+            f.write("import sys\nsys.exit(0)\n")
+
+    def script(self, body, stubs):
+        return f"""
+source "$1"
+set +e
+{agent_globals(self.t)}
+T={self.t}
+RECIPES_DIR=$T POLICY_CONF=$T/policy
+audit() {{ :; }}
+{stubs}
+{agent_funcs(*HANDLE_FUNCS)}
+{body}
+"""
+
+    def run_handle(self, *commands):
+        calls = []
+        for i, cmd in enumerate(commands):
+            with open(os.path.join(self.t, "cmd%d.json" % i), "w") as f:
+                json.dump(cmd, f)
+            calls.append("handle $T/cmd%d.json" % i)
+            if i == 0:
+                calls.append("until_file $T/started")
+        # Порядок держится на явных отметках, а не на скорости: быстрая команда идёт после старта сборки,
+        # а сборка кончается только после неё.
+        stubs = """
+until_file() { local i; for i in $(seq 200); do [[ -e $1 ]] && return 0; /bin/sleep 0.05; done; return 1; }
+run_deploy() {
+	echo "deploy $2 start log=${CMD_LOG##*/} env=${ENV_JSON##*/}" >>$T/events
+	: >$T/started
+	until_file $T/release
+	echo "deploy $2 end" >>$T/events
+}
+run_restart() { echo "restart $2 log=${CMD_LOG##*/}" >>$T/events; [[ $2 == blog ]] && : >$T/release; }
+run_update() { echo "update" >>$T/events; }
+"""
+        script = self.script("; ".join(calls) + "; wait_long; cat $T/events", stubs)
+        return subprocess.run(["bash", "-c", script, "bash", LIB], capture_output=True, text=True, timeout=60,
+                              env={**os.environ, "PARSE_PY": PARSE_PY})
+
+    def deploy(self, cid, app):
+        return {"id": cid, "kind": "deploy", "deploy": {"app": app, "repo": "acme/" + app, "sha": "a" * 40}}
+
+    def restart(self, cid, app):
+        return {"id": cid, "kind": "restart", "restart": {"app": app}}
+
+    def test_quick_runs_now_same_app_and_second_deploy_wait(self):
+        ids = ["0192e000-0000-7000-8000-00000000000%d" % i for i in range(5)]
+        out = self.run_handle(self.deploy(ids[0], "shop"), self.restart(ids[1], "blog"), self.restart(ids[2], "shop"),
+                              self.deploy(ids[3], "blog"), {"id": ids[4], "kind": "update"})
+        events = [line for line in out.stdout.splitlines() if not line.startswith("команда")]
+        self.assertEqual(sorted(events), sorted(["deploy shop start log=command.log env=long-env.json",
+                                                 "restart blog log=side-command.log", "deploy shop end", "restart shop log=command.log",
+                                                 "deploy blog start log=command.log env=long-env.json", "deploy blog end", "update"]),
+                         out.stderr)
+        at = {e.split(" log=")[0]: i for i, e in enumerate(events)}
+        self.assertLess(at["restart blog"], at["deploy shop end"], "быстрая команда другого приложения не ждёт сборку")
+        for before, after in (("deploy shop end", "restart shop"), ("deploy shop end", "deploy blog start"),
+                              ("deploy blog end", "update")):
+            self.assertLess(at[before], at[after], f"{after} ждёт {before}")
+        self.assertIn(f"команда {ids[2]}: ждёт конца команды {ids[0]}", out.stdout)
+        self.assertIn(f"команда {ids[4]}: ждёт конца команды {ids[3]}", out.stdout, "обновление агента — только свободным")
+
+    def test_old_dashboard_falls_back_to_one_by_one(self):
+        with open(os.path.join(self.t, "cmd.json"), "w") as f:
+            json.dump(self.deploy(CID, "shop"), f)
+        stubs = """
+SELF=$T/self SELF_INODE=same DASHBOARD_CONF=$T/conf
+: >$T/conf
+stat() { echo same; }
+sleep() { :; }
+CODES=(200 400 400)
+dashboard_fetch() {
+	echo "GET $2" >>$T/events
+	local n
+	n=$(grep -c ^GET $T/events)
+	local c=${CODES[n-1]:-204}
+	[[ $c == 200 ]] && cp $T/cmd.json "$3"
+	# Сборка кончается только после опроса only=ssh_keys: дальше агент должен ждать её без опроса.
+	[[ $2 == *only=ssh_keys* ]] && : >$T/release
+	echo "$c"
+}
+run_deploy() {
+	echo "deploy $2 start" >>$T/events
+	local i
+	for i in $(seq 200); do [[ -e $T/release ]] && break; /bin/sleep 0.05; done
+	echo "deploy $2 end" >>$T/events
+}
+"""
+        script = self.script("", stubs)
+        script += agent_funcs("poll_once", "side_poll", "flush_results", "results_hold", "result_age", "uptime_cs")
+        script += "\npoll_once; poll_once; poll_once; poll_once; poll_once; cat $T/events\n"
+        out = subprocess.run(["bash", "-c", script, "bash", LIB], capture_output=True, text=True, timeout=60,
+                             env={**os.environ, "PARSE_PY": PARSE_PY})
+        events = out.stdout.splitlines()
+        events = [e for e in events if e.startswith(("GET", "deploy"))]
+        gets = [e for e in events if e.startswith("GET")]
+        self.assertEqual(gets, ["GET /agent/v1/commands/next?wait=25",
+                                "GET /agent/v1/commands/next?wait=10&only=db_query,ssh_keys,ssh_password,restart,remove&busy_app=shop",
+                                "GET /agent/v1/commands/next?wait=10&only=ssh_keys",
+                                "GET /agent/v1/commands/next?wait=25"], out.stdout + out.stderr)
+        last_get = max(i for i, e in enumerate(events) if e.startswith("GET"))
+        self.assertEqual(events[last_get], gets[3])
+        self.assertLess(events.index("deploy shop end"), last_get, "без опроса ждём сборку и только потом берём новые")
+
+    def test_stop_interrupts_deploy_and_reports(self):
+        with open(os.path.join(self.t, "github-deploy.sh"), "w") as f:
+            f.write("#!/bin/bash\necho '→ Сборка'\nexec sleep 30\n")
+        os.chmod(os.path.join(self.t, "github-deploy.sh"), 0o755)
+        with open(os.path.join(self.t, "cmd.json"), "w") as f:
+            json.dump(self.deploy(CID, "shop"), f)
+        stubs = """
+dashboard_fetch() { [[ $2 == */result ]] && cp "${4#@}" $T/result.json; echo 204; }
+"""
+        script = self.script("", stubs)
+        script += agent_funcs("send_result", "result_file", "uptime_cs", "result_age", "flush_results", "stream_progress", "run_deploy")
+        script += "\ntrap stop_agent TERM; handle $T/cmd.json; sleep 1; kill -TERM $$; echo not-reached\n"
+        started = time.monotonic()
+        out = subprocess.run(["bash", "-c", script, "bash", LIB], capture_output=True,
+                             text=True, timeout=60, env={**os.environ, "PARSE_PY": PARSE_PY, "PAYLOAD_PY": PAYLOAD_PY})
+        self.assertLess(time.monotonic() - started, 20, "сборку оборвали, а не ждали")
+        self.assertNotIn("not-reached", out.stdout)
+        with open(os.path.join(self.t, "result.json"), encoding="utf-8") as f:
+            body = json.load(f)
+        self.assertEqual(body["status"], "failed", out.stdout + out.stderr)
+        self.assertIn("прервано", body["message"])
+
+    def test_term_to_whole_tree_keeps_result(self):
+        """Как systemd при остановке службы: TERM разом всем процессам — рецепту, оболочке долгой команды,
+        основному циклу и тем, кто в этот миг сохраняет итог. Итог не должен теряться ни разу."""
+        with open(os.path.join(self.t, "github-deploy.sh"), "w") as f:
+            f.write('#!/bin/bash\n: >"$(dirname "$0")/started"\nexec sleep "$(cat "$(dirname "$0")/delay")"\n')
+        os.chmod(os.path.join(self.t, "github-deploy.sh"), 0o755)
+        with open(os.path.join(self.t, "cmd.json"), "w") as f:
+            json.dump(self.deploy(CID, "shop"), f)
+        stubs = "dashboard_fetch() { echo 000; }\n"
+        script = self.script("", stubs)
+        script += agent_funcs("send_result", "result_file", "uptime_cs", "result_age", "flush_results", "stream_progress", "run_deploy")
+        # Основной цикл в это время занят своим: дочерний процесс, которого тоже касается TERM.
+        script += "\nSTOP_GRACE=2; trap stop_agent TERM; handle $T/cmd.json; while :; do reap_long; /bin/sleep 5; done\n"
+        results = os.path.join(self.t, "results")
+        lost = []
+        for i in range(30):
+            shutil.rmtree(results, ignore_errors=True)
+            # handle удаляет разобранную команду: на каждый повтор — заново.
+            with open(os.path.join(self.t, "cmd.json"), "w") as f:
+                json.dump(self.deploy(CID, "shop"), f)
+            for name in ("started", "events"):
+                if os.path.exists(os.path.join(self.t, name)):
+                    os.remove(os.path.join(self.t, name))
+            # Сборка то ещё идёт, то кончилась сама в тот же миг, что пришёл TERM.
+            recipe, signal_after = (0.3, 0.0), (0.05, 0.15, 0.0, 0.3, 0.1)
+            with open(os.path.join(self.t, "delay"), "w") as f:
+                f.write(str(recipe[i % 2]))
+            log = open(os.path.join(self.t, "run.log"), "w")
+            proc = subprocess.Popen(["bash", "-c", script, "bash", LIB], stdout=log, stderr=subprocess.STDOUT,
+                                    start_new_session=True, env={**os.environ, "PARSE_PY": PARSE_PY, "PAYLOAD_PY": PAYLOAD_PY})
+            log.close()
+            deadline = time.monotonic() + 10
+            while not os.path.exists(os.path.join(self.t, "started")) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(os.path.exists(os.path.join(self.t, "started")), "сборка не началась")
+            time.sleep(signal_after[i % len(signal_after)])
+            started = time.monotonic()
+            term_tree(proc.pid)
+            proc.wait(timeout=90)
+            took = time.monotonic() - started
+            if not glob.glob(os.path.join(results, f"*-{CID}-*.json")) or took > 20:
+                with open(os.path.join(self.t, "run.log"), encoding="utf-8", errors="replace") as f:
+                    lost.append((i, round(took, 1), f.read()[-1500:]))
+        self.assertEqual(lost, [], "итог выкатки потерян или остановка затянулась")
 
 
 if __name__ == "__main__":

@@ -61,6 +61,8 @@ install_git() {
 		told=1
 		sleep 5
 	done
+	# Списки пакетов только что скачаны: server-base.sh не будет скачивать их ещё раз.
+	{ mkdir -p /var/lib/airlok && touch /var/lib/airlok/apt-lists.stamp; } 2>/dev/null || true
 }
 
 has_signers() { [[ -r $1 ]] && grep -Eqv '^[[:space:]]*(#|$)' "$1"; }
@@ -238,7 +240,7 @@ if systemctl is-active --quiet airlok-ssh-rollback.timer; then
    Если не подтвердить за 3 минуты, вход по паролю вернётся сам.
   ══════════════════════════════════════════════════════════════════════
 EOF
-elif sshd -T 2>/dev/null | grep -qx 'passwordauthentication no'; then
+elif grep -qx 'passwordauthentication no' <<<"$(sshd -T 2>/dev/null)"; then
 	echo "  Вход по паролю уже был выключен раньше — ничего подтверждать не нужно."
 else
 	cat <<EOF

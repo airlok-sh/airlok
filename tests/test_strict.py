@@ -12,8 +12,10 @@ import unittest
 
 RECIPES = os.path.join(os.path.dirname(__file__), "..", "recipes")
 sys.path.insert(0, RECIPES)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import strict  # noqa: E402
+from test_agent import HANDLE_FUNCS, agent_funcs, agent_globals  # noqa: E402
 
 CID = "0192e000-0000-7000-8000-000000000001"
 
@@ -173,16 +175,19 @@ class HandleTest(unittest.TestCase):
         with open(os.path.join(RECIPES, "agent.sh"), encoding="utf-8") as f:
             agent = f.read()
         parse = re.search(r"^PARSE_PY='\n.*?\n'\n", agent, re.S | re.M).group(0)
-        funcs = [re.search(rf"^{name}\(\) \{{.*?^\}}", agent, re.S | re.M).group(0) for name in ("audit", "refuse", "handle")]
+        # Настоящие функции и глобальные переменные агента: handle зовёт их на каждом пути.
+        funcs = agent_funcs("audit", "refuse", *HANDLE_FUNCS)
         self.script = "\n".join([
             'source "$1"; set +e',
+            agent_globals(self.tmp.name),
             f'POLICY_CONF={self.policy!r} RECIPES_DIR={self.tmp.name!r} RUN_DIR={self.tmp.name!r} AUDIT_LOG={self.audit!r} AUDIT_MAX_BYTES=100000',
             f'ENV_JSON={self.tmp.name!r}/env.json DBQ_JSON={self.tmp.name!r}/q.json KEYS_JSON={self.tmp.name!r}/k.json',
             'send_result() { echo "result $1 $2 $3"; }',
             'dashboard_fetch() { { echo "db-result $2"; cat "${4#@}"; echo; } >&2; }',
             *[f'run_{n}() {{ echo "RUN {n} $*"; }}' for n in ("update", "restart", "remove", "db_query", "ssh_keys", "ssh_password", "data_move", "os_reboot", "os_upgrade", "deploy")],
-            parse, *funcs,
-            'handle "$2"',
+            parse, funcs,
+            # Выкатка и перенос данных идут в фоне: дождаться их вывода.
+            'handle "$2"; wait_long',
         ])
 
     def enable(self, *repos):

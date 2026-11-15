@@ -22,6 +22,13 @@ BASE_RETRY_MINUTES=60
 # Порт приложения внутри контейнера; снаружи он доступен только nginx сервера.
 CONTAINER_PORT=8080
 KEEP_RELEASES=3
+# Кэш сборки приложений; каталог закрыт root, внутри — по каталогу на приложение.
+BUILD_CACHE_ROOT=/var/lib/airlok/cache
+BUILD_CACHE_MIN_FREE_MB=2048
+BUILD_SLICE=airlok-build.slice
+SLICE_REFUSED=$BASE_STAMPS/slice-refused
+# Память, которую сборка оставляет сайтам и базе.
+BUILD_MEM_RESERVE_MB=256
 IMAGE_EXTS="jpg jpeg png webp gif avif"
 # Свой домен из дашборда: ASCII, кириллица уже в punycode (xn--p1ai для .рф).
 DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})$'
@@ -271,6 +278,163 @@ base_images() {
 	return 0
 }
 
+# build_limits — память сборки: три четверти памяти сервера, но не больше, чем сейчас свободно за
+# вычетом запаса для сайтов и базы, и не меньше 1 ГБ — столько просит next build, и столько было
+# всегда. Swap сверху — не больше самой памяти.
+build_limits() {
+	local total="" avail="" swap=""
+	read -r total avail swap < <(awk '/^MemTotal:/{t=int($2/1024)} /^MemAvailable:/{a=int($2/1024)} /^SwapTotal:/{s=int($2/1024)}
+		END{print t+0, a+0, s+0}' /proc/meminfo 2>/dev/null) || true
+	BUILD_MEM=$((${total:-0} * 3 / 4))
+	((${avail:-0} - BUILD_MEM_RESERVE_MB >= BUILD_MEM)) || BUILD_MEM=$((${avail:-0} - BUILD_MEM_RESERVE_MB))
+	((BUILD_MEM >= 1024)) || BUILD_MEM=1024
+	swap=${swap:-0}
+	((swap <= BUILD_MEM)) || swap=$BUILD_MEM
+	BUILD_MEM_SWAP=$((BUILD_MEM + swap))
+}
+
+# build_slice — slice для шагов RUN сборки по Dockerfile: docker build не принимает ни вес CPU, ни
+# предел памяти, а родительскую группу — да. Только при драйвере cgroup systemd: с ним Docker
+# сам кладёт контейнеры шагов в этот slice. Docker, который однажды отказался, — до его обновления
+# без slice: иначе каждая публикация собиралась бы дважды.
+build_slice() {
+	BUILD_PARENT=()
+	BUILD_DOCKER=$(docker info -f '{{.CgroupDriver}} {{.ServerVersion}}' 2>/dev/null) || return 0
+	[[ $BUILD_DOCKER == "systemd "* ]] || return 0
+	[[ $(cat "$SLICE_REFUSED" 2>/dev/null) != "$BUILD_DOCKER" ]] || return 0
+	if write_if_changed "/etc/systemd/system/${BUILD_SLICE}" 0644 <<EOF; then
+[Unit]
+Description=Сборки приложений Airlok
+
+[Slice]
+CPUWeight=20
+IOWeight=20
+MemoryHigh=${BUILD_MEM}M
+EOF
+		if ! systemctl daemon-reload; then
+			note "systemd не перечитал ${BUILD_SLICE} — сборка по Dockerfile идёт без пониженного приоритета"
+			return 0
+		fi
+	fi
+	BUILD_PARENT=(--cgroup-parent "$BUILD_SLICE")
+}
+
+# slice_refused ЛОГ — docker build упал, потому что не принял --cgroup-parent: ошибка самого Docker,
+# а не вывод шага сборки (у BuildKit тот идёт строками #N, а упавший шаг — «did not complete»).
+slice_refused() {
+	((${#BUILD_PARENT[@]})) || return 1
+	grep -E '^(ERROR|Error response from daemon|error)' "$1" | grep -i cgroup | grep -qv 'did not complete successfully'
+}
+
+# disk_free — свободно на диске с кэшами сборки, МБ; не узнать — 0.
+disk_free() {
+	local free
+	free=$(df -Pm "$BUILD_CACHE_ROOT" 2>/dev/null | awk 'NR==2{print $4}') || free=0
+	echo "${free:-0}"
+}
+
+# cache_limit — предел кэша одного приложения: десятая часть диска, от 1 до 3 ГБ. У крупного
+# Next.js кэш npm и .next/cache вместе больше гигабайта, и на диске побольше предел в 1 ГБ стирал бы
+# кэш через сборку; на 10–20 ГБ он остаётся 1–2 ГБ.
+cache_limit() {
+	local total limit
+	total=$(df -Pm "$BUILD_CACHE_ROOT" 2>/dev/null | awk 'NR==2{print $2}') || total=0
+	limit=$((${total:-0} / 10))
+	((limit >= 1024)) || limit=1024
+	((limit <= 3072)) || limit=3072
+	echo "$limit"
+}
+
+# evict_caches — на диске мало места: стираем кэши сборки всех приложений, начиная с тех, чьи
+# сборки шли давнее всего, пока места не станет достаточно. Кэш собираемого приложения — последним.
+# Время сборки — в ИМЯ.used рядом с кэшем: сама сборка его не подделает.
+evict_caches() {
+	local dir name stamp order=()
+	for dir in "$BUILD_CACHE_ROOT"/*/; do
+		name=$(basename "$dir")
+		if [[ ! -L ${dir%/} && $name =~ ^[a-z][a-z0-9-]{1,30}$ && $name != "$APP_NAME" && ! -e $BUILD_CACHE_ROOT/$name.used ]]; then
+			order+=("$name")
+		fi
+	done
+	while IFS= read -r stamp; do
+		name=$(basename "$stamp" .used)
+		if [[ $name =~ ^[a-z][a-z0-9-]{1,30}$ && $name != "$APP_NAME" ]]; then
+			order+=("$name")
+		fi
+	done < <(cd "$BUILD_CACHE_ROOT" && ls -1tr -- *.used 2>/dev/null)
+	order+=("$APP_NAME")
+	for name in "${order[@]}"; do
+		(($(disk_free) < BUILD_CACHE_MIN_FREE_MB)) || break
+		dir=$BUILD_CACHE_ROOT/$name
+		[[ -d $dir && ! -L $dir ]] || continue
+		rm -rf --one-file-system "$dir"
+		note "кэш сборки ${name} стёрт: на диске мало места"
+	done
+	return 0
+}
+
+# deps_sum — отпечаток файлов зависимостей релиза.
+deps_sum() {
+	local f files=()
+	for f in package.json package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb .npmrc .yarnrc.yml \
+		requirements.txt pyproject.toml poetry.lock uv.lock Pipfile Pipfile.lock go.mod go.sum composer.json composer.lock; do
+		if [[ -f $RELEASE/$f && ! -L $RELEASE/$f ]]; then files+=("$f"); fi
+	done
+	if ((${#files[@]} == 0)); then
+		echo none
+		return 0
+	fi
+	(cd "$RELEASE" && sha256sum -- "${files[@]}") | sha256sum | cut -d' ' -f1
+}
+
+# build_cache — постоянный кэш пакетов и сборки этого приложения, монтируется в контейнер сборки.
+# Свой у каждого приложения: в него пишет код сборки, а соседнему приложению он не виден. Сверх
+# предела кэш стирается целиком, а при нехватке места на диске сначала стираются чужие давние кэши;
+# места всё равно мало — сборка идёт без кэша: медленнее, но не падает из-за него.
+#
+# Колёса pip, модули Go, .next/cache и распакованные npx-пакеты с lock-файлом никто не сверяет:
+# вредная зависимость, однажды выполненная при сборке, жила бы в них и после удаления. Поэтому при
+# смене файлов зависимостей остаются только архивы npm (_cacache) — npm сверяет их с хешами из lock-файла.
+build_cache() {
+	BUILD_CACHE=""
+	local dir=$BUILD_CACHE_ROOT/$APP_NAME used sum
+	install -d -m 700 -o root -g root "$BUILD_CACHE_ROOT"
+	# Каталог кэша меняет только root, но не ссылкой ли он стал — проверить дешевле, чем довериться.
+	if [[ -L $dir || (-e $dir && ! -d $dir) ]]; then
+		rm -f "$dir"
+	fi
+	sum=$(deps_sum) || sum=unknown
+	if [[ -d $dir ]]; then
+		used=$(du -sxm "$dir" 2>/dev/null | cut -f1) || used=0
+		if ((${used:-0} > $(cache_limit))); then
+			rm -rf --one-file-system "$dir"
+			note "кэш сборки больше предела — очищен, эта сборка с нуля"
+		elif [[ $(cat "$dir.deps" 2>/dev/null) != "$sum" ]]; then
+			find "$dir" -mindepth 1 -maxdepth 1 ! -name npm -exec rm -rf --one-file-system {} +
+			if [[ -d $dir/npm && ! -L $dir/npm ]]; then
+				find "$dir/npm" -mindepth 1 -maxdepth 1 ! -name _cacache -exec rm -rf --one-file-system {} +
+			fi
+			note "зависимости изменились — кэш сборки сброшен, кроме архивов npm"
+		fi
+	fi
+	if (($(disk_free) < BUILD_CACHE_MIN_FREE_MB)); then
+		evict_caches
+		if (($(disk_free) < BUILD_CACHE_MIN_FREE_MB)); then
+			note "на диске свободно $(disk_free) МБ — собираем без кэша"
+			return 0
+		fi
+	fi
+	install -d -m 700 -o "$BUILD_USER" -g "$BUILD_USER" "$dir"
+	printf '%s\n' "$sum" >"$dir.deps"
+	touch "$dir.used"
+	BUILD_CACHE=$dir
+}
+
+# cache_spoiled ЛОГ — сборка упала на испорченном или переполненном кэше, а не на коде проекта.
+cache_spoiled() {
+	[[ -n $BUILD_CACHE ]] && grep -qE 'EINTEGRITY|ERR_PNPM_TARBALL_INTEGRITY|ENOSPC|No space left on device|[Cc]orrupt|checksum mismatch' "$1"
+}
+
 # build_container СКРИПТ ЛОГ — установка зависимостей и сборка в контейнере. Значения
 # переменных сборки идут через окружение docker, а не аргументами: в ps их не видно. Агенту вывод
 # нужен и в общем логе: дашборд показывает его по ходу выкатки. sh -x печатает каждую команду
@@ -278,14 +442,24 @@ base_images() {
 build_container() {
 	# Установка зависимостей выполняет скрипты чужих пакетов, поэтому у сборки нет ни
 	# секретов, ни базы, ни прав: только папка релиза и доступ к реестрам пакетов.
-	local pair passed=()
+	local pair passed=() cache=/tmp/airlok-cache mount=()
 	for pair in "${BUILD_ENV[@]}"; do passed+=(-e "${pair%%=*}"); done
+	if [[ -n $BUILD_CACHE ]]; then
+		cache=/cache
+		mount=(-v "${BUILD_CACHE}:${cache}")
+	fi
+	# --cpu-shares 512 в cgroup v2 — вес 20 против 100 у сайтов: на одном ядре под нагрузкой сборка
+	# получает около шестой части процессора, а свободный берёт целиком. Меньше нельзя: если сайт
+	# завис и держит процессор, сборка исправления растянулась бы до таймаута публикации. При нехватке
+	# памяти ядро первой убивает сборку, а не сайт.
 	local run=(env "${BUILD_ENV[@]}" docker run --rm --name "airlok-build-${APP_NAME}"
 		--user "${BUILD_UID}:${BUILD_GID}" --cap-drop ALL --security-opt no-new-privileges
-		--memory 1g --pids-limit 512
-		-e HOME=/tmp -e NEXT_TELEMETRY_DISABLED=1 -e npm_config_cache=/tmp/npm -e PIP_CACHE_DIR=/tmp/pip
-		-e PYTHONDONTWRITEBYTECODE=1 "${passed[@]}"
-		-v "${RELEASE}:/app" -w /app "$BUILD_IMAGE" sh -xc "$1")
+		--cpu-shares 512 --memory "${BUILD_MEM}m" --memory-swap "${BUILD_MEM_SWAP}m" --oom-score-adj 500 --pids-limit 512
+		-e HOME=/tmp -e NEXT_TELEMETRY_DISABLED=1 -e PYTHONDONTWRITEBYTECODE=1
+		-e "AIRLOK_CACHE=${cache}" -e "npm_config_cache=${cache}/npm" -e "PIP_CACHE_DIR=${cache}/pip"
+		-e "XDG_CACHE_HOME=${cache}/xdg" -e "YARN_GLOBAL_FOLDER=${cache}/yarn-berry"
+		-e "GOCACHE=${cache}/go-build" -e "GOMODCACHE=${cache}/go-mod" "${passed[@]}"
+		"${mount[@]}" -v "${RELEASE}:/app" -w /app "$BUILD_IMAGE" sh -xc "$1")
 	if [[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]]; then
 		"${run[@]}" 2>&1 | tee "$2"
 	else
@@ -316,12 +490,21 @@ build_image() {
 	local context file
 	context=$(release_path "$DOCKER_CONTEXT") || die "каталог сборки ${DOCKER_CONTEXT} — ссылка за пределы проекта, так нельзя"
 	file=$(release_path "$DOCKER_FILE") || die "${DOCKER_FILE} — ссылка за пределы проекта, так нельзя"
-	local run=(env "${BUILD_ENV[@]}" docker build "${args[@]}" -t "$RUN_IMAGE" -f "$file" "$context")
+	local run=(env "${BUILD_ENV[@]}" docker build "${BUILD_PARENT[@]}" "${args[@]}" -t "$RUN_IMAGE" -f "$file" "$context")
 	if [[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]]; then
-		"${run[@]}" 2>&1 | tee "$1"
+		"${run[@]}" 2>&1 | tee "$1" && return 0
 	else
-		"${run[@]}" >"$1" 2>&1
+		"${run[@]}" >"$1" 2>&1 && return 0
 	fi
+	if slice_refused "$1"; then
+		note "сборщик Docker не принял ${BUILD_SLICE}, собираем без пониженного приоритета"
+		install -d -m 755 "$BASE_STAMPS"
+		printf '%s\n' "$BUILD_DOCKER" >"$SLICE_REFUSED"
+		BUILD_PARENT=()
+		build_image "$@"
+		return
+	fi
+	return 1
 }
 
 # base_unreachable ЛОГ — сборка упала, не достучавшись до реестра базового образа, а не на шаге
@@ -343,6 +526,17 @@ next_cache() {
 	install -d "${RELEASE}/.next/cache"
 }
 
+# next_cache_script СКРИПТ — сборка Next.js с кэшем .next/cache от прошлой сборки. После удачной
+# сборки кэш уходит из релиза обратно в кэш приложения: в работающем приложении на его месте
+# tmpfs, и в релизе он только занимал бы диск. Переносит его сама сборка, от своего пользователя, —
+# root по содержимому кэша не ходит. Неудача с кэшем сборку не роняет.
+next_cache_script() {
+	# shellcheck disable=SC2016 # переменные раскрывает sh в контейнере сборки
+	printf '%s\n' \
+		'if [ -d "$AIRLOK_CACHE/next" ]; then mkdir -p .next && cp -a "$AIRLOK_CACHE/next" .next/cache || true; fi' \
+		'{' "$1" '} && { [ ! -d .next/cache ] || { rm -rf "$AIRLOK_CACHE/next" && mv .next/cache "$AIRLOK_CACHE/next"; } || true; }'
+}
+
 build() {
 	if ((REUSED)); then
 		stage_skip build "версия уже собрана"
@@ -353,7 +547,9 @@ build() {
 	local log=${RELEASE}.build.log script pair names=() line
 	for pair in "${BUILD_ENV[@]}"; do names+=("${pair%%=*}"); done
 	((${#names[@]})) && note "переменные сборки: ${names[*]}"
+	build_limits
 	if [[ $APP_STACK == docker ]]; then
+		build_slice
 		while IFS= read -r line; do
 			[[ -n $line ]] && note "внимание: $line"
 		done <<<"$DOCKER_WARNINGS"
@@ -378,10 +574,24 @@ build() {
 	script=$BUILD_INSTALL
 	[[ -n $script && -n $BUILD_CMD ]] && script+=" && "
 	script+=$BUILD_CMD
+	[[ -n $script ]] && build_cache
+	[[ -n $script && $APP_STACK == nextjs ]] && script=$(next_cache_script "$script")
+	local built=1
 	if [[ -n $script ]] && ! build_container "$script" "$log"; then
+		built=0
+		# Только при признаках порчи кэша: ошибку в коде повтор лишь отодвинул бы на вторую сборку.
+		if cache_spoiled "$log"; then
+			note "сборка упала на испорченном кэше — стираем его и собираем ещё раз"
+			rm -rf --one-file-system "$BUILD_CACHE"
+			install -d -m 700 -o "$BUILD_USER" -g "$BUILD_USER" "$BUILD_CACHE"
+			prepare_release "$SOURCE_DIR"
+			build_container "$script" "$log" && built=1
+		fi
+	fi
+	if ((!built)); then
 		[[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]] || tail -30 "$log" >&2
 		local outside
-		outside=$(grep -oE "EACCES: permission denied, [a-z]+ '/[^']*'" "$log" | grep -vE "'/(app|tmp)(/|')" | head -1)
+		outside=$(grep -oE "EACCES: permission denied, [a-z]+ '/[^']*'" "$log" | grep -vE "'/(app|tmp|cache)(/|')" | head -1)
 		if [[ -n $outside ]]; then
 			die "сборка пишет за пределы папки проекта (${outside#*, }): так бывает в монорепозитории, где фронтенд собирается в каталог бэкенда. Публикуйте каталог, в котором собирается всё приложение, или поправьте путь сборки. Полный лог: ${log}"
 		fi
@@ -404,22 +614,61 @@ static_root() {
 	python3 "$RECIPES_DIR/detect.py" static-output "$RELEASE" "$BUILD_OUTPUT" "${built[@]}"
 }
 
-# static_conf — сайт для nginx внутри контейнера. Есть 404.html — сайт многостраничный и
+# static_conf [--checked] — сайт для nginx внутри контейнера. Есть 404.html — сайт многостраничный и
 # свою страницу ошибки отдаёт сам; нет — это SPA, и любой путь ведёт на index.html.
+#
+# Год и immutable — только файлам, которые целиком пишет сборка и имя которых она меняет: каталоги
+# _astro, _next/static, _app/immutable и _nuxt (кроме builds — там манифест версии), а в assets — только
+# JS и CSS с хешем в имени (index-BxYz12ab.js, main.3f9a1c2e.css). Остальное в assets могло прийти из
+# public/assets как есть: картинку под тем же именем человек заменит, и посетители должны увидеть новую,
+# поэтому там — перепроверка (no-cache). Хешированного файла нет — 404, а не SPA-запасной index.html:
+# страница с кэшем на год сломала бы сайт до очистки кэша браузера. HTML — тоже no-cache.
+#
+# Новый конфиг проверяет nginx того же образа: конфиг, который он не примет, положил бы сайт, и
+# откат его бы не поднял. --checked — шаблон уже проверен этой публикацией (откат на прежний релиз).
 static_conf() {
-	local root fallback="/index.html"
+	local root fallback="/index.html" conf=$APP_DIR/shared/static.conf new out
 	root=$(static_root) || exit 1
 	[[ -f $RELEASE/$root/404.html ]] && fallback="=404"
-	write_if_changed "$APP_DIR/shared/static.conf" 0644 <<EOF || true
+	new=$conf.new
+	install -m 644 /dev/null "$new"
+	cat >"$new" <<EOF
+map \$sent_http_content_type \$airlok_cache {
+    ~^text/html no-cache;
+    default "";
+}
 server {
     listen ${CONTAINER_PORT};
     server_tokens off;
     root /app/${root};
     index index.html;
     error_page 404 /404.html;
+    add_header Cache-Control \$airlok_cache always;
+    location ~ "^/(?:_astro/|_next/static/|_app/immutable/|_nuxt/(?!builds/))" {
+        try_files \$uri =404;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+    location ~ "^/assets/(?:[^/]+/)*[^/]*[.-](?:(?=[A-Za-z0-9_-]{0,7}[0-9])(?=[A-Za-z0-9_-]{0,7}[a-z])(?=[A-Za-z0-9_-]{0,7}[A-Z])[A-Za-z0-9_-]{8}|(?=[0-9a-f]*[a-f])(?=[0-9a-f]*[0-9])[0-9a-f]{8,})\.(?:m?js|css)\$" {
+        try_files \$uri =404;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+    location /assets/ {
+        add_header Cache-Control no-cache always;
+        try_files \$uri \$uri/ \$uri.html ${fallback};
+    }
     location / { try_files \$uri \$uri/ \$uri.html ${fallback}; }
 }
 EOF
+	if [[ -f $conf ]] && cmp -s "$new" "$conf"; then
+		rm -f "$new"
+		return 0
+	fi
+	if [[ ${1:-} != --checked ]] && ! out=$(docker run --rm --network none --entrypoint nginx \
+		-v "${new}:/etc/nginx/conf.d/default.conf:ro" "$STATIC_IMAGE" -t -q 2>&1); then
+		rm -f "$new"
+		die "nginx образа ${STATIC_IMAGE} не принял новый конфиг сайта — публикация остановлена, конфиг и контейнер сайта остались прежними: $(tail -3 <<<"$out")"
+	fi
+	mv -f "$new" "$conf"
 }
 
 # compose_command — команда запуска в compose.yml. JSON — это YAML, а $ удваиваем: иначе
@@ -716,7 +965,7 @@ deploy() {
 		crashing && crashed=1
 		if [[ -n $prev && $prev != "$RELEASE" ]]; then
 			RELEASE=$prev
-			[[ $APP_STACK == static ]] && static_conf
+			[[ $APP_STACK == static ]] && static_conf --checked
 			restore_compose
 			compose up -d --force-recreate --no-deps app >>"$log" 2>&1 || true
 			ROLLED_BACK=$(basename "$prev")
@@ -820,6 +1069,11 @@ nginx_site() {
     http2 on;"
 	fi
 
+	# Прежний конфиг — на случай, если новый nginx не примет: сайт тогда остаётся на нём.
+	local site=/etc/nginx/sites-available/airlok-${APP_NAME}.conf enabled=/etc/nginx/sites-enabled/airlok-${APP_NAME}.conf linked=0
+	rm -f "${site}.prev"
+	[[ -L $enabled || -e $enabled ]] && linked=1
+	[[ -f $site ]] && cp -p "$site" "${site}.prev"
 	if write_if_changed "/etc/nginx/sites-available/airlok-${APP_NAME}.conf" 0644 <<EOF; then
 server {
     listen 80;
@@ -839,6 +1093,15 @@ ${tls_listen}
 
     client_max_body_size ${UPLOAD_MAX_MB}m;
     include snippets/airlok-security-headers.conf;
+    # Ответы, которые приложение уже сжало, nginx не трогает. Поток событий (text/event-stream)
+    # не сжимается: его типа в списке нет.
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 5;
+    gzip_min_length 1024;
+    gzip_types text/css text/plain text/xml text/javascript application/javascript application/json
+        application/manifest+json application/xml application/rss+xml application/atom+xml image/svg+xml;
     access_log /var/log/nginx/airlok-${APP_NAME}.access.log airlok;
     access_log /var/log/nginx/airlok-${APP_NAME}.visits.log airlok_visit if=\$airlok_visit;
 
@@ -868,14 +1131,20 @@ ${uploads_block}
     }
 }
 EOF
-		ln -sfn "/etc/nginx/sites-available/airlok-${APP_NAME}.conf" "/etc/nginx/sites-enabled/airlok-${APP_NAME}.conf"
+		ln -sfn "$site" "$enabled"
 		if ! nginx -t -q; then
 			# Битый конфиг в sites-enabled сломал бы любой следующий reload nginx, в том числе чужих сайтов.
-			rm -f "/etc/nginx/sites-enabled/airlok-${APP_NAME}.conf" "/etc/nginx/sites-available/airlok-${APP_NAME}.conf"
+			if [[ -f ${site}.prev ]]; then
+				mv -f "${site}.prev" "$site"
+				((linked)) || rm -f "$enabled"
+				die "nginx не принял новый конфиг сайта — оставлен прежний, остальные сайты не затронуты"
+			fi
+			rm -f "$enabled" "$site"
 			die "nginx не принял конфиг сайта, конфиг убран, остальные сайты не затронуты"
 		fi
 		reload=yes
 	fi
+	rm -f "${site}.prev"
 	# Формат лога мог смениться и без правки сайта, а nginx перечитывает его только по reload.
 	[[ $reload == no ]] || systemctl reload nginx
 	ok "https://${APP_DOMAIN} → 127.0.0.1:${APP_PORT}, сертификат ${TLS_KIND}, HTTP перенаправляется на HTTPS"
@@ -1029,6 +1298,7 @@ main() {
 	local src=${1:-}
 	[[ -d $src ]] || die "использование: $0 /путь/к/проекту"
 	src=$(cd "$src" && pwd)
+	SOURCE_DIR=$src
 	# Агент разворачивает под именем из дашборда: в монорепозитории у фронтенда и бэкенда
 	# свои манифесты, но имена приложений на сервере не должны совпасть.
 	if [[ -n ${AIRLOK_APP_NAME:-} ]]; then
@@ -1084,9 +1354,13 @@ main() {
 		printf '\n%sГотово:%s фоновое приложение %s работает, логи: docker compose -f %s/compose.yml logs app\n' "$C_B" "$C_0" "$APP_NAME" "$APP_DIR"
 		return
 	fi
+	nginx_lock
 	nginx_site
+	nginx_unlock
 	uploads_private
+	nginx_lock
 	issue_certificate
+	nginx_unlock
 	printf '\n%sГотово:%s https://%s\n' "$C_B" "$C_0" "$APP_DOMAIN"
 }
 

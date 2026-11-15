@@ -48,10 +48,11 @@ BERRY_METADATA = re.compile(r'^__metadata:\s*\n\s+version:\s*"?(\d+)', re.M)
 # более новый обновил бы формат, и yarn install --immutable упал бы.
 BERRY_VERSIONS = {"4": "2.4.3", "5": "3.1.1", "6": "3.8.7", "8": "4.13.0", "9": "4.14.1", "10": "4.18.1"}
 LATEST_BERRY_LOCK = "10"
-# Окружение Yarn 2+: corepack и скачанный им Yarn лежат в папке проекта, Yarn берётся из
-# реестра npm, как и все пакеты сборки. node-modules вместо PnP: иначе node server.js и
-# Next.js standalone не найдут модули.
-COREPACK_ENV = (f"export COREPACK_HOME={COREPACK_DIR}/home "
+# Окружение Yarn 2+: обёртки corepack лежат в папке проекта, а Yarn, который он берёт из реестра
+# npm, как и все пакеты сборки, — в кэше сборки приложения (AIRLOK_CACHE задаёт app-deploy.sh):
+# работающему приложению он не нужен. node-modules вместо PnP: иначе node server.js и Next.js
+# standalone не найдут модули.
+COREPACK_ENV = ('export COREPACK_HOME="${AIRLOK_CACHE:-/tmp}/corepack" '
                 'COREPACK_NPM_REGISTRY="${COREPACK_NPM_REGISTRY:-https://registry.npmjs.org}" '
                 "COREPACK_ENABLE_DOWNLOAD_PROMPT=0 COREPACK_ENABLE_AUTO_PIN=0 COREPACK_ENABLE_STRICT=0 "
                 f"YARN_NODE_LINKER=node-modules YARN_ENABLE_TELEMETRY=0 PATH={COREPACK_DIR}/bin:$PATH")
@@ -124,8 +125,13 @@ SPEC_CLAUSE = re.compile(r"^(>=|<=|==|!=|~=|>|<)\s*(\d+)(?:\.(\d+))?")
 GO_DIRECTIVE = re.compile(r"^go\s+(\d+\.\d+)", re.M)
 GO_PACKAGE_MAIN = re.compile(r"^package\s+main\s*$", re.M)
 
+# Хранилище pnpm — в кэше сборки приложения. Каталог задан явно: иначе pnpm, не сумев сделать жёсткие
+# ссылки из другой файловой системы, завёл бы хранилище в самой папке релиза. Кэш смонтирован отдельно
+# от релиза, и жёсткие ссылки между ними невозможны, поэтому копирование задано явно и главнее
+# package-import-method из .npmrc проекта.
+PNPM_STORE = '--store-dir "${AIRLOK_CACHE:-/tmp}/pnpm-store" --package-import-method copy'
 NPM_INSTALL = ("if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; "
-               f"elif [ -f pnpm-lock.yaml ]; then npx --yes pnpm@{PNPM_VERSION} install --frozen-lockfile; "
+               f"elif [ -f pnpm-lock.yaml ]; then npx --yes pnpm@{PNPM_VERSION} install --frozen-lockfile {PNPM_STORE}; "
                f"elif [ -f yarn.lock ]; then npx --yes yarn@{YARN_VERSION} install --frozen-lockfile; "
                "else npm install --no-audit --no-fund; fi")
 
@@ -264,7 +270,7 @@ def js_install(root, pkg, bun):
     elif exists(root, "pnpm-lock.yaml"):
         deps["manager"] = "pnpm"
         if name == "pnpm":
-            deps["install"] = f"npx --yes pnpm@{version} install --frozen-lockfile"
+            deps["install"] = f"npx --yes pnpm@{version} install --frozen-lockfile {PNPM_STORE}"
     elif exists(root, "yarn.lock"):
         deps["manager"] = "yarn"
         lock = BERRY_METADATA.search(read_text(root, "yarn.lock"))
@@ -516,7 +522,7 @@ def django_wsgi(root):
 
 def plan_python(root, deps, run_command, plan):
     install = ["python -m venv /app/.venv"]
-    pip = "/app/.venv/bin/pip install --no-cache-dir --disable-pip-version-check"
+    pip = "/app/.venv/bin/pip install --disable-pip-version-check"
     if exists(root, "requirements.txt"):
         install.append(pip + " -r requirements.txt")
     elif exists(root, "pyproject.toml"):

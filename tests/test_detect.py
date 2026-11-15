@@ -60,8 +60,9 @@ class DetectTest(unittest.TestCase):
                    start="uvicorn app.main:api --host 0.0.0.0 --port 8080 --proxy-headers --forwarded-allow-ips '*'")
         plan = detect(project({"requirements.txt": "Flask>=3\n", "app.py": "import flask\napp = flask.Flask(__name__)\n"}))
         self.assertEqual(plan["start"], "gunicorn app:app --bind 0.0.0.0:8080 --workers 2 --access-logfile -")
-        self.assertIn("pip install --no-cache-dir --disable-pip-version-check gunicorn", plan["install"],
+        self.assertIn("pip install --disable-pip-version-check gunicorn", plan["install"],
                       "сервер приложений ставится, если проект его не указал")
+        self.assertNotIn("--no-cache-dir", plan["install"], "пакеты берутся из кэша сборки приложения")
         self.check({"pyproject.toml": '[project]\ndependencies = ["Django>=5", "gunicorn"]\n', "manage.py": "",
                     "mysite/wsgi.py": "application = None\n", "runtime.txt": "python-3.13.1"},
                    framework="Django", python="3.13",
@@ -194,9 +195,10 @@ class DetectTest(unittest.TestCase):
                    install="npx --yes yarn@1.22.19 install --frozen-lockfile")
 
         self.check({"package.json": express(), "pnpm-lock.yaml": "lockfileVersion: '9.0'\n"}, install=NPM_INSTALL, manager="pnpm")
-        self.assertIn("npx --yes pnpm@9.15.9 install --frozen-lockfile", NPM_INSTALL)
+        store = '--store-dir "${AIRLOK_CACHE:-/tmp}/pnpm-store" --package-import-method copy'
+        self.assertIn("npx --yes pnpm@9.15.9 install --frozen-lockfile " + store, NPM_INSTALL, "хранилище pnpm — в кэше сборки")
         self.check({"package.json": express(',"packageManager":"pnpm@10.18.3+sha512.abc0"'), "pnpm-lock.yaml": "lockfileVersion: '9.0'\n"},
-                   install="npx --yes pnpm@10.18.3 install --frozen-lockfile")
+                   install="npx --yes pnpm@10.18.3 install --frozen-lockfile " + store)
         self.check({"package.json": express(',"packageManager":"pnpm@10.18.3"'), "package-lock.json": "{}"}, install=NPM_INSTALL, manager="")
 
         plan = detect(project({"package.json": express(',"packageManager":"pnpm@10; id"'), "pnpm-lock.yaml": "lockfileVersion: '9.0'\n"}))

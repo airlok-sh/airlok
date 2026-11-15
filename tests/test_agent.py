@@ -695,7 +695,8 @@ class ResultQueueTest(unittest.TestCase):
         t = self.tmp.name
         script = f"""
 set -u
-RESULTS_DIR={self.dir} RESULT_KEEP=3600 RESULT_HOLD=600 MAX_RESULTS=3 CMD_KIND={kind} UPTIME={t}/uptime
+RESULTS_DIR={self.dir} RESULT_KEEP=3600 RESULT_HOLD=600 MAX_RESULTS=3 CMD_KIND={kind} UPTIME={t}/uptime RUN_DIR={t}
+{STOP_MESSAGE_LINE}
 flock() {{ return 0; }}
 dashboard_fetch() {{ echo "$2" >>{t}/urls; cp "${{4#@}}" {t}/body; cat {t}/code; }}
 {self.FUNCS}
@@ -848,8 +849,10 @@ def agent_globals(run_dir):
     return "\n".join(lines)
 
 
+STOP_MESSAGE_LINE = re.search(r"^STOP_MESSAGE=.*$", SOURCE, re.M).group(0)
 HANDLE_FUNCS = ("handle", "drop_result", "results_pending", "results_flusher", "jitter", "long_running", "reap_long",
-                "wait_long", "must_wait_long", "long_job", "stop_recipe", "recipe_wait", "start_long", "stop_agent")
+                "wait_long", "must_wait_long", "long_job", "stop_recipe", "recipe_wait", "start_long", "stop_agent", "stop_current",
+                "sent_already", "sent_trim", "job_pending", "resume_later")
 
 
 def agent_funcs(*names):
@@ -862,7 +865,7 @@ class LongCommandTest(unittest.TestCase):
     """Долгая команда идёт в фоне, а агент тем временем берёт только быстрые и только у дашборда, который это умеет."""
 
     FUNCS = agent_funcs("long_running", "reap_long", "wait_long", "must_wait_long", "long_job", "stop_recipe", "recipe_wait", "start_long",
-                        "stop_agent",
+                        "stop_agent", "stop_current", "sent_already", "job_pending", "resume_later",
                         "side_poll", "poll_once")
 
     def setUp(self):
@@ -879,6 +882,8 @@ set -u
 T={t}
 RUN_DIR=$T STATE_DIR=$T WAIT=25 SIDE_WAIT=10 SIDE_RECHECK=600 QUICK_KINDS=db_query,ssh_keys,ssh_password,restart,remove
 LONG_PID="" LONG_APP="" LONG_ID="" LONG_KIND="" LONG_CHILD="" STOP_GRACE=40 SIDE_POLL=list SIDE_POLL_AT=0 BACKOFF=5
+CUR_ID="" CUR_KIND="" CUR_APP="" CUR_LOG="" RESUME=$T/resume
+{STOP_MESSAGE_LINE}
 RESULTS_DIR=$T/results
 ENV_JSON=$T/env.json PANEL_ENV=$T/panel.env ENV_ERR=$T/env.err
 LONG_ENV_JSON=$T/long-env.json LONG_PANEL_ENV=$T/long-panel.env LONG_ENV_ERR=$T/long-env.err
@@ -973,7 +978,8 @@ fake_long() {{ /bin/sleep "$1" & recipe_wait $!; echo "long done ENV_JSON=${{ENV
             funcs = ResultQueueTest.FUNCS
             script = f"""
 set -u
-RESULTS_DIR={tmp}/results RESULT_KEEP=3600 RESULT_HOLD=600 MAX_RESULTS=3 CMD_KIND=deploy UPTIME={tmp}/uptime LONG_STOP=1
+RESULTS_DIR={tmp}/results RESULT_KEEP=3600 RESULT_HOLD=600 MAX_RESULTS=3 CMD_KIND=deploy UPTIME={tmp}/uptime LONG_STOP=1 RUN_DIR={tmp}
+{STOP_MESSAGE_LINE}
 echo "100.00 1.0" >{tmp}/uptime
 flock() {{ return 0; }}
 dashboard_fetch() {{ cp "${{4#@}}" {tmp}/body; echo 204; }}
@@ -1179,7 +1185,7 @@ run_deploy() {
 dashboard_fetch() { [[ $2 == */result ]] && cp "${4#@}" $T/result.json; echo 204; }
 """
         script = self.script("", stubs)
-        script += agent_funcs("send_result", "result_file", "uptime_cs", "result_age", "flush_results", "stream_progress", "run_deploy")
+        script += agent_funcs("send_result", "result_file", "uptime_cs", "result_age", "flush_results", "stream_progress", "job_pending", "run_deploy")
         script += "\ntrap stop_agent TERM; handle $T/cmd.json; sleep 1; kill -TERM $$; echo not-reached\n"
         started = time.monotonic()
         out = subprocess.run(["bash", "-c", script, "bash", LIB], capture_output=True,
@@ -1201,7 +1207,7 @@ dashboard_fetch() { [[ $2 == */result ]] && cp "${4#@}" $T/result.json; echo 204
             json.dump(self.deploy(CID, "shop"), f)
         stubs = "dashboard_fetch() { echo 000; }\n"
         script = self.script("", stubs)
-        script += agent_funcs("send_result", "result_file", "uptime_cs", "result_age", "flush_results", "stream_progress", "run_deploy")
+        script += agent_funcs("send_result", "result_file", "uptime_cs", "result_age", "flush_results", "stream_progress", "job_pending", "run_deploy")
         # Основной цикл в это время занят своим: дочерний процесс, которого тоже касается TERM.
         script += "\nSTOP_GRACE=2; trap stop_agent TERM; handle $T/cmd.json; while :; do reap_long; /bin/sleep 5; done\n"
         results = os.path.join(self.t, "results")

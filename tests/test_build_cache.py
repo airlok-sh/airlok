@@ -227,7 +227,7 @@ class NextCacheTest(unittest.TestCase):
 class BuildContainerTest(unittest.TestCase):
     """Аргументы docker run сборки: кэш, вес CPU, память."""
 
-    def run_build(self, meminfo, cache):
+    def run_build(self, meminfo, cache, parent="()"):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = os.path.join(tmp, "bin")
             os.makedirs(bin_dir)
@@ -240,7 +240,7 @@ class BuildContainerTest(unittest.TestCase):
             funcs = const("BUILD_MEM_RESERVE_MB") + "\n" + func("build_limits").replace("/proc/meminfo", proc) + func("build_container")
             # set +u: пустой массив в bash 3 (macOS) под set -u — ошибка, на сервере bash 5.
             script = ('source "$1"; ((BASH_VERSINFO[0] >= 4)) || set +u; eval "$2"; BUILD_ENV=(); APP_NAME=shop; BUILD_UID=998; BUILD_GID=998; RELEASE=/srv/apps/shop/releases/x; '
-                      f'BUILD_IMAGE=node:22-bookworm-slim; BUILD_CACHE={cache!r}; build_limits; build_container "npm ci" "$3"; cat "$3"')
+                      f'BUILD_IMAGE=node:22-bookworm-slim; BUILD_CACHE={cache!r}; BUILD_PARENT={parent}; build_limits; build_container "npm ci" "$3"; cat "$3"')
             out = subprocess.run(["bash", "-c", script, "bash", LIB, funcs, os.path.join(tmp, "log")],
                                  env={**os.environ, "PATH": bin_dir + ":" + os.environ["PATH"]}, capture_output=True, text=True)
             self.assertEqual(out.returncode, 0, out.stderr)
@@ -253,7 +253,8 @@ class BuildContainerTest(unittest.TestCase):
         args = self.run_build("MemTotal:  987654 kB\nMemAvailable: 614400 kB\nSwapTotal: 2097148 kB\n", "/var/lib/airlok/cache/shop")
         self.assertEqual(self.flag(args, "--memory"), "1024m", "next build нужен хотя бы 1 ГБ")
         self.assertEqual(self.flag(args, "--memory-swap"), "2048m", "swap сверху — не больше самой памяти")
-        self.assertEqual(self.flag(args, "--cpu-shares"), "512", "вес 20 против 100 у сайтов: зависший сайт не задушит сборку")
+        self.assertEqual(self.flag(args, "--cpu-shares"), "512", "без slice — доля, зависший сайт не задушит сборку")
+        self.assertNotIn("--cgroup-parent", args)
         self.assertIn("/var/lib/airlok/cache/shop:/cache", args)
         self.assertIn("npm_config_cache=/cache/npm", args)
         self.assertIn("GOMODCACHE=/cache/go-mod", args)
@@ -264,6 +265,11 @@ class BuildContainerTest(unittest.TestCase):
         self.assertEqual(self.flag(args, "--memory-swap"), "5859m", "без swap — без swap")
         self.assertFalse(any(a.endswith(":/cache") for a in args), "без кэша на диске каталог не монтируется")
         self.assertIn("AIRLOK_CACHE=/tmp/airlok-cache", args)
+
+    def test_build_in_slice(self):
+        args = self.run_build("MemTotal: 2000000 kB\nMemAvailable: 1500000 kB\nSwapTotal: 0 kB\n", "", "(--cgroup-parent airlokbuild.slice)")
+        self.assertEqual(self.flag(args, "--cgroup-parent"), "airlokbuild.slice", "вес задаёт slice, а не пересчёт долей Docker")
+        self.assertNotIn("--cpu-shares", args)
 
     def test_busy_server_keeps_memory_for_sites(self):
         args = self.run_build("MemTotal: 4000000 kB\nMemAvailable: 1800000 kB\nSwapTotal: 2097148 kB\n", "")
@@ -298,9 +304,10 @@ class StaticCacheTest(unittest.TestCase):
 
     def test_conf(self):
         self.assertEqual(STATIC_CONF.count("try_files \\$uri =404;"), 2, "без файла — 404, а не index.html на год")
-        self.assertIn("~^text/html no-cache;", STATIC_CONF)
-        assets = STATIC_CONF[STATIC_CONF.index("location /assets/ {"):]
-        self.assertIn("add_header Cache-Control no-cache always;", assets.split("}")[0], "картинки из public/assets перепроверяются")
+        server = STATIC_CONF[STATIC_CONF.index("server {"):STATIC_CONF.index("location")]
+        self.assertIn("add_header Cache-Control no-cache always;", server,
+                      "всё, что не immutable, — HTML, /style.css, /data.json, картинки из public/assets — перепроверяется")
+        self.assertEqual(STATIC_CONF.count("add_header"), 3, "у location / своего add_header нет: no-cache сервера действует и там")
 
 
 class SiteGzipTest(unittest.TestCase):
@@ -388,7 +395,7 @@ class SliceRefusedTest(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
             f.write(log)
         self.addCleanup(os.remove, f.name)
-        parent = "BUILD_PARENT=(--cgroup-parent airlok-build.slice)" if parent else "BUILD_PARENT=()"
+        parent = "BUILD_PARENT=(--cgroup-parent airlokbuild.slice)" if parent else "BUILD_PARENT=()"
         out = subprocess.run(["bash", "-c", f'eval "$1"; {parent}; slice_refused "$2" && echo yes || echo no', "bash",
                               func("slice_refused"), f.name], capture_output=True, text=True)
         return out.stdout.strip() == "yes"

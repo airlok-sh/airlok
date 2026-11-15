@@ -25,7 +25,7 @@ KEEP_RELEASES=3
 # Кэш сборки приложений; каталог закрыт root, внутри — по каталогу на приложение.
 BUILD_CACHE_ROOT=/var/lib/airlok/cache
 BUILD_CACHE_MIN_FREE_MB=2048
-BUILD_SLICE=airlok-build.slice
+BUILD_SLICE=airlokbuild.slice
 SLICE_REFUSED=$BASE_STAMPS/slice-refused
 # Память, которую сборка оставляет сайтам и базе.
 BUILD_MEM_RESERVE_MB=256
@@ -210,8 +210,11 @@ prepare_release() {
 		fi
 		note "переменные сборки, версия среды или образ сборки изменились с прошлой сборки ${id} — собираем заново"
 	fi
+	drop_unfinished
 	rm -rf "$RELEASE" "${RELEASE}.built"
 	install -d -m 755 "$RELEASE"
+	# Пока сборка не закончилась, релиз помечен: оборванный убирает drop_build или следующая публикация.
+	touch "${RELEASE}.building"
 	# --safe-links: ссылки за пределы проекта не копируются, если код пришёл не через github-deploy.sh.
 	rsync -a --safe-links --exclude .git --exclude node_modules --exclude .next --exclude .venv --exclude __pycache__ \
 		--exclude '.env*' "$src/" "$RELEASE/"
@@ -220,6 +223,28 @@ prepare_release() {
 		note ".env из проекта не копируется: секреты задаются в ${APP_DIR}/shared/user.env"
 	fi
 	ok "релиз ${id}"
+}
+
+# drop_unfinished — релизы, сборку которых оборвали так, что убрать их было некому (KILL, выключение).
+drop_unfinished() {
+	local mark dir current
+	current=$(readlink -f "$APP_DIR/current" 2>/dev/null) || current=""
+	for mark in "$APP_DIR"/releases/*.building; do
+		[[ -e $mark ]] || continue
+		dir=${mark%.building}
+		[[ -n $current && $(readlink -f "$dir" 2>/dev/null) == "$current" ]] || rm -rf "$dir" "${dir}.built"
+		rm -f "$mark"
+	done
+	return 0
+}
+
+# drop_build — сборку оборвали или она не удалась: контейнер сборки и недособранный релиз (сотни
+# мегабайт node_modules) не должны пережить публикацию. Лог сборки остаётся.
+drop_build() {
+	docker rm -f "airlok-build-${APP_NAME}" >/dev/null 2>&1 || true
+	[[ -n ${RELEASE:-} && -e ${RELEASE}.building ]] || return 0
+	[[ -L $APP_DIR/current && $(readlink -f "$RELEASE") == "$(readlink -f "$APP_DIR/current")" ]] || rm -rf "$RELEASE" "${RELEASE}.built"
+	rm -f "${RELEASE}.building"
 }
 
 # release_image РЕЛИЗ — образ приложения, собранный по его Dockerfile.
@@ -293,15 +318,19 @@ build_limits() {
 	BUILD_MEM_SWAP=$((BUILD_MEM + swap))
 }
 
-# build_slice — slice для шагов RUN сборки по Dockerfile: docker build не принимает ни вес CPU, ни
-# предел памяти, а родительскую группу — да. Только при драйвере cgroup systemd: с ним Docker
-# сам кладёт контейнеры шагов в этот slice. Docker, который однажды отказался, — до его обновления
-# без slice: иначе каждая публикация собиралась бы дважды.
+# build_slice — slice всех сборок: вес CPU 20 против 100 у system.slice, где работают сайты, nginx и
+# база, и общий предел памяти. Вес задаёт сам slice, а не --cpu-shares: как Docker пересчитывает доли
+# в вес cgroup v2, зависит от его версии (в 29 — 512 → 59). Slice запускается заранее: каталог, который
+# создал бы BuildKit для шагов RUN, сам по себе ни веса, ни предела не получает. Только при драйвере
+# cgroup systemd. Docker, который однажды отказался от slice в docker build, — до его обновления без
+# slice: иначе каждая публикация собиралась бы дважды. В имени slice нет дефиса: «airlok-build.slice»
+# systemd вложил бы в «airlok.slice», и вес 20 сравнивался бы только внутри неё, а не с сайтами; к тому
+# же BuildKit понимает --cgroup-parent как путь от корня cgroup — у slice без дефиса это он сам.
 build_slice() {
 	BUILD_PARENT=()
 	BUILD_DOCKER=$(docker info -f '{{.CgroupDriver}} {{.ServerVersion}}' 2>/dev/null) || return 0
 	[[ $BUILD_DOCKER == "systemd "* ]] || return 0
-	[[ $(cat "$SLICE_REFUSED" 2>/dev/null) != "$BUILD_DOCKER" ]] || return 0
+	[[ $APP_STACK != docker || $(cat "$SLICE_REFUSED" 2>/dev/null) != "$BUILD_DOCKER" ]] || return 0
 	if write_if_changed "/etc/systemd/system/${BUILD_SLICE}" 0644 <<EOF; then
 [Unit]
 Description=Сборки приложений Airlok
@@ -312,11 +341,25 @@ IOWeight=20
 MemoryHigh=${BUILD_MEM}M
 EOF
 		if ! systemctl daemon-reload; then
-			note "systemd не перечитал ${BUILD_SLICE} — сборка по Dockerfile идёт без пониженного приоритета"
+			note "systemd не перечитал ${BUILD_SLICE} — сборка идёт без пониженного приоритета"
 			return 0
 		fi
 	fi
+	if ! systemctl start "$BUILD_SLICE"; then
+		note "не запустился ${BUILD_SLICE} — сборка идёт без пониженного приоритета"
+		return 0
+	fi
 	BUILD_PARENT=(--cgroup-parent "$BUILD_SLICE")
+}
+
+# slice_cleanup — пустые группы шагов, которые BuildKit оставляет в slice после сборки. rmdir не
+# удаляет группу, где ещё есть процессы: сборка другого приложения не пострадает.
+slice_cleanup() {
+	local dir
+	for dir in "/sys/fs/cgroup/${BUILD_SLICE}/buildkit"/*/; do
+		[[ -d $dir ]] && rmdir "$dir" 2>/dev/null || true
+	done
+	return 0
 }
 
 # slice_refused ЛОГ — docker build упал, потому что не принял --cgroup-parent: ошибка самого Docker,
@@ -448,23 +491,30 @@ build_container() {
 		cache=/cache
 		mount=(-v "${BUILD_CACHE}:${cache}")
 	fi
-	# --cpu-shares 512 в cgroup v2 — вес 20 против 100 у сайтов: на одном ядре под нагрузкой сборка
-	# получает около шестой части процессора, а свободный берёт целиком. Меньше нельзя: если сайт
-	# завис и держит процессор, сборка исправления растянулась бы до таймаута публикации. При нехватке
-	# памяти ядро первой убивает сборку, а не сайт.
+	# Приоритет CPU — у slice (build_slice); без него — доля 512 из 1024 у сайтов, вес которой зависит от
+	# версии Docker. Меньше нельзя: если сайт завис и держит процессор, сборка исправления растянулась
+	# бы до таймаута публикации. При нехватке памяти ядро первой убивает сборку, а не сайт.
+	local priority=(--cpu-shares 512)
+	((${#BUILD_PARENT[@]})) && priority=("${BUILD_PARENT[@]}")
 	local run=(env "${BUILD_ENV[@]}" docker run --rm --name "airlok-build-${APP_NAME}"
 		--user "${BUILD_UID}:${BUILD_GID}" --cap-drop ALL --security-opt no-new-privileges
-		--cpu-shares 512 --memory "${BUILD_MEM}m" --memory-swap "${BUILD_MEM_SWAP}m" --oom-score-adj 500 --pids-limit 512
+		"${priority[@]}" --memory "${BUILD_MEM}m" --memory-swap "${BUILD_MEM_SWAP}m" --oom-score-adj 500 --pids-limit 512
 		-e HOME=/tmp -e NEXT_TELEMETRY_DISABLED=1 -e PYTHONDONTWRITEBYTECODE=1
 		-e "AIRLOK_CACHE=${cache}" -e "npm_config_cache=${cache}/npm" -e "PIP_CACHE_DIR=${cache}/pip"
 		-e "XDG_CACHE_HOME=${cache}/xdg" -e "YARN_GLOBAL_FOLDER=${cache}/yarn-berry"
 		-e "GOCACHE=${cache}/go-build" -e "GOMODCACHE=${cache}/go-mod" "${passed[@]}"
 		"${mount[@]}" -v "${RELEASE}:/app" -w /app "$BUILD_IMAGE" sh -xc "$1")
+	# Контейнер прошлой сборки, которую оборвали: с тем же именем новый не запустится.
+	docker rm -f "airlok-build-${APP_NAME}" >/dev/null 2>&1 || true
+	# В фоне и через wait: сигнал остановки ждёт конца обычной команды, а docker run пересылает его
+	# контейнеру, где sh с PID 1 его не замечает, — сборка шла бы ещё минуты. wait сигнал прерывает,
+	# и контейнер сразу убирает drop_build.
 	if [[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]]; then
-		"${run[@]}" 2>&1 | tee "$2"
+		("${run[@]}" 2>&1 | tee "$2") &
 	else
-		"${run[@]}" >"$2" 2>&1
+		"${run[@]}" >"$2" 2>&1 &
 	fi
+	wait $!
 }
 
 # release_path ПУТЬ — путь внутри релиза с развёрнутыми ссылками; ошибка, если он выходит наружу.
@@ -491,11 +541,14 @@ build_image() {
 	context=$(release_path "$DOCKER_CONTEXT") || die "каталог сборки ${DOCKER_CONTEXT} — ссылка за пределы проекта, так нельзя"
 	file=$(release_path "$DOCKER_FILE") || die "${DOCKER_FILE} — ссылка за пределы проекта, так нельзя"
 	local run=(env "${BUILD_ENV[@]}" docker build "${BUILD_PARENT[@]}" "${args[@]}" -t "$RUN_IMAGE" -f "$file" "$context")
+	# В фоне — как build_container: остановка не ждёт конца сборки. Клиент docker build, получив
+	# сигнал, отменяет сборку, и BuildKit останавливает шаг RUN.
 	if [[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]]; then
-		"${run[@]}" 2>&1 | tee "$1" && return 0
+		("${run[@]}" 2>&1 | tee "$1") &
 	else
-		"${run[@]}" >"$1" 2>&1 && return 0
+		"${run[@]}" >"$1" 2>&1 &
 	fi
+	wait $! && return 0
 	if slice_refused "$1"; then
 		note "сборщик Docker не принял ${BUILD_SLICE}, собираем без пониженного приоритета"
 		install -d -m 755 "$BASE_STAMPS"
@@ -548,8 +601,8 @@ build() {
 	for pair in "${BUILD_ENV[@]}"; do names+=("${pair%%=*}"); done
 	((${#names[@]})) && note "переменные сборки: ${names[*]}"
 	build_limits
+	build_slice
 	if [[ $APP_STACK == docker ]]; then
-		build_slice
 		while IFS= read -r line; do
 			[[ -n $line ]] && note "внимание: $line"
 		done <<<"$DOCKER_WARNINGS"
@@ -561,6 +614,7 @@ build() {
 			note "не удалось обновить базовые образы из ${DOCKER_FILE} — собираю на тех, что уже есть на сервере"
 			build_image "$log" && built=1
 		fi
+		slice_cleanup
 		if ((!built)); then
 			[[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]] || tail -30 "$log" >&2
 			die "сборка по ${DOCKER_FILE} не удалась, полный лог: ${log}$(hub_hint "$log")"
@@ -568,6 +622,7 @@ build() {
 		chown -R root:root "$RELEASE"
 		chmod -R u+rwX,go+rX,go-w "$RELEASE"
 		printf '%s' "$BUILD_ENV_SUM" >"${RELEASE}.built"
+		rm -f "${RELEASE}.building"
 		ok "образ ${RUN_IMAGE} собран по ${DOCKER_FILE}"
 		return 0
 	fi
@@ -605,6 +660,7 @@ build() {
 	# имеет 700, и приложение не смогло бы прочитать собственный код.
 	chmod -R u+rwX,go+rX,go-w "$RELEASE"
 	printf '%s' "$BUILD_ENV_SUM" >"${RELEASE}.built"
+	rm -f "${RELEASE}.building"
 	ok "собрано в изолированном контейнере, код передан root и закрыт на запись"
 }
 
@@ -620,9 +676,9 @@ static_root() {
 # Год и immutable — только файлам, которые целиком пишет сборка и имя которых она меняет: каталоги
 # _astro, _next/static, _app/immutable и _nuxt (кроме builds — там манифест версии), а в assets — только
 # JS и CSS с хешем в имени (index-BxYz12ab.js, main.3f9a1c2e.css). Остальное в assets могло прийти из
-# public/assets как есть: картинку под тем же именем человек заменит, и посетители должны увидеть новую,
-# поэтому там — перепроверка (no-cache). Хешированного файла нет — 404, а не SPA-запасной index.html:
-# страница с кэшем на год сломала бы сайт до очистки кэша браузера. HTML — тоже no-cache.
+# public/assets как есть: картинку под тем же именем человек заменит, и посетители должны увидеть новую.
+# Поэтому всё остальное, и HTML тоже, — с перепроверкой (no-cache). Хешированного файла нет — 404, а не
+# SPA-запасной index.html: страница с кэшем на год сломала бы сайт до очистки кэша браузера.
 #
 # Новый конфиг проверяет nginx того же образа: конфиг, который он не примет, положил бы сайт, и
 # откат его бы не поднял. --checked — шаблон уже проверен этой публикацией (откат на прежний релиз).
@@ -633,17 +689,13 @@ static_conf() {
 	new=$conf.new
 	install -m 644 /dev/null "$new"
 	cat >"$new" <<EOF
-map \$sent_http_content_type \$airlok_cache {
-    ~^text/html no-cache;
-    default "";
-}
 server {
     listen ${CONTAINER_PORT};
     server_tokens off;
     root /app/${root};
     index index.html;
     error_page 404 /404.html;
-    add_header Cache-Control \$airlok_cache always;
+    add_header Cache-Control no-cache always;
     location ~ "^/(?:_astro/|_next/static/|_app/immutable/|_nuxt/(?!builds/))" {
         try_files \$uri =404;
         add_header Cache-Control "public, max-age=31536000, immutable";
@@ -651,10 +703,6 @@ server {
     location ~ "^/assets/(?:[^/]+/)*[^/]*[.-](?:(?=[A-Za-z0-9_-]{0,7}[0-9])(?=[A-Za-z0-9_-]{0,7}[a-z])(?=[A-Za-z0-9_-]{0,7}[A-Z])[A-Za-z0-9_-]{8}|(?=[0-9a-f]*[a-f])(?=[0-9a-f]*[0-9])[0-9a-f]{8,})\.(?:m?js|css)\$" {
         try_files \$uri =404;
         add_header Cache-Control "public, max-age=31536000, immutable";
-    }
-    location /assets/ {
-        add_header Cache-Control no-cache always;
-        try_files \$uri \$uri/ \$uri.html ${fallback};
     }
     location / { try_files \$uri \$uri/ \$uri.html ${fallback}; }
 }
@@ -934,6 +982,9 @@ cron_setup() {
 deploy() {
 	step "Запуск"
 	stage start
+	# Дальше копия базы, миграции и смена контейнера: оборванные посередине, они оставили бы сайт
+	# лежать. Отсюда остановку публикации on_term не выполняет, а доводит её до конца.
+	job_phase "$PUBLISH_UNIT" finish
 	local prev="" log=$APP_DIR/shared/deploy.log
 	[[ -L $APP_DIR/current ]] && prev=$(readlink -f "$APP_DIR/current")
 
@@ -1224,7 +1275,10 @@ ensure_project_free() {
 deploy_finished() {
 	# RELEASE_ID, а не RELEASE: при откате RELEASE указывает уже на предыдущую версию.
 	local code=$1 version=${RELEASE_ID:-} took=$((SECONDS - STARTED))
-	local what="версия ${version}${AIRLOK_RELEASE_TITLE:+ «${AIRLOK_RELEASE_TITLE}»}" status domain=""
+	local what="версия ${version}${AIRLOK_RELEASE_TITLE:+ «${AIRLOK_RELEASE_TITLE}»}" status domain="" outcome=failed
+	((code == 0)) && outcome=success
+	((${INTERRUPTED:-0})) && outcome=interrupted
+	((code == 0)) || drop_build
 	if ((code == 0)); then
 		status=success
 		domain=$APP_DOMAIN
@@ -1242,6 +1296,19 @@ deploy_finished() {
 	# Выкатка, упавшая до создания релиза (например, уже идёт другая), id ещё не имеет. Домен —
 	# только у успешной: после неудачи nginx остался на прежнем адресе.
 	report_deploy "$APP_NAME" "$domain" "${version:-unknown}" "${AIRLOK_RELEASE_TITLE:-}" "$status" "$took" "${DIE_MSG:-}"
+	job_outcome "$PUBLISH_UNIT" "$outcome" "${DIE_MSG:-}"
+}
+
+# on_term — публикацию остановили. До копии базы и смены контейнера — прерываем: контейнер сборки и
+# недособранный релиз убирает deploy_finished. Дальше — доводим до конца (job_phase в deploy).
+on_term() {
+	if job_finishing "$PUBLISH_UNIT"; then
+		note "публикацию остановили во время смены версии — доводим её до конца"
+		return 0
+	fi
+	INTERRUPTED=1
+	DIE_MSG="публикация прервана до смены версии, приложение работает на прежней"
+	exit 143
 }
 
 # default_name — имя приложения по папке проекта: для выкатки руками без airlok.yml.
@@ -1283,6 +1350,14 @@ panel_domain() {
 	APP_DOMAIN=$PANEL_DOMAIN
 }
 
+# save_git_slug — из какого репозитория публикуется приложение: app-remove.sh удаляет его копию в
+# /var/lib/airlok/git, только если она больше никому не нужна.
+save_git_slug() {
+	local slug=${AIRLOK_GIT_SLUG:-}
+	[[ $slug =~ ^[A-Za-z0-9_][A-Za-z0-9_.~-]*$ && $slug != *..* ]] || return 0
+	printf '%s\n' "$slug" >"$APP_DIR/shared/git.slug"
+}
+
 # save_panel_domain — запомнить домен, который прислал агент; выкатка руками его не меняет.
 save_panel_domain() {
 	[[ -n ${AIRLOK_APP_DOMAIN+set} ]] || return 0
@@ -1309,6 +1384,9 @@ main() {
 		[[ -n $APP_NAME ]] || APP_NAME=$(default_name "$src")
 	fi
 	APP_DIR=$APPS_ROOT/$APP_NAME
+	PUBLISH_UNIT=airlok-publish-$APP_NAME
+	# Публикация идёт своей службой systemd: остановка агента её не обрывает посреди смены версии.
+	detach "$PUBLISH_UNIT" job_finishing "$RECIPES_DIR/app-deploy.sh" "$src" || true
 	local name=$APP_NAME
 	if [[ -f $APP_DIR/compose.yml ]] && ! grep -q '^    image: airlok-' "$APP_DIR/compose.yml"; then
 		export AIRLOK_KEEP_BUILD=1
@@ -1333,7 +1411,10 @@ main() {
 	flock -n 8 || die "публикация ${APP_NAME} уже идёт"
 	STARTED=$SECONDS
 	RELEASE=""
+	INTERRUPTED=0
 	trap 'deploy_finished $?' EXIT
+	trap on_term TERM INT HUP
+	job_phase "$PUBLISH_UNIT" build
 
 	# До сборки: занятый домен выяснится за секунду, а не после нескольких минут npm.
 	[[ $APP_KIND == web ]] && ensure_domain_free
@@ -1341,6 +1422,7 @@ main() {
 	ensure_users
 	layout
 	save_panel_domain
+	save_git_slug
 	[[ $APP_KIND == web ]] && allocate_port
 	secrets
 	base_images

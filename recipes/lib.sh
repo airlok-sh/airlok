@@ -313,6 +313,72 @@ nginx_lock() {
 
 nginx_unlock() { exec 6>&-; }
 
+# Рецепты, которые нельзя обрывать посередине, идут отдельной службой systemd (detach). Здесь — что
+# такая служба оставляет агенту: ИМЯ.phase — начат ли шаг, который надо довести до конца, и
+# ИМЯ.outcome — итог (success, failed или interrupted, со второй строки — сообщение).
+JOBS_DIR=/run/airlok-jobs
+
+# detach СЛУЖБА ДОВЕСТИ КОМАНДА… — выполнить рецепт службой systemd СЛУЖБА и дождаться её. Остановка
+# службы агента шлёт TERM всем процессам её cgroup, в том числе docker compose посреди пересоздания
+# контейнера: старый уже остановлен, новый не создан, и сайт лежит до следующей публикации. Отдельная
+# служба этот TERM не получает. Ожидание прервали — служба останавливается, если только ДОВЕСТИ (имя
+# функции) не говорит, что начат шаг, который надо закончить. Вывод службы идёт туда же, куда вывод
+# рецепта. Без systemd возвращает 1, и рецепт идёт как раньше, в этом же процессе.
+detach() {
+	local unit=$1 keep=$2 name client rc env=(--setenv=AIRLOK_DETACHED=1) empty=()
+	shift 2
+	[[ -z ${AIRLOK_DETACHED:-} && -d /run/systemd/system ]] && command -v systemd-run >/dev/null || return 1
+	systemctl is-active --quiet "$unit" && die "${unit} ещё не закончил прошлую работу — запустите ещё раз через пару минут"
+	# Окружение службы видно любому пользователю сервера (systemctl show): только наше и без токенов.
+	for name in HOME LANG ${!AIRLOK_@}; do
+		case $name in AIRLOK_GITHUB_TOKEN | AIRLOK_GIT_AUTH | AIRLOK_DETACHED) continue ;; esac
+		[[ -n ${!name+set} ]] || continue
+		if [[ -n ${!name} ]]; then
+			env+=("--setenv=${name}=${!name}")
+		else
+			empty+=("$name")
+		fi
+	done
+	# Пустое значение systemd службе не передаёт, а «задана пустой» и «не задана» для рецепта — разное:
+	# пустой AIRLOK_APP_DOMAIN значит, что свой домен в дашборде убрали.
+	((${#empty[@]} == 0)) || env+=("--setenv=AIRLOK_EMPTY=$(IFS=,; echo "${empty[*]}")")
+	install -d -m 700 "$JOBS_DIR"
+	rm -f "$JOBS_DIR/${unit}.phase" "$JOBS_DIR/${unit}.outcome"
+	# Чья это служба: итог прошлой публикации или публикации из очереди webhook агент своим не засчитает.
+	printf '%s\n' "${AIRLOK_JOB_ID:-}" >"$JOBS_DIR/${unit}.owner"
+	# RuntimeMaxSec — страховка: ожидающего рецепт агент обрывает по таймауту, а служба сама не кончилась бы.
+	systemd-run --pipe --wait --collect --quiet --unit="$unit" --property=RuntimeMaxSec=7200 "${env[@]}" -- "$@" &
+	client=$!
+	# shellcheck disable=SC2064 # имена известны сейчас
+	trap "\"$keep\" '$unit' || systemctl stop --no-block '$unit' 2>/dev/null; exit 143" TERM INT HUP
+	wait "$client" && rc=0 || rc=$?
+	exit "$rc"
+}
+
+# Переменные, которые detach передал пустыми.
+if [[ -n ${AIRLOK_EMPTY:-} ]]; then
+	for _name in ${AIRLOK_EMPTY//,/ }; do
+		[[ $_name =~ ^AIRLOK_[A-Z0-9_]+$ ]] && export "$_name="
+	done
+	unset _name AIRLOK_EMPTY
+fi
+
+# job_phase СЛУЖБА ШАГ — отметить шаг рецепта, идущего службой detach; без неё — ничего.
+job_phase() {
+	[[ -n ${AIRLOK_DETACHED:-} ]] || return 0
+	printf '%s\n' "$2" >"$JOBS_DIR/$1.phase" 2>/dev/null || true
+}
+
+# job_outcome СЛУЖБА СТАТУС [СООБЩЕНИЕ] — итог рецепта для агента, который мог перезапуститься, пока служба работала.
+job_outcome() {
+	[[ -n ${AIRLOK_DETACHED:-} ]] || return 0
+	printf '%s\n%s\n' "$2" "${3:-}" >"$JOBS_DIR/$1.outcome" 2>/dev/null || true
+	rm -f "$JOBS_DIR/$1.phase"
+}
+
+# job_finishing СЛУЖБА — начат шаг, который надо довести до конца.
+job_finishing() { [[ $(cat "$JOBS_DIR/$1.phase" 2>/dev/null) == finish ]]; }
+
 # Формат логов nginx для метрик: время, код, длительность, размер ответа, метод, путь и
 # время ответа приложения — в $request_time входят ещё приём тела запроса и отдача ответа
 # медленному клиенту. Без IP и query-строки, а путь metrics.py отправляет в дашборд только

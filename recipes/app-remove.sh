@@ -88,6 +88,29 @@ remove_site() {
 		fi
 	fi
 	nginx_unlock
+	# Журналы — после reload: до него nginx писал бы в них дальше. По ним metrics.py находит приложения
+	# сервера, и убранное снова появилось бы в дашборде. Ротированные копии — туда же.
+	rm -f "/var/log/nginx/airlok-${NAME}.access.log"* "/var/log/nginx/airlok-${NAME}.visits.log"* \
+		"/var/log/nginx/airlok-${NAME}.speed.log"*
+}
+
+# remove_git_cache — копия репозитория, из которого публиковалось приложение (её записал app-deploy.sh в
+# shared/git.slug). Остаётся, если из того же репозитория публикуется другое приложение или он настроен
+# на сервере руками (ключ или webhook в /etc/airlok/github). Приложения, опубликованные до этой отметки,
+# своего репозитория не помнят — их копию не трогаем.
+remove_git_cache() {
+	local slug other
+	slug=$(cat "$APP_DIR/shared/git.slug" 2>/dev/null) || return 0
+	[[ $slug =~ ^[A-Za-z0-9_][A-Za-z0-9_.~-]*$ && $slug != *..* ]] || return 0
+	for other in "$APPS_ROOT"/*/shared/git.slug; do
+		[[ $other == "$APP_DIR/shared/git.slug" || ! -f $other ]] && continue
+		[[ $(cat "$other" 2>/dev/null) == "$slug" ]] && return 0
+	done
+	[[ -e /etc/airlok/github/$slug ]] && return 0
+	if [[ -d /var/lib/airlok/git/${slug}.git ]]; then
+		rm -rf --one-file-system "/var/lib/airlok/git/${slug}.git"
+		ok "копия репозитория ${slug//__//} удалена"
+	fi
 }
 
 remove_files() {
@@ -135,10 +158,14 @@ main() {
 	((WITH_DATA)) || last_backup
 	stop_containers
 	remove_site
+	remove_git_cache
 	remove_files
-	rm -f "/var/lib/airlok/health/${NAME}"
+	rm -f "/var/lib/airlok/health/${NAME}" "$JOBS_DIR/airlok-publish-${NAME}".* "$JOBS_DIR/airlok-restart-${NAME}".*
 	# Кэш сборки — не данные: без приложения он только занимает диск.
 	rm -rf --one-file-system "/var/lib/airlok/cache/${NAME}" "/var/lib/airlok/cache/${NAME}.used" "/var/lib/airlok/cache/${NAME}.deps"
+
+	# Замок держим мы сами, а следующей публикации под этим именем файл создастся заново.
+	rm -f "/run/airlok-deploy-${NAME}.lock"
 
 	if ((WITH_DATA)); then
 		printf '\n%sГотово:%s приложение %s убрано с сервера вместе с данными\n' "$C_B" "$C_0" "$NAME"

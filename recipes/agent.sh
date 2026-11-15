@@ -71,6 +71,12 @@ LONG_PID="" LONG_APP="" LONG_ID="" LONG_KIND="" LONG_CHILD=""
 # остановки службы 90 секунд (TimeoutStopSec по умолчанию), а итог «прервано» должен успеть лечь в
 # очередь и уйти. На TERM рецепт под timeout из uutils (Ubuntu 26.04) может и не выйти.
 STOP_GRACE=10
+STOP_MESSAGE="прервано: служба агента остановилась (перезапуск агента или сервера). Запустите ещё раз"
+# Быстрая команда, которую выполняет сейчас основной цикл: остановка службы и её не должна оставить без итога.
+CUR_ID="" CUR_KIND="" CUR_APP="" CUR_LOG=""
+# Команды, чей рецепт идёт своей службой systemd (detach в lib.sh) и пережил остановку агента: итог
+# отправит агент после перезапуска, когда служба закончит. Строка — id, вид, служба, журнал.
+RESUME=$STATE_DIR/resume
 # list — опрос со списком быстрых видов, keys — только ключи устройств (дашборд не знает списка),
 # none — посреди долгой команды не опрашиваем вовсе (не знает и этого).
 SIDE_POLL=list SIDE_POLL_AT=0
@@ -386,7 +392,7 @@ send_result() {
 	local id=$1 status=$2 message=$3 log=${4:-} stages=${5:-} title=${6:-} name up
 	# Службу остановили посреди долгой команды: рецепт оборван, и причина не в проекте.
 	if [[ ${LONG_STOP:-} == 1 && $status == failed ]]; then
-		message="прервано: служба агента остановилась (перезапуск агента или сервера). Запустите ещё раз"
+		message=$STOP_MESSAGE
 	fi
 	# TERM от systemd при остановке службы мог оборвать и шаг сохранения, если совпал с концом команды:
 	# второй раз systemd его не шлёт, поэтому оборванный шаг повторяем.
@@ -400,6 +406,7 @@ send_result() {
 		echo "итог команды ${id} (${status}) не удалось сохранить в ${RESULTS_DIR} (кончилось место?), в дашборд он не уйдёт"
 		return
 	fi
+	printf '%s\n' "$id" >>"$RUN_DIR/sent" 2>/dev/null
 	flush_results
 	[[ -e $RESULTS_DIR/${name}.json ]] && echo "итог команды ${id} (${status}) пока не доставлен, дошлём позже"
 	return 0
@@ -416,6 +423,50 @@ result_file() {
 
 results_pending() { compgen -G "$RESULTS_DIR/*.json" >/dev/null; }
 
+# sent_already ID — итог команды уже лёг в очередь: при остановке второй, «прервано», не нужен.
+sent_already() { grep -qxF "$1" "$RUN_DIR/sent" 2>/dev/null; }
+
+# job_pending ID СЛУЖБА — итог команды ID знает её служба, а не остановленный агент: она ещё работает или
+# успела закончить сама, пока агент останавливался, — тогда «прервано» было бы неправдой. Служба другой
+# команды (прошлая публикация, очередь webhook) не в счёт: эта до своей службы не дошла.
+job_pending() {
+	[[ -n $1 && $(cat "$JOBS_DIR/$2.owner" 2>/dev/null) == "$1" ]] || return 1
+	systemctl is-active --quiet "$2" 2>/dev/null ||
+		[[ $(sed -n 1p "$JOBS_DIR/$2.outcome" 2>/dev/null) =~ ^(success|failed)$ ]]
+}
+
+# resume_later ID ВИД СЛУЖБА ЖУРНАЛ — итог отправит агент после перезапуска (resume_jobs).
+resume_later() {
+	printf '%s %s %s %s\n' "$@" >>"$RESUME"
+	printf '%s\n' "$1" >>"$RUN_DIR/sent" 2>/dev/null
+	echo "команда ${1}: итог у службы ${3}, он придёт после перезапуска агента"
+}
+
+# resume_jobs — агент запустился, а команды, пережившие его остановку, без итога: дождаться их служб и
+# отправить настоящий итог. Служба кончилась, не оставив итога, — её оборвали.
+resume_jobs() {
+	[[ -s $RESUME ]] || return 0
+	local id kind unit log status outcome stages title limit
+	while read -r id kind unit log; do
+		[[ $id =~ ^[0-9a-fA-F-]{36}$ && $unit =~ ^airlok-(publish|restart)-[a-z][a-z0-9-]{1,30}$ ]] || continue
+		echo "команда ${id}: ждём, пока ${unit} закончит"
+		limit=$((SECONDS + DEPLOY_TIMEOUT))
+		while systemctl is-active --quiet "$unit" && ((SECONDS < limit)); do
+			sleep 2
+		done
+		outcome=$JOBS_DIR/${unit}.outcome
+		status=$(sed -n 1p "$outcome" 2>/dev/null)
+		stages="" title=""
+		[[ $kind == deploy ]] && stages=$STATE_DIR/command.stages title=$STATE_DIR/command.title
+		case $status in
+		success) CMD_KIND=$kind send_result "$id" success "" "$log" "$stages" "$title" ;;
+		failed) CMD_KIND=$kind send_result "$id" failed "" "$log" "$stages" "$title" ;;
+		*) CMD_KIND=$kind send_result "$id" failed "$STOP_MESSAGE" "$log" "$stages" "$title" ;;
+		esac
+		rm -f "$outcome"
+	done <"$RESUME"
+	rm -f "$RESUME"
+}
 # uptime_cs — сотые секунды с загрузки.
 uptime_cs() {
 	local up
@@ -562,7 +613,7 @@ run_deploy() {
 	stream_progress "$id" "$log" "$stages" &
 	streamer=$!
 	# Токен — только в окружении дочернего процесса: в аргументах его было бы видно в ps.
-	AIRLOK_GITHUB_TOKEN=$token AIRLOK_GITHUB_PUBLIC=$public AIRLOK_GIT_AUTH=$git_auth AIRLOK_FETCH_REF=$ref \
+	AIRLOK_JOB_ID=$id AIRLOK_GITHUB_TOKEN=$token AIRLOK_GITHUB_PUBLIC=$public AIRLOK_GIT_AUTH=$git_auth AIRLOK_FETCH_REF=$ref \
 		AIRLOK_ROOT_DIR=$root AIRLOK_APP_NAME=$app AIRLOK_STAGE_FILE=$stages AIRLOK_BUILD_OUTPUT=1 \
 		AIRLOK_PANEL_ENV=$panel AIRLOK_APP_DOMAIN=$domain AIRLOK_TITLE_FILE=$subject \
 		timeout --kill-after=60 "$DEPLOY_TIMEOUT" "$RECIPES_DIR/github-deploy.sh" deploy "$repo" "$sha" \
@@ -574,6 +625,11 @@ run_deploy() {
 	rm -f "$RUN_DIR/progress.json" "$PANEL_ENV"
 	if ((rc == 124 || rc == 137)); then
 		message="публикация не уложилась в $((DEPLOY_TIMEOUT / 60)) минут и была остановлена"
+	fi
+	# Службу агента остановили, когда публикация уже меняла версию: её служба доводит дело до конца.
+	if [[ ${LONG_STOP:-} == 1 ]] && job_pending "$id" "airlok-publish-${app}"; then
+		resume_later "$id" deploy "airlok-publish-${app}" "$log"
+		return
 	fi
 	if ((rc == 0)); then
 		send_result "$id" success "$message" "$log" "$stages" "$subject"
@@ -598,7 +654,7 @@ run_restart() {
 	fi
 	rm -f "$ENV_JSON" "$ENV_ERR"
 	install -m 600 /dev/null "$log"
-	AIRLOK_PANEL_ENV=$panel timeout --kill-after=30 "$RESTART_TIMEOUT" "$RECIPES_DIR/app-restart.sh" "$app" \
+	AIRLOK_JOB_ID=$id AIRLOK_PANEL_ENV=$panel timeout --kill-after=30 "$RESTART_TIMEOUT" "$RECIPES_DIR/app-restart.sh" "$app" \
 		</dev/null >"$log" 2>&1
 	rc=$?
 	rm -f "$PANEL_ENV"
@@ -963,8 +1019,12 @@ recipe_wait() {
 		rc=$?
 		if ((rc > 128)) && kill -0 "$LONG_CHILD" 2>/dev/null; then
 			if [[ ${LONG_STOP:-} == 1 && -z $killer ]]; then
+				# sleep — в фоне со своим trap: kill этой подоболочки иначе оставил бы его висеть в cgroup службы.
 				(
-					sleep "$STOP_GRACE"
+					trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
+					sleep "$STOP_GRACE" &
+					sleeper=$!
+					wait "$sleeper"
 					stop_recipe KILL "$1"
 				) 2>/dev/null &
 				killer=$!
@@ -998,10 +1058,34 @@ stop_agent() {
 			sleep 0.2
 		done
 	fi
-	if [[ -n $LONG_ID ]] && ! compgen -G "$RESULTS_DIR/*-${LONG_ID}-*.json" >/dev/null; then
-		LONG_STOP=1 CMD_KIND=$LONG_KIND send_result "$LONG_ID" failed ""
+	if [[ -n $LONG_ID ]] && ! sent_already "$LONG_ID"; then
+		if [[ $LONG_KIND == deploy ]] && job_pending "$LONG_ID" "airlok-publish-${LONG_APP}"; then
+			resume_later "$LONG_ID" deploy "airlok-publish-${LONG_APP}" "$STATE_DIR/command.log"
+		else
+			LONG_STOP=1 CMD_KIND=$LONG_KIND send_result "$LONG_ID" failed ""
+		fi
 	fi
+	stop_current
 	exit 0
+}
+
+# stop_current — итог быстрой команды, которую основной цикл выполнял в миг остановки: TERM оборвал её
+# рецепт, а до своего send_result она уже не дойдёт. Обновление системы и перезагрузку доводит
+# resume_os_job, перезапуск приложения, который идёт своей службой, — resume_jobs.
+stop_current() {
+	[[ -n $CUR_ID ]] && ! sent_already "$CUR_ID" || return 0
+	case $CUR_KIND in
+	os_upgrade) ;;
+	db_query) refuse "$CUR_ID" db_query "$STOP_MESSAGE" ;;
+	restart)
+		if job_pending "$CUR_ID" "airlok-restart-${CUR_APP}"; then
+			resume_later "$CUR_ID" restart "airlok-restart-${CUR_APP}" "$CUR_LOG"
+		else
+			LONG_STOP=1 CMD_KIND=$CUR_KIND send_result "$CUR_ID" failed "" "$CUR_LOG"
+		fi
+		;;
+	*) LONG_STOP=1 CMD_KIND=$CUR_KIND send_result "$CUR_ID" failed "" "$CUR_LOG" ;;
+	esac
 }
 
 handle() {
@@ -1054,6 +1138,12 @@ handle() {
 		results_flusher &
 		flusher=$!
 	fi
+	# Ключи, принятые посреди закрытия пароля, — вложенный handle: текущей остаётся внешняя команда.
+	local own=0
+	if [[ -z $CUR_ID && ${f[2]} != deploy && ${f[2]} != data_move ]]; then
+		CUR_ID=${f[1]} CUR_KIND=${f[2]} CUR_APP=$app CUR_LOG=$CMD_LOG own=1
+		sent_trim
+	fi
 	case ${f[2]:-} in
 	update) run_update "${f[1]}" "${f[3]:-}" ;;
 	restart) run_restart "${f[1]}" "${f[3]}" "${f[4]}" ;;
@@ -1075,7 +1165,15 @@ handle() {
 		kill "$flusher" 2>/dev/null
 		wait "$flusher" 2>/dev/null
 	fi
+	((own)) && CUR_ID="" CUR_KIND="" CUR_APP="" CUR_LOG=""
 	return 0
+}
+
+# sent_trim — список отправленных итогов нужен только для идущих команд: не даём ему расти.
+sent_trim() {
+	local list=$RUN_DIR/sent
+	[[ -f $list ]] && (($(wc -l <"$list") > 200)) || return 0
+	tail -n 50 "$list" >"$list.tmp" && mv -f "$list.tmp" "$list"
 }
 
 # side_poll — опрос, пока идёт долгая команда или не доставлен итог выкатки: только быстрые команды и без
@@ -1195,6 +1293,7 @@ main() {
 		echo "не удалось создать ключ ${ENV_KEY}: переменные из дашборда не расшифровать"
 	fi
 	[[ -r $DASHBOARD_CONF ]] && resume_os_job
+	[[ -r $DASHBOARD_CONF ]] && resume_jobs
 	while :; do
 		poll_once
 	done

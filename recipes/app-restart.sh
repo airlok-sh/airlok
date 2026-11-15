@@ -37,19 +37,34 @@ wait_started() {
 	return 1
 }
 
+# restart_finished КОД — итог для агента, если тот перезапустился, пока шёл перезапуск приложения.
+restart_finished() {
+	if (($1 == 0)); then
+		job_outcome "$RESTART_UNIT" success
+	else
+		job_outcome "$RESTART_UNIT" failed "${DIE_MSG:-}"
+	fi
+}
+
 main() {
 	need_root
 	local name=${1:-} port="" path release where
 	[[ $name =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "некорректное имя приложения: ${name}"
 	APP_DIR=$APPS_ROOT/$name
 	[[ -f $APP_DIR/compose.yml && -L $APP_DIR/current ]] || die "приложение ${name} на этом сервере ещё не публиковали"
+	# Своей службой systemd: остановка агента между остановкой старого контейнера и запуском нового
+	# оставила бы приложение лежать. Перезапуск короткий, и его всегда доводим до конца.
+	RESTART_UNIT=airlok-restart-$name
+	detach "$RESTART_UNIT" true "$RECIPES_DIR/app-restart.sh" "$name" || true
 
 	# Та же блокировка, что у выкатки: перезапуск не пересечётся с ней, а проверка
 	# доступности не примет его за простой.
 	exec 8>"/run/airlok-deploy-${name}.lock"
 	flock -w 60 8 || die "у ${name} идёт публикация: перезапустите после неё"
+	trap 'restart_finished $?' EXIT
 
-	if [[ -n ${AIRLOK_PANEL_ENV:-} ]]; then
+	# Файла может уже не быть: агент остановился, пока служба перезапуска ждала замка.
+	if [[ -n ${AIRLOK_PANEL_ENV:-} && -r $AIRLOK_PANEL_ENV ]]; then
 		write_if_changed "$APP_DIR/shared/panel.env" 0600 <"$AIRLOK_PANEL_ENV" || true
 		ok "переменные из дашборда записаны"
 	fi

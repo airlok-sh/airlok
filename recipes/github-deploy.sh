@@ -193,6 +193,9 @@ deploy() {
 	HANDED_OFF=0
 	SRC=""
 	trap 'deploy_trap $?' EXIT
+	# Без этого bash, убитый сигналом при остановке агента, до EXIT не доходит и оставляет каталог
+	# исходников. Об итоге сообщит агент: своё «не началась» здесь было бы лишним.
+	trap 'HANDED_OFF=1; exit 143' TERM INT HUP
 	[[ -z $branch || $branch =~ $REF_RE ]] || die "некорректное имя ветки: ${branch}"
 	# Тот же формат, что проверяют дашборд и агент: сегменты через /, каждый не с точки
 	# и не с дефиса — так отсекаются «..» и скрытые каталоги.
@@ -237,7 +240,7 @@ deploy() {
 	# Дальше код уже на диске: сборке и приложению токен не нужен.
 	unset AIRLOK_GITHUB_TOKEN AIRLOK_GIT_AUTH GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1
 	HANDED_OFF=1
-	AIRLOK_RELEASE_ID=${SHA:0:12} AIRLOK_RELEASE_TITLE=$subject "$RECIPES_DIR/app-deploy.sh" "$src"
+	AIRLOK_RELEASE_ID=${SHA:0:12} AIRLOK_RELEASE_TITLE=$subject AIRLOK_GIT_SLUG=$SLUG "$RECIPES_DIR/app-deploy.sh" "$src"
 }
 
 log() {

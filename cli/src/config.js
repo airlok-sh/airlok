@@ -56,6 +56,22 @@ export async function readLink(dir) {
   return link?.app_id ? link : null
 }
 
+// Сайт без входа той же папки: его токен обновляет сайт, пока тот жив, и ведёт по ссылке «забрать себе».
+export const temporaryPath = (dir) => join(dir, '.airlok', 'temporary.json')
+
+export async function readTemporary(dir) {
+  const t = await readJSON(temporaryPath(dir)).catch(() => null)
+  return t?.token && t?.expires_at ? t : null
+}
+
+export async function saveTemporary(dir, site) {
+  const path = temporaryPath(dir)
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, JSON.stringify(site, null, 2) + '\n', { mode: 0o600 })
+  await writeFile(join(dirname(path), '.gitignore'), '*\n')
+  return path
+}
+
 export async function saveLink(dir, link) {
   const path = linkPath(dir)
   await mkdir(dirname(path), { recursive: true })

@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline/promises'
 import { parseArgs, promisify } from 'node:util'
 
 import { Api, ApiError } from './api.js'
-import { forgetSession, readLink, savedLogin, saveLink, saveSession, session } from './config.js'
+import { forgetSession, readLink, readTemporary, savedLogin, saveLink, saveSession, saveTemporary, session } from './config.js'
 import { formatReport, normalize } from './check.js'
 import { DeviceError, deviceCommand } from './device.js'
 import { DomainError, domainCommand } from './domain.js'
@@ -43,6 +43,7 @@ const help = `Airlok — публикация проекта на хостинг
 Для deploy:
   --app <имя>       опубликовать в существующее приложение
   --new <имя>       создать приложение с этим именем и опубликовать
+  --temporary       без входа: статический сайт на час по случайному адресу; ссылка «забрать себе» — в выводе
   --title <текст>   название публикации (по умолчанию — последний коммит)
   --no-wait         не ждать конца сборки
   --include-data    взять и файлы баз и выгрузок (*.db, *.sqlite, dump.sql, credentials.json…): без флага CLI спросит или пропустит их
@@ -205,7 +206,7 @@ export async function main(argv, io = makeIO(), env = process.env, sys = system)
         from: { type: 'string' }, 'allow-empty': { type: 'boolean' }, name: { type: 'string' }, port: { type: 'string' }, email: { type: 'string' },
         letsencrypt: { type: 'boolean' }, 'ssh-keys-only': { type: 'boolean' }, key: { type: 'string' }, server: { type: 'string' },
         'no-wait': { type: 'boolean' }, 'include-data': { type: 'boolean' }, json: { type: 'boolean' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
-        'keep-token': { type: 'boolean' }, force: { type: 'boolean' },
+        'keep-token': { type: 'boolean' }, force: { type: 'boolean' }, temporary: { type: 'boolean' },
       },
     })
   } catch (err) {
@@ -485,6 +486,7 @@ export async function agentToken(api, client, io) {
 async function deploy(target, opts, io, env) {
   const dir = resolve(target)
   if (!(await stat(dir).catch(() => null))?.isDirectory()) throw new UserError(`Нет такой папки: ${dir}`)
+  if (opts.temporary) return deployTemporary(dir, opts, io, env)
   let s = await session(env)
   if (!s.token) {
     if (!io.interactive) throw new UserError('Вы не вошли: npx @airlok/cli login (или задайте AIRLOK_TOKEN)')
@@ -534,6 +536,59 @@ async function deploy(target, opts, io, env) {
   if (opts.json && tail.length > 1) io.err(`\nКонец лога:\n${tail.map((l) => `  ${l}`).join('\n')}`)
   io.err(`\nПолный лог: ${s.url}/apps/${app.id}?tab=deploys`)
   return 1
+}
+
+// TEMPORARY_FRESH_MS — сайт, которому осталось меньше, не обновляем, а публикуем заново: иначе он
+// пропал бы почти сразу после публикации.
+const TEMPORARY_FRESH_MS = 5 * 60_000
+
+// deployTemporary публикует папку без входа: статический сайт живёт час по случайному адресу, а по
+// ссылке его забирают в свой аккаунт. Повторный запуск в той же папке обновляет тот же сайт, пока он жив.
+async function deployTemporary(dir, opts, io, env) {
+  if (opts.app || opts.new) throw new UserError('--temporary публикует без входа на случайный адрес: --app и --new с ним не указывают.')
+  const s = await session(env)
+  const { files, excluded, git } = await projectFiles(dir, opts, io, env)
+  io.err(`Упаковываю ${files.length} ${plural(files.length, 'файл', 'файла', 'файлов')}…`)
+  const archive = await pack(dir, files, { gitignore: git })
+  const title = opts.title || (await gitTitle(dir)) || `Папка ${basename(dir)}`
+
+  let site = await readTemporary(dir)
+  let cmd
+  if (site && Date.parse(site.expires_at) - Date.now() > TEMPORARY_FRESH_MS) {
+    io.err(`Обновляю сайт без входа ${site.app}…`)
+    try {
+      cmd = (await new Api(s.url, site.token).updateTemporary(archive, title)).command
+    } catch (err) {
+      if (!(err instanceof ApiError) || err.status !== 404) throw err
+      cmd = undefined // срок вышел раньше, чем думал CLI: публикуем заново
+    }
+  }
+  if (!cmd) {
+    io.err(`Загружаю ${mb(archive.length)} без входа…`)
+    const res = await new Api(s.url).createTemporary(archive, title)
+    site = { app: res.app, url: res.url, token: res.token, claim_url: s.url + res.claim_path, expires_at: res.expires_at }
+    await saveTemporary(dir, site)
+    cmd = res.command
+  }
+  const api = new Api(s.url, site.token)
+  const until = new Date(site.expires_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+  const out = { app: site.app, url: site.url, claim_url: site.claim_url, expires_at: site.expires_at, excluded, temporary: true }
+  if (opts['no-wait']) {
+    if (opts.json) io.out(JSON.stringify({ status: cmd.status, command_id: cmd.id, ...out }))
+    else io.err(`Публикация поставлена в очередь. Сайт: ${site.url}\nЗабрать его в свой аккаунт: ${site.claim_url}`)
+    return 0
+  }
+  const result = await follow(api, cmd.id, io, !opts.json, (id) => api.temporaryCommand(id))
+  const failedStage = result.status === 'failed' ? result.stages?.find((st) => st.status === 'failed')?.key : undefined
+  if (opts.json) io.out(JSON.stringify({ status: result.status, command_id: cmd.id, message: result.message, failed_stage: failedStage, ...out }))
+  if (result.status !== 'success') {
+    io.err(`\n✗ ${result.message || 'Сборка не удалась'}`)
+    return 1
+  }
+  io.err(`\n✓ Опубликовано без входа: ${site.url}`)
+  io.err(`Сайт временный и удалится в ${until}. Чтобы оставить его себе, откройте ссылку и войдите:\n${site.claim_url}`)
+  if (!opts.json) io.out(site.url)
+  return 0
 }
 
 // check упаковывает папку так же, как deploy, и печатает отчёт дашборда. Код 1 — выкатка не пройдёт.
@@ -652,13 +707,14 @@ async function create(api, name) {
 }
 
 // follow печатает ход сборки, пока она не закончится: этапы и, если withLog, новые строки лога.
-async function follow(api, id, io, withLog) {
+// get — откуда брать выкатку: у сайта без входа свой адрес и его токен.
+async function follow(api, id, io, withLog, get = (id) => api.command(id)) {
   const seen = new Map()
   let queued = false
   let shown = ''
   const deadline = Date.now() + FOLLOW_LIMIT_MS
   for (;;) {
-    const cmd = await api.command(id)
+    const cmd = await get(id)
     if (cmd.status === 'queued' && !queued) {
       queued = true
       io.err('Ждём сборщика…')

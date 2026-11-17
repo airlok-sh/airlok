@@ -77,7 +77,7 @@ test('logUpdate prints only new whole lines while the log window slides', () => 
 // fakeDashboard — сервер с API для CLI: вход подтверждается со второго опроса, сборка
 // проходит этапы и завершается успехом.
 async function fakeDashboard() {
-  const state = { polls: 0, created: [], archive: null, title: '', commandPolls: 0 }
+  const state = { polls: 0, created: [], archive: null, title: '', commandPolls: 0, temporary: [], tempUntil: new Date(Date.now() + 3600_000).toISOString() }
   const app = { id: 'a1', name: 'shop', domain: 'shop.airlok.site', hosted: true }
   const server = createServer(async (req, res) => {
     const chunks = []
@@ -89,6 +89,20 @@ async function fakeDashboard() {
       res.end(data === undefined ? '' : JSON.stringify(data))
     }
     const authed = req.headers.authorization === 'Bearer airlok_pat_test'
+    // Сайт без входа: создать можно без токена, обновить и следить — только токеном самого сайта.
+    const site = { app: 'tmp-k3f9qz', url: 'https://tmp-k3f9qz.airlok.site', expires_at: state.tempUntil }
+    if (url.pathname === '/api/cli/v1/temporary') {
+      state.temporary.push({ method: req.method, auth: req.headers.authorization ?? '', title: url.searchParams.get('title') })
+      if (req.method === 'POST') return send(201, { ...site, token: 'tmp_token', claim_path: '/claim/tmp_token', command: { id: 't1', status: 'queued' } })
+      if (req.headers.authorization !== 'Bearer tmp_token') return send(404, { error: { code: 'temporary_not_found', message: 'нет' } })
+      return send(202, { ...site, command: { id: 't2', status: 'queued' } })
+    }
+    if (url.pathname.startsWith('/api/cli/v1/temporary/commands/')) {
+      if (req.headers.authorization !== 'Bearer tmp_token') return send(404, { error: { code: 'temporary_not_found', message: 'нет' } })
+      const at = '2026-11-17T10:00:00Z'
+      return send(200, { id: url.pathname.split('/').pop(), status: 'success', started_at: at, finished_at: '2026-11-17T10:00:09Z',
+        stages: [{ key: 'source', status: 'done', started_at: at, finished_at: at }] })
+    }
     if (req.method === 'POST' && url.pathname === '/api/cli/v1/login') {
       return send(201, { device_code: 'dev', user_code: 'BCDF-GHJK', url: `${state.base}/cli?code=BCDF-GHJK`, expires_in: 60, interval: 0 })
     }
@@ -238,6 +252,36 @@ test('projectFiles takes data files only with consent and refuses the home folde
 
   await assert.rejects(projectFiles(dir, {}, captureIO(), { HOME: dir }), /домашняя/)
   await assert.rejects(projectFiles(join(dir, '..'), {}, captureIO(), { HOME: dir }), /домашняя/)
+})
+
+test('deploy --temporary publishes without login and then updates the same site', { timeout: 30_000 }, async (t) => {
+  const dash = await fakeDashboard()
+  t.after(dash.close)
+  const home = await mkdtemp(join(tmpdir(), 'airlok-home-'))
+  const env = { XDG_CONFIG_HOME: home, AIRLOK_URL: dash.state.base }
+  const dir = await mkdtemp(join(tmpdir(), 'airlok-temp-'))
+  await writeFile(join(dir, 'index.html'), '<h1>hi</h1>')
+
+  const first = captureIO()
+  assert.equal(await main(['deploy', dir, '--temporary', '--json'], first, env), 0, first.errLines.join('\n'))
+  const out = JSON.parse(first.outLines.at(-1))
+  assert.equal(out.status, 'success')
+  assert.equal(out.url, 'https://tmp-k3f9qz.airlok.site')
+  assert.equal(out.claim_url, `${dash.state.base}/claim/tmp_token`)
+  assert.equal(out.temporary, true)
+  assert.deepEqual(dash.state.temporary[0], { method: 'POST', auth: '', title: `Папка ${dir.split('/').pop()}` }, 'без входа — без токена')
+  const saved = JSON.parse(await readFile(join(dir, '.airlok', 'temporary.json'), 'utf8'))
+  assert.equal(saved.token, 'tmp_token')
+  assert.equal((await stat(join(dir, '.airlok', 'temporary.json'))).mode & 0o777, 0o600, 'токен сайта читает только владелец')
+
+  const again = captureIO()
+  assert.equal(await main(['deploy', dir, '--temporary'], again, env), 0)
+  assert.deepEqual(dash.state.temporary[1], { method: 'PUT', auth: 'Bearer tmp_token', title: `Папка ${dir.split('/').pop()}` }, 'тот же сайт обновляется его токеном')
+  assert.deepEqual(again.outLines, ['https://tmp-k3f9qz.airlok.site'])
+  assert.match(again.errLines.join('\n'), /Чтобы оставить его себе, откройте ссылку и войдите:\n.*\/claim\/tmp_token/)
+
+  const both = captureIO()
+  assert.equal(await main(['deploy', dir, '--temporary', '--app', 'shop'], both, env), 1)
 })
 
 test('deploy --new creates no app for a folder it cannot publish', { timeout: 30_000 }, async (t) => {

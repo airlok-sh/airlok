@@ -177,4 +177,20 @@ export class Api {
   command(id) {
     return this.request('GET', `/api/cli/v1/commands/${encodeURIComponent(id)}`).then((r) => r.data)
   }
+
+  // createTemporary публикует без входа: Api без токена, в ответе — токен сайта и ссылка «забрать себе».
+  createTemporary(archive, title) {
+    const q = new URLSearchParams({ title })
+    return this.request('POST', `/api/cli/v1/temporary?${q}`, archive, { raw: true }).then((r) => r.data)
+  }
+
+  // updateTemporary обновляет сайт без входа: токен — токен этого сайта, а не вход CLI.
+  updateTemporary(archive, title) {
+    const q = new URLSearchParams({ title })
+    return this.request('PUT', `/api/cli/v1/temporary?${q}`, archive, { raw: true }).then((r) => r.data)
+  }
+
+  temporaryCommand(id) {
+    return this.request('GET', `/api/cli/v1/temporary/commands/${encodeURIComponent(id)}`).then((r) => r.data)
+  }
 }

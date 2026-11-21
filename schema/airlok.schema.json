@@ -81,7 +81,7 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "enabled": { "type": "boolean", "description": "Только для своего сервера: постоянная папка /data, путь — в переменной DATA_DIR. Для файлов, которые нельзя перенести в PostgreSQL, например SQLite. На хостинге публикация остановится." }
+            "enabled": { "type": "boolean", "description": "Постоянная папка /data, путь — в переменной DATA_DIR. Для файлов, которые нельзя перенести в PostgreSQL, например SQLite. Копируется вместе с базой. На хостинге размер — по тарифу, от 100 МБ до 5 ГБ." }
           }
         },
         "uploads": {

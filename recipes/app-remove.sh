@@ -162,7 +162,9 @@ main() {
 	remove_files
 	rm -f "/var/lib/airlok/health/${NAME}" "$JOBS_DIR/airlok-publish-${NAME}".* "$JOBS_DIR/airlok-restart-${NAME}".*
 	# Кэш сборки — не данные: без приложения он только занимает диск.
-	rm -rf --one-file-system "/var/lib/airlok/cache/${NAME}" "/var/lib/airlok/cache/${NAME}.used" "/var/lib/airlok/cache/${NAME}.deps"
+	rm -rf --one-file-system "/var/lib/airlok/cache/${NAME}" "/var/lib/airlok/cache/${NAME}.used" "/var/lib/airlok/cache/${NAME}.deps" \
+		"/var/lib/airlok/cache/${NAME}.modules" "/var/lib/airlok/cache/${NAME}.modules.key" "/var/lib/airlok/cache/${NAME}.modules.tmp" \
+		"/var/lib/airlok/images/app-${NAME}.pull" "/var/lib/airlok/images/app-${NAME}.pull.failed"
 
 	# Замок держим мы сами, а следующей публикации под этим именем файл создастся заново.
 	rm -f "/run/airlok-deploy-${NAME}.lock"

@@ -6,7 +6,10 @@
 
     detect.py static-output КАТАЛОГ [ВЫХОД] [built]  — где после сборки лежит index.html
     detect.py drop-links КАТАЛОГ                     — убрать ссылки за пределы каталога и перечислить их
+    detect.py reusable-install КАТАЛОГ СТЕК          — можно ли взять зависимости из снимка прошлой сборки
+                                                       и отпечаток того, что ещё влияет на установку
 """
+import hashlib
 import json
 import os
 import re
@@ -65,6 +68,9 @@ def bun_setup(version):
 BUN_SETUP = bun_setup(BUN_VERSION)
 # Сервер, который собирает Nitro (Nuxt, TanStack Start).
 NITRO_SERVER = "node .output/server/index.mjs"
+# Байткод кода проекта: в работающем приложении папка только для чтения, и без него каждый старт
+# компилировал бы весь код заново.
+PY_COMPILE = "/app/.venv/bin/python -m compileall -q -x '/\\.venv/' ."
 
 # Первые слова, перед которыми exec не поставить: синтаксис и встроенные команды оболочки.
 SHELL_KEYWORDS = frozenset((
@@ -583,8 +589,9 @@ def plan_python(root, deps, run_command, plan):
                               "и Gradio, для остального укажите run.command в airlok.yml")
     # Сервер приложений ставим сами, если проект его не указал: без него не запуститься.
     install += [f"{pip} {p}" for p in extra if not has(p)]
-    install.append("/app/.venv/bin/python -m compileall -q -x '/\\.venv/' .")
+    install.append(PY_COMPILE)
     plan["install"] = " && ".join(install)
+    plan["compile"] = PY_COMPILE
     plan["start"] = start
     plan["framework"] = plan["framework"] or "Python"
     return plan
@@ -832,6 +839,175 @@ def drop_outside_links(root):
     return sorted(os.path.relpath(p, root) for p in outside)
 
 
+# Скрипты проекта, которые npm, pnpm, Yarn и Bun запускают при установке. Они могут читать любые
+# файлы проекта, и их результат по файлам зависимостей не предсказать.
+LIFECYCLE_SCRIPTS = ("preinstall", "install", "postinstall", "preprepare", "prepare", "postprepare", "dependencies")
+# Зависимости из папок проекта: их содержимое в отпечаток зависимостей не входит.
+LOCAL_DEP_PREFIXES = ("file:", "link:", "portal:", "workspace:", "patch:")
+# Lock-файлы, которые закрепляют все версии: без них установка каждый раз берёт свежие, а снимок
+# заморозил бы их.
+NODE_LOCKS = ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb")
+# Откуда postinstall @prisma/client генерирует клиент в node_modules/.prisma: схема не входит в
+# файлы зависимостей, и её отпечаток добавляется к ключу снимка.
+PRISMA_FILES = ("schema.prisma", "prisma", "prisma.config.ts", "prisma.config.js", "prisma.config.mjs", "prisma.config.cjs",
+                "prisma.config.mts")
+MAX_EXTRA_FILES = 1000
+# Строки requirements.txt, которые не тянут ничего, кроме пакетов из индекса.
+PIP_OPTIONS = ("-i ", "--index-url", "--extra-index-url", "--trusted-host", "--prefer-binary", "--only-binary", "--no-binary",
+               "--pre")
+PINNED_REQUIREMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[^\]]*\])?\s*===?\s*[^\s*,]+$")
+HASH_OPTION = re.compile(r"--hash[= ]\S+")
+
+
+class NotReusable(Exception):
+    pass
+
+
+def reusable_install(root, stack):
+    """Отпечаток того, что кроме файлов зависимостей и команды установки задаёт её результат ("" —
+    ничего), или None — снимок прошлой сборки проекту не подходит: установка зависит от того, что
+    по файлам зависимостей не предсказать, или берёт свежие версии. Правила — как у сборщика
+    хостинга (internal/builder/snapshot.go)."""
+    try:
+        if stack == "python":
+            return "" if pinned_requirements(root) else None
+        if stack in ("node", "nextjs", "static"):
+            return reusable_node(root)
+    except NotReusable:
+        return None
+    # Go и так берёт модули из кэша без распаковки, а Dockerfile собирает сам Docker.
+    return None
+
+
+def regular_file(root, name):
+    path = os.path.join(root, name)
+    return os.path.isfile(path) and not os.path.islink(path)
+
+
+def pinned_requirements(root):
+    """В requirements.txt все версии закреплены и нет ничего, что читает другие файлы. Без него
+    пакеты выводятся из импортов, без версий."""
+    if not regular_file(root, "requirements.txt"):
+        return False
+    try:
+        with open(os.path.join(root, "requirements.txt"), encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return False
+    for line in text.replace("\r\n", "\n").replace("\\\n", " ").split("\n"):
+        line = HASH_OPTION.sub("", line.split(" #", 1)[0]).strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("-"):
+            # -r, -c, -e и --find-links читают другие файлы и папки.
+            if not line.startswith(PIP_OPTIONS):
+                return False
+        elif not PINNED_REQUIREMENT.match(line.split(";", 1)[0].strip()):
+            return False
+    return True
+
+
+def reusable_node(root):
+    if os.path.lexists(os.path.join(root, "pnpm-workspace.yaml")):
+        raise NotReusable
+    if not any(regular_file(root, name) for name in NODE_LOCKS):
+        raise NotReusable
+    try:
+        with open(os.path.join(root, "package.json"), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        raise NotReusable from None
+    if not isinstance(data, dict) or "workspaces" in data:
+        raise NotReusable
+    scripts = data.get("scripts") or {}
+    if not isinstance(scripts, dict) or any(name in scripts for name in LIFECYCLE_SCRIPTS):
+        raise NotReusable
+    # Правки пакетов из папки проекта (pnpm и Bun) тоже не входят в отпечаток.
+    pnpm = data.get("pnpm")
+    if "patchedDependencies" in data or (isinstance(pnpm, dict) and "patchedDependencies" in pnpm):
+        raise NotReusable
+    deps = [data.get(k) or {} for k in ("dependencies", "devDependencies", "optionalDependencies")]
+    groups = deps + [data.get(k) or {} for k in ("overrides", "resolutions")]
+    if isinstance(pnpm, dict):
+        groups.append(pnpm.get("overrides") or {})
+    if not all(local_deps_free(g) for g in groups):
+        raise NotReusable
+    if not any("@prisma/client" in d or "prisma" in d for d in deps):
+        return ""
+    paths = list(PRISMA_FILES)
+    prisma = data.get("prisma")
+    schema = prisma.get("schema") if isinstance(prisma, dict) else None
+    if schema is not None:
+        if not isinstance(schema, str) or not schema or os.path.isabs(schema):
+            raise NotReusable
+        schema = os.path.normpath(schema)
+        if schema == ".." or schema.startswith("../"):
+            raise NotReusable
+        paths.append(schema)
+    return files_fingerprint(root, paths)
+
+
+def files_fingerprint(root, paths):
+    """Отпечаток обычных файлов paths внутри root (каталоги — целиком). Ссылки не читаются: путь
+    через ссылку — NotReusable, ссылки внутри каталогов пропускаются, как и всё, кроме файлов."""
+    h = hashlib.sha256()
+    count = 0
+    for rel in paths:
+        if rel != "." and any(os.path.islink(os.path.join(root, *rel.split("/")[:i + 1])) for i in range(len(rel.split("/")))):
+            raise NotReusable
+        top = os.path.join(root, rel)
+        if os.path.isdir(top):
+            files = []
+            for folder, dirs, names in os.walk(top, onerror=raise_walk):
+                dirs.sort()
+                files += [os.path.join(folder, n) for n in sorted(names)]
+        elif os.path.lexists(top):
+            files = [top]
+        else:
+            continue
+        for path in files:
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            count += 1
+            if count > MAX_EXTRA_FILES:
+                raise NotReusable
+            try:
+                with open(path, "rb") as f:
+                    body = f.read()
+            except OSError:
+                raise NotReusable from None
+            h.update(f"{os.path.relpath(path, root)}\0{len(body)}\0".encode())
+            h.update(body)
+    return h.hexdigest()
+
+
+def raise_walk(err):
+    raise NotReusable from err
+
+
+def local_deps_free(deps):
+    """В словаре зависимостей (у overrides — вложенном) нет ссылок на папки проекта."""
+    if not isinstance(deps, dict):
+        return False
+    for value in deps.values():
+        if isinstance(value, dict):
+            if not local_deps_free(value):
+                return False
+        elif not isinstance(value, str) or value.startswith(LOCAL_DEP_PREFIXES):
+            return False
+    return True
+
+
+def build_prefix(plan):
+    """Окружение, которое установка оставляет сборке, когда они идут разными запусками контейнера."""
+    parts = []
+    if plan.get("corepack"):
+        parts.append(COREPACK_ENV)
+    if plan.get("bun"):
+        parts.append(f"export PATH={BUN_BIN}:$PATH")
+    return " && ".join(parts)
+
+
 def printable(text):
     return "".join(c if c.isprintable() else "?" for c in text)
 
@@ -850,7 +1026,13 @@ def main():
         except DetectError as e:
             sys.exit(f"Ошибка: {e}")
         return
-    sys.exit("использование: detect.py static-output КАТАЛОГ [ВЫХОД] [built] | drop-links КАТАЛОГ")
+    if len(sys.argv) == 4 and sys.argv[1] == "reusable-install":
+        extra = reusable_install(sys.argv[2], sys.argv[3])
+        if extra is None:
+            sys.exit(1)
+        print(extra)
+        return
+    sys.exit("использование: detect.py static-output КАТАЛОГ [ВЫХОД] [built] | drop-links КАТАЛОГ | reusable-install КАТАЛОГ СТЕК")
 
 
 if __name__ == "__main__":

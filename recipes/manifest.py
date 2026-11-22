@@ -17,7 +17,7 @@ import sys
 import yaml
 
 from cron import CronError, parse_jobs
-from detect import STACKS, DetectError, detect, runtime_warnings, shell_exec, subprojects
+from detect import STACKS, DetectError, build_prefix, detect, runtime_warnings, shell_exec, subprojects
 from dockerfile import DockerfileError, find_source
 
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
@@ -268,6 +268,9 @@ def parse(data, root):
         "APP_BUN": int(plan["bun"]),
         "BUILD_INSTALL": plan["install"],
         "BUILD_CMD": plan["build"],
+        "BUILD_PREFIX": build_prefix(plan),
+        # Шаг установки, который зависит от кода проекта: после снимка зависимостей он идёт отдельно.
+        "BUILD_COMPILE": plan.get("compile", ""),
         "BUILD_OUTPUT": plan["output"],
         "RUN_CMD": shell_exec(plan["start"]) or plan["start"],
         "RELEASE_CMD": release,

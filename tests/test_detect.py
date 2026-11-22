@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "recipes"))
 
 from detect import (BERRY_VERSIONS, BUN_SETUP, COREPACK_ENV, DEFAULT_GO, DEFAULT_NODE, DEFAULT_PYTHON, LATEST_BERRY_LOCK,  # noqa: E402
                     NODE_VERSIONS, NPM_INSTALL, DetectError, Package, berry_install, bun_setup, detect, drop_outside_links,
-                    fits_node, runtime_warnings, shell_exec, static_output)
+                    fits_node, PY_COMPILE, reusable_install, runtime_warnings, shell_exec, static_output)
 from dockerfile import guess_port  # noqa: E402
 from manifest import ManifestError, parse  # noqa: E402
 
@@ -398,6 +398,137 @@ services:
                  ({"ExposedPorts": {"80/tcp": {}, "443/tcp": {}}}, 80)]
         for config, want in cases:
             self.assertEqual(guess_port(config), want, config)
+
+
+class ReusableInstallTest(unittest.TestCase):
+    """Когда node_modules и .venv прошлой сборки годятся следующей: установку задают только файлы
+    зависимостей с закреплёнными версиями (и схема Prisma — её отпечаток идёт в ключ)."""
+
+    def node(self, pkg, extra=None, lock="package-lock.json"):
+        files = {"package.json": json.dumps(pkg), **(extra or {})}
+        if lock:
+            files[lock] = "{}"
+        return reusable_install(project(files), "node")
+
+    def test_node(self):
+        plain = {"scripts": {"build": "vite build", "start": "node server.js", "prestart": "x"},
+                 "dependencies": {"express": "^5", "lodash": "npm:lodash@4"}, "devDependencies": {"vite": "7"},
+                 "overrides": {"foo": {"bar": "1.0.0"}}}
+        self.assertEqual(self.node(plain), "")
+        for stack in ("nextjs", "static"):
+            self.assertEqual(reusable_install(project({"package.json": json.dumps(plain), "yarn.lock": ""}), stack), "", stack)
+        for script in ("preinstall", "install", "postinstall", "preprepare", "prepare", "postprepare", "dependencies"):
+            self.assertIsNone(self.node({**plain, "scripts": {script: "x"}}), script)
+        self.assertIsNone(self.node({**plain, "workspaces": ["packages/*"]}))
+        self.assertIsNone(self.node({**plain, "workspaces": {"packages": []}}))
+        self.assertIsNone(self.node(plain, {"pnpm-workspace.yaml": "packages: []\n"}))
+        for spec in ("file:../lib", "link:./x", "portal:./x", "workspace:*", "patch:left-pad@1#./patches/x.patch"):
+            self.assertIsNone(self.node({"dependencies": {"x": spec}}), spec)
+            self.assertIsNone(self.node({"devDependencies": {"x": spec}}), spec)
+            self.assertIsNone(self.node({"optionalDependencies": {"x": spec}}), spec)
+            self.assertIsNone(self.node({"overrides": {"y": {"x": spec}}}), spec)
+            self.assertIsNone(self.node({"resolutions": {"x": spec}}), spec)
+            self.assertIsNone(self.node({"pnpm": {"overrides": {"x": spec}}}), spec)
+        self.assertIsNone(self.node({"pnpm": {"patchedDependencies": {"x@1": "patches/x.patch"}}}))
+        self.assertIsNone(self.node({"patchedDependencies": {"x@1": "patches/x.patch"}}), "так правки задаёт Bun")
+        self.assertIsNone(self.node({"dependencies": {"x": 1}}), "чего не понять — того не повторяем")
+        self.assertIsNone(self.node({"scripts": "x"}))
+        self.assertIsNone(reusable_install(project({"package.json": "{", "package-lock.json": "{}"}), "node"))
+        self.assertIsNone(reusable_install(project({"package.json": "[]", "package-lock.json": "{}"}), "node"))
+        self.assertIsNone(reusable_install(project({"index.html": ""}), "static"))
+
+    def test_node_needs_lock(self):
+        for lock in ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"):
+            self.assertEqual(self.node({}, lock=lock), "", lock)
+        self.assertIsNone(self.node({"dependencies": {"x": "^1"}}, lock=None), "без lock-файла каждая установка берёт свежие версии")
+        root = project({"package.json": "{}", "real.json": "{}"}, {"package-lock.json": "real.json"})
+        self.assertIsNone(reusable_install(root, "node"), "lock-файл-ссылка не в счёт")
+        os.makedirs(os.path.join(root, "yarn.lock"))
+        self.assertIsNone(reusable_install(root, "node"), "и каталог тоже")
+
+    def test_prisma(self):
+        def key(files, pkg=None, links=None):
+            pkg = pkg or {"dependencies": {"@prisma/client": "6"}}
+            return reusable_install(project({"package.json": json.dumps(pkg), "package-lock.json": "{}", **files}, links), "node")
+
+        base = key({"prisma/schema.prisma": "model A {}", "prisma/migrations/1/migration.sql": "x"})
+        self.assertTrue(base, "схема Prisma — в ключе снимка")
+        self.assertEqual(base, key({"prisma/schema.prisma": "model A {}", "prisma/migrations/1/migration.sql": "x", "src/a.ts": "1"}))
+        self.assertNotEqual(base, key({"prisma/schema.prisma": "model B {}", "prisma/migrations/1/migration.sql": "x"}))
+        self.assertNotEqual(base, key({"prisma/schema.prisma": "model A {}", "prisma/migrations/1/migration.sql": "y"}),
+                            "каталог prisma/ — целиком")
+        self.assertNotEqual(base, key({"prisma/schema.prisma": "model A {}", "prisma/migrations/1/migration.sql": "x",
+                                       "prisma.config.ts": "export default {}"}))
+        self.assertNotEqual(key({"schema.prisma": "a"}, {"devDependencies": {"prisma": "6"}}),
+                            key({"schema.prisma": "b"}, {"devDependencies": {"prisma": "6"}}))
+        self.assertEqual(key({"schema.prisma": "a"}, {"dependencies": {"x": "1"}}), "", "без Prisma схема не читается")
+        custom = {"dependencies": {"@prisma/client": "6"}, "prisma": {"schema": "db/schema.prisma"}}
+        self.assertNotEqual(key({"db/schema.prisma": "a"}, custom), key({"db/schema.prisma": "b"}, custom), "путь из package.json")
+        custom_dir = {"dependencies": {"@prisma/client": "6"}, "prisma": {"schema": "./db/"}}
+        self.assertNotEqual(key({"db/a.prisma": "a"}, custom_dir), key({"db/a.prisma": "b"}, custom_dir))
+        for schema in ("../schema.prisma", "/etc/schema.prisma", "db/../../x", 5, ""):
+            self.assertIsNone(key({}, {"dependencies": {"@prisma/client": "6"}, "prisma": {"schema": schema}}), schema)
+        outside = project({"schema.prisma": "secret"})
+        self.assertIsNone(key({}, links={"prisma": outside}), "по ссылкам наружу не ходим")
+        self.assertIsNone(key({}, links={"schema.prisma": os.path.join(outside, "schema.prisma")}))
+        linked = key({"prisma/schema.prisma": "a"}, links={"prisma/up": outside})
+        self.assertEqual(linked, key({"prisma/schema.prisma": "a"}), "ссылка внутри каталога пропускается")
+        many = {f"prisma/m/{i}.sql": "" for i in range(1001)}
+        self.assertIsNone(key(many), "больше 1000 файлов — снимок не используется")
+
+    def python(self, requirements, extra=None):
+        return reusable_install(project({"requirements.txt": requirements, **(extra or {})}), "python")
+
+    def test_python(self):
+        self.assertEqual(self.python("# web\nflask==3.1.1 ; python_version >= '3.10'  # нужен\nFlask-Login[extra,x] == 0.6.3\n"
+                                     "requests[socks]===2.32.4 \\\n    --hash=sha256:abc --hash sha256:def\n\n"
+                                     "-i https://pypi.example.com/simple\n--index-url https://x/simple\n"
+                                     "--extra-index-url https://y/simple\n--trusted-host y\n--prefer-binary\n--only-binary :all:\n"
+                                     "--no-binary lxml\n--pre\r\n", {"pyproject.toml": "[tool.ruff]\n"}), "")
+        for line in ("flask", "flask>=3", "flask~=3.1", "flask==3.*", "flask==3.1,<4", "flask!=3", "flask==3.1 extra",
+                     "-r base.txt", "--requirement base.txt", "-c constraints.txt", "-e .", "-e git+https://x/y.git#egg=y",
+                     "--find-links ./wheels", "-f ./wheels", "./libs/pkg", "/opt/pkg.whl", "pkg @ file:///opt/pkg.whl",
+                     "git+https://github.com/x/y@main", "pkg @ https://example.com/pkg.tar.gz", "../shared", "--hash-bogus"):
+            self.assertIsNone(self.python("flask==3.1.1\n" + line + "\n"), line)
+        self.assertIsNone(reusable_install(project({"pyproject.toml": "[project]\nname='x'\n"}), "python"),
+                          "pip install . ставит сам проект")
+        self.assertIsNone(reusable_install(project({"app.py": "import flask\n"}), "python"), "пакеты из импортов — без версий")
+        self.assertIsNone(reusable_install(project({"r.txt": "flask==3.1.1\n"}, {"requirements.txt": "r.txt"}), "python"))
+
+    def test_other_stacks(self):
+        self.assertIsNone(reusable_install(project({"go.mod": "module x\n", "go.sum": ""}), "go"))
+        self.assertIsNone(reusable_install(project({"Dockerfile": "FROM x\n", "package.json": "{}", "package-lock.json": "{}"}), "docker"))
+
+    def test_command(self):
+        script = os.path.join(os.path.dirname(__file__), "..", "recipes", "detect.py")
+        ok = subprocess.run([sys.executable, script, "reusable-install", project({"requirements.txt": "flask==3.1.1\n"}), "python"],
+                            capture_output=True, text=True)
+        self.assertEqual((ok.returncode, ok.stdout), (0, "\n"))
+        no = subprocess.run([sys.executable, script, "reusable-install", project({"requirements.txt": "-e .\n"}), "python"])
+        self.assertEqual(no.returncode, 1)
+        pkg = '{"dependencies":{"prisma":"6"}}'
+        prisma = subprocess.run([sys.executable, script, "reusable-install", project({"package.json": pkg, "yarn.lock": "",
+                                 "schema.prisma": "x"}), "node"], capture_output=True, text=True)
+        self.assertEqual(prisma.returncode, 0)
+        self.assertRegex(prisma.stdout, r"^[0-9a-f]{64}\n$")
+
+    def test_build_prefix(self):
+        berry = "__metadata:\n  version: 8\n"
+        express = '{"scripts":{"start":"node server.js","build":"tsc"},"dependencies":{"express":"5"}}'
+        self.assertEqual(parse(None, project({"package.json": express, "yarn.lock": berry}))["BUILD_PREFIX"], COREPACK_ENV,
+                         "отдельный запуск сборки видит Yarn, который поставила установка")
+        bun = parse(None, project({"package.json": express, "bun.lock": "{}"}))["BUILD_PREFIX"]
+        self.assertEqual(bun, "export PATH=/app/.airlok/bun/node_modules/.bin:$PATH")
+        self.assertTrue(BUN_SETUP.endswith(bun), "то же, что оставляет установка Bun")
+        self.assertEqual(parse(None, project({"package.json": express, "package-lock.json": "{}"}))["BUILD_PREFIX"], "")
+        self.assertEqual(parse(None, project({"go.mod": "module x\n", "main.go": "package main\n"}))["BUILD_PREFIX"], "")
+
+    def test_build_compile(self):
+        flask = {"requirements.txt": "flask==3.1.1\n", "app.py": "import flask\napp = flask.Flask(__name__)\n"}
+        values = parse(None, project(flask))
+        self.assertEqual(values["BUILD_COMPILE"], PY_COMPILE, "после снимка байткод кода проекта собирается отдельно")
+        self.assertTrue(values["BUILD_INSTALL"].endswith(" && " + PY_COMPILE))
+        self.assertEqual(parse(None, project({"package.json": '{"scripts":{"start":"node a.js"}}'}))["BUILD_COMPILE"], "")
 
 
 class DropLinksTest(unittest.TestCase):

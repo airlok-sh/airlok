@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 
 RECIPES = os.path.join(os.path.dirname(__file__), "..", "recipes")
@@ -157,6 +158,81 @@ class BaseImagesTest(unittest.TestCase):
                 f.write(text + "\n")
             out = self.run_func(f"base_unreachable {path!r}")
             self.assertEqual(out.returncode == 0, want, text)
+
+
+class DockerfilePullTest(unittest.TestCase):
+    """Сборка по Dockerfile: --pull не чаще раза в сутки на приложение, после неудачи — раза в час."""
+
+    def setUp(self):
+        with open(os.path.join(RECIPES, "app-deploy.sh"), encoding="utf-8") as f:
+            src = f.read()
+        self.funcs = "\n".join(re.search(r"^%s\(\) \{\n.*?\n\}\n" % name, src, re.M | re.S).group(0)
+                               for name in ("dockerfile_build", "base_unreachable"))
+        self.consts = "\n".join(re.search(r"^%s=.*$" % name, src, re.M).group(0) for name in ("BASE_PULL_MINUTES", "BASE_RETRY_MINUTES"))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.stamp = os.path.join(self.tmp, "stamps", "app-shop.pull")
+        self.log = os.path.join(self.tmp, "build.log")
+
+    def build(self, pull_log=None, build_fails=False):
+        """build_image пишет аргументы в calls; с --pull падает с pull_log в логе, если он задан."""
+        stub = ('build_image() { echo "${2:-}" >>"$T/calls"; '
+                'if [[ ${2:-} == --pull && -n $PULL_LOG ]]; then echo "$PULL_LOG" >"$1"; return 1; fi; '
+                '[[ -z $BUILD_FAILS ]]; }')
+        script = f'source "$1"; eval "$2"; eval "$3"; {stub}; BASE_STAMPS=$T/stamps; APP_NAME=shop; DOCKER_FILE=Dockerfile; dockerfile_build "$4"'
+        env = {**os.environ, "T": self.tmp, "PULL_LOG": pull_log or "", "BUILD_FAILS": "1" if build_fails else ""}
+        out = subprocess.run(["bash", "-c", script, "bash", LIB, self.consts, self.funcs, self.log], env=env, capture_output=True, text=True)
+        path = os.path.join(self.tmp, "calls")
+        calls = []
+        if os.path.exists(path):
+            with open(path) as f:
+                calls = f.read().splitlines()
+            os.remove(path)
+        return out, calls
+
+    def age(self, path, minutes):
+        t = time.time() - minutes * 60
+        os.utime(path, (t, t))
+
+    def test_pull_once_a_day(self):
+        out, calls = self.build()
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(calls, ["--pull"])
+        self.assertTrue(os.path.exists(self.stamp))
+        self.assertEqual(self.build()[1], [""], "базу уже проверяли сегодня — без похода в реестр")
+        self.age(self.stamp, 1441)
+        self.assertEqual(self.build()[1], ["--pull"], "сутки прошли — снова с --pull")
+
+    def test_registry_down(self):
+        down = ('ERROR: failed to solve: node:22: failed to resolve source metadata for docker.io/library/node:22: '
+                'failed to authorize: failed to fetch anonymous token: unexpected status: 429 Too Many Requests')
+        out, calls = self.build(pull_log=down)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(calls, ["--pull", ""], "собирается на образах, что уже есть")
+        self.assertIn("не удалось обновить базовые образы", out.stdout)
+        self.assertTrue(os.path.exists(self.stamp + ".failed"))
+        self.assertFalse(os.path.exists(self.stamp))
+        self.assertEqual(self.build(pull_log=down)[1], [""], "после неудачи час не ходит в реестр")
+        self.age(self.stamp + ".failed", 61)
+        out, calls = self.build()
+        self.assertEqual(calls, ["--pull"])
+        self.assertTrue(os.path.exists(self.stamp))
+        self.assertFalse(os.path.exists(self.stamp + ".failed"))
+
+    def test_project_error(self):
+        out, calls = self.build(pull_log='ERROR: failed to solve: process "/bin/sh -c npm ci" did not complete successfully: exit code: 1')
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(calls, ["--pull"], "ошибку в проекте повтор не исправит")
+        self.assertFalse(os.path.exists(self.stamp))
+        self.assertFalse(os.path.exists(self.stamp + ".failed"))
+        self.assertEqual(self.build()[1], ["--pull"], "образы так и не проверены — следующая сборка проверит")
+
+    def test_build_fails_without_pull(self):
+        self.build()
+        out, calls = self.build(build_fails=True)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(calls, [""])
 
 
 if __name__ == "__main__":

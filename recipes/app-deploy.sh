@@ -25,6 +25,13 @@ KEEP_RELEASES=3
 # Кэш сборки приложений; каталог закрыт root, внутри — по каталогу на приложение.
 BUILD_CACHE_ROOT=/var/lib/airlok/cache
 BUILD_CACHE_MIN_FREE_MB=2048
+# Файлы зависимостей: по их отпечатку сбрасывается кэш сборки и подходит снимок зависимостей.
+DEPS_FILES=(package.json package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb .npmrc .yarnrc .yarnrc.yml bunfig.toml requirements.txt pyproject.toml poetry.lock uv.lock Pipfile Pipfile.lock go.mod go.sum composer.json composer.lock)
+# Версия формата снимка зависимостей: меняется вместе с тем, что влияет на установку в контейнере
+# сборки (переменные build_container, состав modules_outputs), — старые снимки тогда не подходят.
+MODULES_REV=2
+# Срок жизни снимка: пакеты, которые агент ставит сам без версий (gunicorn, uvicorn), иначе застыли бы.
+MODULES_MAX_MINUTES=4320
 BUILD_SLICE=airlokbuild.slice
 SLICE_REFUSED=$BASE_STAMPS/slice-refused
 # Память, которую сборка оставляет сайтам и базе.
@@ -287,7 +294,7 @@ pull_base() {
 # base_images — свежие базовые образы до сборки. Node.js, Python, nginx и Postgres живут в образе
 # запуска и обновляются при пересоздании контейнера, а Go вшит в собранную программу: для Go
 # идентификатор образа сборки входит в отпечаток релиза, и после обновления Go релиз собирается
-# заново. Образ по Dockerfile обновляет docker build --pull.
+# заново. Образ по Dockerfile обновляет docker build --pull (dockerfile_build).
 # Имя образа сборки тоже входит в отпечаток: node_modules с нативными модулями и .venv собраны под
 # свою версию среды, а её меняет не только проект, но и обновление агента (правила выбора версии).
 base_images() {
@@ -388,8 +395,9 @@ cache_limit() {
 	echo "$limit"
 }
 
-# evict_caches — на диске мало места: стираем кэши сборки всех приложений, начиная с тех, чьи
-# сборки шли давнее всего, пока места не станет достаточно. Кэш собираемого приложения — последним.
+# evict_caches — на диске мало места: стираем кэши сборки всех приложений вместе со снимками
+# зависимостей, начиная с тех, чьи сборки шли давнее всего, пока места не станет достаточно. Кэш
+# собираемого приложения — последним.
 # Время сборки — в ИМЯ.used рядом с кэшем: сама сборка его не подделает.
 evict_caches() {
 	local dir name stamp order=()
@@ -410,6 +418,7 @@ evict_caches() {
 		(($(disk_free) < BUILD_CACHE_MIN_FREE_MB)) || break
 		dir=$BUILD_CACHE_ROOT/$name
 		[[ -d $dir && ! -L $dir ]] || continue
+		modules_drop "$name"
 		rm -rf --one-file-system "$dir"
 		note "кэш сборки ${name} стёрт: на диске мало места"
 	done
@@ -419,8 +428,7 @@ evict_caches() {
 # deps_sum — отпечаток файлов зависимостей релиза.
 deps_sum() {
 	local f files=()
-	for f in package.json package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb .npmrc .yarnrc.yml \
-		requirements.txt pyproject.toml poetry.lock uv.lock Pipfile Pipfile.lock go.mod go.sum composer.json composer.lock; do
+	for f in "${DEPS_FILES[@]}"; do
 		if [[ -f $RELEASE/$f && ! -L $RELEASE/$f ]]; then files+=("$f"); fi
 	done
 	if ((${#files[@]} == 0)); then
@@ -451,8 +459,10 @@ build_cache() {
 		used=$(du -sxm "$dir" 2>/dev/null | cut -f1) || used=0
 		if ((${used:-0} > $(cache_limit))); then
 			rm -rf --one-file-system "$dir"
+			modules_drop
 			note "кэш сборки больше предела — очищен, эта сборка с нуля"
 		elif [[ $(cat "$dir.deps" 2>/dev/null) != "$sum" ]]; then
+			modules_drop
 			find "$dir" -mindepth 1 -maxdepth 1 ! -name npm -exec rm -rf --one-file-system {} +
 			if [[ -d $dir/npm && ! -L $dir/npm ]]; then
 				find "$dir/npm" -mindepth 1 -maxdepth 1 ! -name _cacache -exec rm -rf --one-file-system {} +
@@ -478,7 +488,160 @@ cache_spoiled() {
 	[[ -n $BUILD_CACHE ]] && grep -qE 'EINTEGRITY|ERR_PNPM_TARBALL_INTEGRITY|ENOSPC|No space left on device|[Cc]orrupt|checksum mismatch' "$1"
 }
 
-# build_container СКРИПТ ЛОГ — установка зависимостей и сборка в контейнере. Значения
+# Снимок зависимостей: node_modules или .venv после удачной установки лежат в ИМЯ.modules рядом с кэшем
+# приложения, а ключ — в ИМЯ.modules.key. Пока не изменились файлы зависимостей, образ сборки, команда
+# установки и переменные сборки, установку заменяет копия снимка: npm ci и pip install по тёплому кэшу
+# пакетов всё равно распаковывают десятки тысяч файлов, а копия на диске — секунды. Снимок вне каталога,
+# который монтируется в контейнер: код сборки не может подменить его для следующих сборок.
+
+# modules_outputs — что оставляет в релизе установка зависимостей.
+modules_outputs() {
+	if [[ $APP_STACK == python ]]; then
+		echo .venv
+	else
+		echo node_modules .airlok/bun .airlok/corepack
+	fi
+}
+
+# plain_path ПУТЬ — путь внутри релиза без ссылок: root читает и пишет по нему, не выходя из релиза.
+plain_path() {
+	local part path=$RELEASE parts=()
+	IFS=/ read -ra parts <<<"$1"
+	for part in "${parts[@]}"; do
+		path+=/$part
+		[[ ! -L $path ]] || return 1
+	done
+}
+
+# modules_key — ключ снимка для этой сборки. Ошибка — снимок не подходит: установка зависит не только
+# от файлов зависимостей или берёт свежие версии (detect.py reusable-install), файл зависимостей —
+# ссылка и не входит в отпечаток, или образа сборки ещё нет на сервере. Что ещё читает установка
+# (схему Prisma), detect.py возвращает отпечатком.
+modules_key() {
+	local f id sum extra
+	[[ -n $BUILD_INSTALL && -n $BUILD_CACHE ]] || return 1
+	for f in "${DEPS_FILES[@]}"; do
+		[[ ! -L $RELEASE/$f ]] || return 1
+	done
+	extra=$(python3 "$RECIPES_DIR/detect.py" reusable-install "$RELEASE" "$APP_STACK") || return 1
+	id=$(docker image inspect --format '{{.Id}}' "$BUILD_IMAGE" 2>/dev/null) && [[ -n $id ]] || return 1
+	sum=$(deps_sum) && [[ $sum != none ]] || return 1
+	printf '%s\0' "$MODULES_REV" "$APP_STACK" "$sum" "$extra" "$BUILD_IMAGE" "$id" "$BUILD_INSTALL" "$BUILD_ENV_SUM" | sha256sum | cut -d' ' -f1
+}
+
+# modules_drop [ИМЯ] — убрать снимок зависимостей приложения вместе с недописанным.
+modules_drop() {
+	local snap=$BUILD_CACHE_ROOT/${1:-$APP_NAME}.modules
+	rm -f "$snap.key"
+	rm -rf --one-file-system "$snap" "$snap.tmp"
+}
+
+# modules_copy ОТКУДА КУДА — копия каталога: ссылки остаются ссылками, время изменения сохраняется —
+# по нему Python решает, свежий ли .pyc, а npm — можно ли верить node_modules/.package-lock.json.
+modules_copy() {
+	cp -dR --preserve=mode,ownership,timestamps --reflink=auto "$1" "$2"
+}
+
+# modules_save КЛЮЧ — снимок того, что оставила удачная установка. Снимок больше предела кэша
+# приложения не хранится.
+modules_save() {
+	local snap=$BUILD_CACHE_ROOT/$APP_NAME.modules name size saved=0
+	local tmp=$snap.tmp
+	modules_drop
+	install -d -m 700 -o root -g root "$tmp" || return 1
+	for name in $(modules_outputs); do
+		plain_path "$name" || return 1
+		[[ -d $RELEASE/$name ]] || continue
+		if [[ $name == */* ]]; then install -d -m 700 "$tmp/${name%/*}" || return 1; fi
+		modules_copy "$RELEASE/$name" "$tmp/$name" || return 1
+		saved=1
+	done
+	if ((!saved)); then
+		rm -rf --one-file-system "$tmp"
+		return 0
+	fi
+	# Каналы и сокеты зависимостям не нужны, а setuid и setgid в них ставить незачем.
+	find "$tmp" ! -type d ! -type f ! -type l -delete || return 1
+	find "$tmp" ! -type l -perm /6000 -exec chmod ug-s {} + || return 1
+	size=$(du -sxm "$tmp" | cut -f1) || return 1
+	if ((${size:-0} > $(cache_limit))); then
+		rm -rf --one-file-system "$tmp"
+		note "зависимости занимают ${size} МБ — больше предела кэша, следующая сборка поставит их заново"
+		return 0
+	fi
+	mv -T "$tmp" "$snap" && printf '%s\n' "$1" >"$snap.key"
+}
+
+# modules_restore КЛЮЧ — скопировать в релиз снимок с этим ключом, если он не старше
+# MODULES_MAX_MINUTES (время сохранения — у файла ключа). Владелец копии — пользователь сборки: ей туда
+# писать. Не вышло — недокопированное убирается, и зависимости ставятся как обычно.
+modules_restore() {
+	local snap=$BUILD_CACHE_ROOT/$APP_NAME.modules name names=() broken=0
+	[[ -d $snap && ! -L $snap && $(cat "$snap.key" 2>/dev/null) == "$1" ]] || return 1
+	[[ -n $(find "$snap.key" -mmin "-${MODULES_MAX_MINUTES}" 2>/dev/null) ]] || return 1
+	for name in $(modules_outputs); do
+		[[ -d $snap/$name && ! -L $snap/$name ]] || continue
+		plain_path "$name" || return 1
+		names+=("$name")
+	done
+	((${#names[@]})) || return 1
+	for name in "${names[@]}"; do
+		rm -rf --one-file-system "${RELEASE:?}/$name"
+		if [[ $name == */* ]] && ! install -d -o "$BUILD_UID" -g "$BUILD_GID" "$RELEASE/${name%/*}"; then
+			broken=1
+			break
+		fi
+		if ! modules_copy "$snap/$name" "$RELEASE/$name" || ! chown -hR "$BUILD_UID:$BUILD_GID" "$RELEASE/$name"; then
+			broken=1
+			break
+		fi
+	done
+	((broken)) || return 0
+	for name in "${names[@]}"; do rm -rf --one-file-system "${RELEASE:?}/$name"; done
+	return 1
+}
+
+# build_steps ЛОГ — установка зависимостей и сборка в контейнере. Если подходит снимок зависимостей,
+# вместо установки — его копия и только тот шаг установки, что зависит от кода проекта (BUILD_COMPILE:
+# байткод Python — код запуска не может писать в папку приложения); без него и без команды сборки
+# контейнер не нужен вовсе. Если снимок подойдёт следующей сборке, установка и сборка идут разными
+# запусками: снимок делается между ними, пока сборка не тронула зависимости.
+build_steps() {
+	local log=$1 key="" build=$BUILD_CMD script
+	MODULES_RESTORED=0
+	: >"$log"
+	if [[ -n $BUILD_INSTALL ]]; then key=$(modules_key) || key=""; fi
+	if [[ -z $key ]]; then
+		script=$BUILD_INSTALL
+		[[ -n $script && -n $build ]] && script+=" && "
+		script+=$build
+		[[ $APP_STACK == nextjs ]] && script=$(next_cache_script "$script")
+		build_container "$script" "$log"
+		return
+	fi
+	if [[ -n $build ]]; then
+		[[ -n $BUILD_PREFIX ]] && build="${BUILD_PREFIX} && ${build}"
+		[[ $APP_STACK == nextjs ]] && build=$(next_cache_script "$build")
+	fi
+	if modules_restore "$key"; then
+		MODULES_RESTORED=1
+		note "зависимости не менялись — взяты из прошлой сборки"
+		echo "зависимости не менялись — взяты из прошлой сборки, без установки" >>"$log"
+		script=$BUILD_COMPILE
+		[[ -n $script && -n $build ]] && script+=" && "
+		script+=$build
+		[[ -z $script ]] || build_container "$script" "$log"
+		return
+	fi
+	build_container "$BUILD_INSTALL" "$log" || return 1
+	if ! modules_save "$key"; then
+		modules_drop
+		note "не удалось сохранить зависимости для следующих сборок — они поставят их заново"
+	fi
+	[[ -z $build ]] || build_container "$build" "$log"
+}
+
+# build_container СКРИПТ ЛОГ — установка зависимостей и сборка в контейнере, вывод дописывается в ЛОГ. Значения
 # переменных сборки идут через окружение docker, а не аргументами: в ps их не видно. Агенту вывод
 # нужен и в общем логе: дашборд показывает его по ходу выкатки. sh -x печатает каждую команду
 # перед запуском: go build и go mod download молчат минутами, а так видно, какой шаг идёт.
@@ -510,9 +673,9 @@ build_container() {
 	# контейнеру, где sh с PID 1 его не замечает, — сборка шла бы ещё минуты. wait сигнал прерывает,
 	# и контейнер сразу убирает drop_build.
 	if [[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]]; then
-		("${run[@]}" 2>&1 | tee "$2") &
+		("${run[@]}" 2>&1 | tee -a "$2") &
 	else
-		"${run[@]}" >"$2" 2>&1 &
+		"${run[@]}" >>"$2" 2>&1 &
 	fi
 	wait $!
 }
@@ -560,6 +723,28 @@ build_image() {
 	return 1
 }
 
+# dockerfile_build ЛОГ — сборка по Dockerfile. Базовые образы из FROM Docker сам не обновляет, и сборка
+# идёт с --pull, но, как у pull_base, не чаще раза в BASE_PULL_MINUTES на приложение, а после неудачи —
+# раза в BASE_RETRY_MINUTES: иначе каждая публикация ходила бы в реестр, а при недоступном Docker Hub
+# ждала бы таймаута. Образа из FROM нет на сервере — Docker скачает его и без --pull.
+dockerfile_build() {
+	local log=$1 stamp=$BASE_STAMPS/app-${APP_NAME}.pull
+	if [[ -n $(find "$stamp" -mmin "-${BASE_PULL_MINUTES}" 2>/dev/null) || -n $(find "${stamp}.failed" -mmin "-${BASE_RETRY_MINUTES}" 2>/dev/null) ]]; then
+		build_image "$log"
+		return
+	fi
+	install -d -m 755 "$BASE_STAMPS"
+	if build_image "$log" --pull; then
+		touch "$stamp"
+		rm -f "${stamp}.failed"
+		return 0
+	fi
+	base_unreachable "$log" || return 1
+	touch "${stamp}.failed"
+	note "не удалось обновить базовые образы из ${DOCKER_FILE} — собираю на тех, что уже есть на сервере"
+	build_image "$log"
+}
+
 # base_unreachable ЛОГ — сборка упала, не достучавшись до реестра базового образа, а не на шаге
 # проекта и не из-за опечатки в FROM: отказ Docker Hub (hub_failed) или сетевой сбой чужого реестра.
 base_unreachable() {
@@ -597,7 +782,7 @@ build() {
 	fi
 	step "Сборка: ${APP_FRAMEWORK}"
 	stage build "$APP_FRAMEWORK"
-	local log=${RELEASE}.build.log script pair names=() line
+	local log=${RELEASE}.build.log pair names=() line
 	for pair in "${BUILD_ENV[@]}"; do names+=("${pair%%=*}"); done
 	((${#names[@]})) && note "переменные сборки: ${names[*]}"
 	build_limits
@@ -606,14 +791,8 @@ build() {
 		while IFS= read -r line; do
 			[[ -n $line ]] && note "внимание: $line"
 		done <<<"$DOCKER_WARNINGS"
-		# --pull: иначе Docker собирал бы на том образе из FROM, что скачал когда-то впервые.
 		local built=0
-		if build_image "$log" --pull; then
-			built=1
-		elif base_unreachable "$log"; then
-			note "не удалось обновить базовые образы из ${DOCKER_FILE} — собираю на тех, что уже есть на сервере"
-			build_image "$log" && built=1
-		fi
+		dockerfile_build "$log" && built=1
 		slice_cleanup
 		if ((!built)); then
 			[[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]] || tail -30 "$log" >&2
@@ -626,21 +805,22 @@ build() {
 		ok "образ ${RUN_IMAGE} собран по ${DOCKER_FILE}"
 		return 0
 	fi
-	script=$BUILD_INSTALL
-	[[ -n $script && -n $BUILD_CMD ]] && script+=" && "
-	script+=$BUILD_CMD
-	[[ -n $script ]] && build_cache
-	[[ -n $script && $APP_STACK == nextjs ]] && script=$(next_cache_script "$script")
 	local built=1
-	if [[ -n $script ]] && ! build_container "$script" "$log"; then
-		built=0
-		# Только при признаках порчи кэша: ошибку в коде повтор лишь отодвинул бы на вторую сборку.
-		if cache_spoiled "$log"; then
-			note "сборка упала на испорченном кэше — стираем его и собираем ещё раз"
-			rm -rf --one-file-system "$BUILD_CACHE"
-			install -d -m 700 -o "$BUILD_USER" -g "$BUILD_USER" "$BUILD_CACHE"
-			prepare_release "$SOURCE_DIR"
-			build_container "$script" "$log" && built=1
+	if [[ -n $BUILD_INSTALL || -n $BUILD_CMD ]]; then
+		build_cache
+		if ! build_steps "$log"; then
+			built=0
+			# Дело могло быть в самих зависимостях: следующая сборка поставит их заново.
+			((MODULES_RESTORED)) && modules_drop
+			# Только при признаках порчи кэша: ошибку в коде повтор лишь отодвинул бы на вторую сборку.
+			if cache_spoiled "$log"; then
+				note "сборка упала на испорченном кэше — стираем его и собираем ещё раз"
+				rm -rf --one-file-system "$BUILD_CACHE"
+				modules_drop
+				install -d -m 700 -o "$BUILD_USER" -g "$BUILD_USER" "$BUILD_CACHE"
+				prepare_release "$SOURCE_DIR"
+				build_steps "$log" && built=1
+			fi
 		fi
 	fi
 	if ((!built)); then

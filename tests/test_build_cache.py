@@ -477,14 +477,22 @@ class ModulesSnapshotTest(unittest.TestCase):
         out = self.publish("build", BUILD_CMD="echo broken >&2; false")
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("broken", out.stderr)
+        self.assertIn("сборка не удалась, полный лог:", out.stderr, "человек видит причину, а не «неизвестная ошибка»")
         self.assertEqual(len(self.calls()), 1, "сборка шла с зависимостями из снимка")
         self.assertFalse(os.path.exists(self.snap), "следующая сборка поставит зависимости заново")
         self.ok()
         self.assertEqual(len(self.calls()), 2)
 
+    def test_build_writing_outside_project(self):
+        # Одинарные кавычки — через \047: publish подставляет значения в bash через repr.
+        out = self.publish("build", BUILD_CMD='printf "Error: EACCES: permission denied, mkdir \\047/srv/backend/static\\047\\n" >&2; false')
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("сборка пишет за пределы папки проекта (mkdir '/srv/backend/static')", out.stderr)
+
     def test_failed_install_keeps_nothing(self):
         out = self.publish("build", BUILD_INSTALL="mkdir node_modules && false")
         self.assertNotEqual(out.returncode, 0)
+        self.assertIn("сборка не удалась, полный лог:", out.stderr)
         self.assertEqual(len(self.calls()), 1, "после неудачной установки сборка не запускается")
         self.assertFalse(os.path.exists(self.snap))
 

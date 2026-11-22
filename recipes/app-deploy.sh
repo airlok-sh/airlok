@@ -826,7 +826,8 @@ build() {
 	if ((!built)); then
 		[[ ${AIRLOK_BUILD_OUTPUT:-} == 1 ]] || tail -30 "$log" >&2
 		local outside
-		outside=$(grep -oE "EACCES: permission denied, [a-z]+ '/[^']*'" "$log" | grep -vE "'/(app|tmp|cache)(/|')" | head -1)
+		# Без совпадений grep возвращает 1, и под pipefail рецепт оборвался бы, не назвав причину.
+		outside=$(grep -oE "EACCES: permission denied, [a-z]+ '/[^']*'" "$log" | grep -vE "'/(app|tmp|cache)(/|')" | head -1) || true
 		if [[ -n $outside ]]; then
 			die "сборка пишет за пределы папки проекта (${outside#*, }): так бывает в монорепозитории, где фронтенд собирается в каталог бэкенда. Публикуйте каталог, в котором собирается всё приложение, или поправьте путь сборки. Полный лог: ${log}"
 		fi

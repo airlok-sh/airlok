@@ -106,15 +106,71 @@ def busy(paths):
     return held
 
 
-def wait_lock(seconds, paths=LOCKS, poll=LOCK_POLL):
+def lock_pid(locks, dev, inode):
+    """PID того, кто держит блокировку файла, по тексту /proc/locks. Ждущих (->) пропускаем."""
+    key = "%02x:%02x:%d" % (os.major(dev), os.minor(dev), inode)
+    for line in locks.splitlines():
+        f = line.split()
+        if len(f) >= 6 and f[1] == "POSIX" and f[5] == key and f[4].isdigit():
+            return int(f[4])
+    return None
+
+
+# Юнит systemd надёжнее имени процесса: unattended-upgrades под apt-daily-upgrade.service
+# называется по-разному в разных версиях Ubuntu.
+UNITS = (
+    (re.compile(r"apt-daily-upgrade\.service|unattended-upgrades\.service"), "ставятся автообновления Ubuntu"),
+    (re.compile(r"apt-daily\.service"), "Ubuntu проверяет обновления"),
+    (re.compile(r"cloud-(init|config|final)\.service"), "хостер ещё донастраивает сервер (cloud-init)"),
+    (re.compile(r"packagekit\.service"), "PackageKit проверяет обновления"),
+    (re.compile(r"airlok"), "идёт другая задача Airlok"),
+    (re.compile(r"session-\d+\.scope"), "кто-то ставит пакеты вручную по SSH"),
+)
+COMMS = {"unattended-upgr": "ставятся автообновления Ubuntu", "cloud-init": "хостер ещё донастраивает сервер (cloud-init)"}
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def describe(pid, proc="/proc"):
+    """Что за процесс держит apt, простыми словами."""
+    comm = read(os.path.join(proc, str(pid), "comm")).strip()
+    cgroup = read(os.path.join(proc, str(pid), "cgroup"))
+    what = next((text for unit, text in UNITS if unit.search(cgroup)), None) or COMMS.get(comm)
+    name = f"{comm}, PID {pid}" if comm else f"PID {pid}"
+    return f"{what} ({name})" if what else name
+
+
+def holder(paths, proc="/proc"):
+    """Кто держит первую занятую блокировку: описание или None, если узнать не вышло."""
+    locks = read(os.path.join(proc, "locks"))
+    for path in paths:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        pid = lock_pid(locks, st.st_dev, st.st_ino)
+        if pid:
+            return describe(pid, proc)
+    return None
+
+
+def wait_lock(seconds, paths=LOCKS, poll=LOCK_POLL, proc="/proc"):
     deadline = time.monotonic() + seconds
     told = False
-    while busy(paths):
+    while held := busy(paths):
         if time.monotonic() >= deadline:
             return False
-        if not told:
-            print("  система занята другой установкой (часто это автообновления), ждём…", flush=True)
-            told = True
+        # Очередь обычно сменяется: за apt-daily сразу идёт apt-daily-upgrade.
+        who = holder(held, proc)
+        if not told or (who and who != told):
+            print(f"  система занята: {who}, ждём…" if who else "  система занята другой установкой (часто это автообновления), ждём…", flush=True)
+            told = who or True
         time.sleep(poll)
     return True
 

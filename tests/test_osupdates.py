@@ -1,5 +1,6 @@
 """Подсчёт обновлений системы: python3 -m unittest discover tests"""
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -7,6 +8,8 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 
 PATH = os.path.join(os.path.dirname(__file__), "..", "recipes", "osupdates.py")
 spec = importlib.util.spec_from_file_location("osupdates", PATH)
@@ -121,6 +124,73 @@ class LockTest(unittest.TestCase):
         self.assertEqual(osupdates.busy((self.lock,)), [self.lock])
         self.assertTrue(osupdates.wait_lock(10, paths=(self.lock,), poll=0.05))
         self.assertEqual(osupdates.busy((self.lock,)), [])
+
+    @unittest.skipUnless(os.path.exists("/proc/locks"), "нужен Linux")
+    def test_names_real_holder(self):
+        p = self.hold(30)
+        self.assertIn(f"PID {p.pid}", osupdates.holder((self.lock,)))
+
+
+class HolderTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.proc = os.path.join(tmp.name, "proc")
+        os.mkdir(self.proc)
+        self.lock = os.path.join(tmp.name, "lock-frontend")
+        with open(self.lock, "w", encoding="utf-8"):
+            pass
+        st = os.stat(self.lock)
+        self.key = "%02x:%02x:%d" % (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+
+    def write(self, rel, text):
+        path = os.path.join(self.proc, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def process(self, pid, comm, cgroup):
+        self.write(f"{pid}/comm", comm + "\n")
+        self.write(f"{pid}/cgroup", cgroup)
+
+    def test_lock_pid_skips_waiters_and_other_files(self):
+        locks = ("1: POSIX  ADVISORY  WRITE 111 fd:01:999 0 EOF\n"
+                 f"2: POSIX  ADVISORY  WRITE 222 {self.key} 0 EOF\n"
+                 f"2: -> POSIX  ADVISORY  WRITE 333 {self.key} 0 EOF\n")
+        st = os.stat(self.lock)
+        self.assertEqual(osupdates.lock_pid(locks, st.st_dev, st.st_ino), 222)
+        self.assertIsNone(osupdates.lock_pid("", st.st_dev, st.st_ino))
+
+    def test_unattended_upgrades_by_unit(self):
+        self.write("locks", f"1: POSIX  ADVISORY  WRITE 1234 {self.key} 0 EOF\n")
+        self.process(1234, "unattended-upgr", "0::/system.slice/apt-daily-upgrade.service\n")
+        self.assertEqual(osupdates.holder((self.lock,), self.proc), "ставятся автообновления Ubuntu (unattended-upgr, PID 1234)")
+
+    def test_manual_apt_over_ssh(self):
+        self.write("locks", f"1: POSIX  ADVISORY  WRITE 77 {self.key} 0 EOF\n")
+        self.process(77, "apt-get", "0::/user.slice/user-0.slice/session-3.scope\n")
+        self.assertEqual(osupdates.holder((self.lock,), self.proc), "кто-то ставит пакеты вручную по SSH (apt-get, PID 77)")
+
+    def test_unknown_process_is_named_as_is(self):
+        self.write("locks", f"1: POSIX  ADVISORY  WRITE 55 {self.key} 0 EOF\n")
+        self.process(55, "mystery", "0::/system.slice/mystery.service\n")
+        self.assertEqual(osupdates.holder((self.lock,), self.proc), "mystery, PID 55")
+
+    def test_no_procfs_gives_none(self):
+        self.assertIsNone(osupdates.holder((self.lock,), self.proc))
+
+    def test_wait_lock_prints_each_new_holder(self):
+        steps = [[self.lock], [self.lock], [self.lock], []]
+        holders = iter(["Ubuntu проверяет обновления (apt.systemd.daily, PID 1)", "Ubuntu проверяет обновления (apt.systemd.daily, PID 1)",
+                        "ставятся автообновления Ubuntu (unattended-upgr, PID 2)"])
+        out = io.StringIO()
+        with mock.patch.object(osupdates, "busy", lambda paths: steps.pop(0)), \
+                mock.patch.object(osupdates, "holder", lambda paths, proc: next(holders)), redirect_stdout(out):
+            self.assertTrue(osupdates.wait_lock(10, paths=(self.lock,), poll=0))
+        self.assertEqual(out.getvalue().splitlines(), [
+            "  система занята: Ubuntu проверяет обновления (apt.systemd.daily, PID 1), ждём…",
+            "  система занята: ставятся автообновления Ubuntu (unattended-upgr, PID 2), ждём…",
+        ])
 
 
 if __name__ == "__main__":

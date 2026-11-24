@@ -13,9 +13,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "recipes"))
 
 from detect import (BERRY_VERSIONS, BUN_SETUP, COREPACK_ENV, DEFAULT_GO, DEFAULT_NODE, DEFAULT_PYTHON, LATEST_BERRY_LOCK,  # noqa: E402
                     NODE_VERSIONS, NPM_INSTALL, DetectError, Package, berry_install, bun_setup, detect, drop_outside_links,
-                    fits_node, PY_COMPILE, reusable_install, runtime_warnings, shell_exec, static_output)
+                    fits_node, imported_modules, PY_COMPILE, reusable_install, runtime_warnings, shell_exec, static_output)
 from dockerfile import guess_port  # noqa: E402
-from manifest import ManifestError, parse  # noqa: E402
+from manifest import ManifestError, parse, parse_env_example  # noqa: E402
 
 
 def project(files, links=None):
@@ -219,6 +219,36 @@ class DetectTest(unittest.TestCase):
             detect(project({"index.html": ""}), kind="worker")
         with self.assertRaises(DetectError):
             detect(project({"package.json": "{}"}), stack="node", node="18")
+
+    def test_python_without_requirements(self):
+        # Бот из одного main.py, рядом — чужие исходники, которые бот не импортирует.
+        plan = detect(project({
+            "main.py": "import asyncio, os\nimport sqlite3\nfrom aiogram import Bot, Dispatcher, F\n"
+                       "from aiogram.filters import Command\nfrom handlers.start import router\nfrom . import x\n",
+            "handlers/__init__.py": "",
+            "handlers/start.py": "from dotenv import load_dotenv\nfrom handlers import common\n",
+            "handlers/common.py": "import PIL.Image as Image\nimport telegram\n",
+            "telegram-bot-api/td/gen.py": "import some_vendored_thing\n",
+        }))
+        self.assertEqual((plan["stack"], plan["kind"], plan["framework"], plan["start"]),
+                         ("python", "worker", "бот (aiogram)", "python main.py"))
+        self.assertIn("pip install --disable-pip-version-check 'aiogram' 'pillow' 'python-dotenv' 'python-telegram-bot'",
+                      plan["install"])
+
+        plan = detect(project({"app.py": "from flask import Flask\napp = Flask(__name__)\n"}))
+        self.assertEqual(plan["framework"], "Flask")
+        self.assertIn("'flask'", plan["install"])
+        self.assertIn("pip install --disable-pip-version-check gunicorn", plan["install"], "сервер приложений ставим сами")
+
+        with self.assertRaisesRegex(DetectError, "mysterylib.*requirements.txt"):
+            detect(project({"bot.py": "import aiogram\nimport mysterylib\n"}))
+        self.assertEqual(detect(project({"index.html": "", "server.py": "import http.server\n"}))["stack"], "static",
+                         "index.html важнее случайного скрипта")
+
+    def test_imported_modules(self):
+        src = ("import os, sys as system\nimport xml.etree.ElementTree as ET\nfrom a.b import c\n  import lazy  # comment\n"
+               "from . import rel\nfrom .x import y\n# import commented\nimport (bad)\n")
+        self.assertEqual(imported_modules(src), ["os", "sys", "xml", "a", "lazy", "bad"])
 
     def test_go_directive_is_minimum(self):
         for directive, want in {"1.21": DEFAULT_GO, "1.25": DEFAULT_GO, "1.26.3": DEFAULT_GO, "1.27.2": "1.27"}.items():
@@ -592,11 +622,19 @@ class ManifestTest(unittest.TestCase):
                    "export MAX_FILE_SIZE_MB=\"10\" # мегабайты\n\n# Токен, минимум 16 символов\nUPLOAD_TOKEN=\n")
         files = {"go.mod": "module x\n", "main.go": "package main\n", ".env.example": example}
         values = parse(None, project(files))
-        self.assertEqual(values["ENV_NAMES"], "S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY UPLOAD_TOKEN",
-                         "пустое значение и заглушка обязательны, «по умолчанию», значение и комментарий — нет")
+        self.assertEqual((values["ENV_NAMES"], values["ENV_HINTS"]), ("", "S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY UPLOAD_TOKEN"),
+                         "пустое значение и заглушка — подсказка, а не блокировка; «по умолчанию», значение и комментарий — не нужны")
         values = parse({"version": 1, "env": {"UPLOAD_TOKEN": {"required": False}, "ADMIN_ID": "Telegram id администратора"}},
                        project(files))
-        self.assertEqual(values["ENV_NAMES"], "ADMIN_ID S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY", "airlok.yml важнее .env.example")
+        self.assertEqual((values["ENV_NAMES"], values["ENV_HINTS"]), ("ADMIN_ID", "S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY"),
+                         "airlok.yml важнее .env.example")
+
+    def test_env_example_placeholders(self):
+        got = parse_env_example("BOT_TOKEN=PASTE_TELEGRAM_BOT_TOKEN_HERE\nPANEL_URL=https://YOUR_PANEL_HOST\n"
+                                "PANEL_TOKEN=replace_with_panel_api_token\nTIMEZONE=Europe/Moscow\nCISPAY_API_BASE=https://api.cispay.app\n")
+        self.assertEqual([v["name"] for v in got if v["required"]], ["BOT_TOKEN", "PANEL_URL", "PANEL_TOKEN"])
+        values = parse(None, project({"bot.py": "import aiogram\n", ".env.example": "BOT_TOKEN=PASTE_TELEGRAM_BOT_TOKEN_HERE\n"}))
+        self.assertEqual((values["ENV_NAMES"], values["ENV_HINTS"]), ("", "BOT_TOKEN"), ".env.example выкатку не останавливает")
 
     def test_env_spec(self):
         root = project({"go.mod": "module x\n", "main.go": "package main\n"})
@@ -606,7 +644,7 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(parse({"version": 1, "env": ["A", "B"]}, root)["ENV_NAMES"], "A B", "список — все обязательные")
         values = parse({"version": 1, "capabilities": {"database": {"enabled": True}}},
                        project({"go.mod": "module x\n", "main.go": "package main\n", ".env.example": "DATABASE_URL=\nDEBUG=\n"}))
-        self.assertEqual(values["ENV_NAMES"], "DEBUG", "DATABASE_URL задаёт рецепт, когда заводит базу сам")
+        self.assertEqual(values["ENV_HINTS"], "DEBUG", "DATABASE_URL задаёт рецепт, когда заводит базу сам")
         values = parse({"version": 1, "env": {"SENTRY_AUTH_TOKEN": {"secret": True, "build": True},
                                               "NEXT_PUBLIC_DEBUG": {"default": "0", "build": False}, "API_URL": "Адрес API"}}, root)
         self.assertEqual((values["ENV_BUILD"], values["ENV_NO_BUILD"]), ("SENTRY_AUTH_TOKEN", "NEXT_PUBLIC_DEBUG"),

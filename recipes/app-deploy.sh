@@ -177,14 +177,20 @@ secrets() {
 	[[ -f $panel_env ]] || install -m 600 /dev/null "$panel_env"
 	ok "секреты в ${APP_DIR}/shared, права 600, в репозиторий не попадают"
 
-	# Обязательные — из airlok.yml и .env.example проекта. Без них приложение упало бы при
+	# Обязательные — из airlok.yml и compose.yml проекта. Без них приложение упало бы при
 	# запуске, а узнать об этом лучше до сборки, чем через несколько минут.
-	local name missing=()
+	local name missing=() waiting=()
 	for name in $ENV_NAMES; do
 		grep -qE "^${name}=['\"]?[^'\"]" "$panel_env" "$user_env" || missing+=("$name")
 	done
 	if ((${#missing[@]})); then
-		die "не заданы обязательные переменные: ${missing[*]}. Задайте их на странице приложения в дашборде airlok или впишите в ${user_env} в виде ИМЯ=значение и опубликуйте снова — что в них, описано в airlok.yml или .env.example проекта"
+		die "не заданы обязательные переменные: ${missing[*]}. Задайте их на странице приложения в дашборде airlok или впишите в ${user_env} в виде ИМЯ=значение и опубликуйте снова — что в них, описано в airlok.yml или compose.yml проекта"
+	fi
+	for name in ${ENV_HINTS:-}; do
+		grep -qE "^${name}=['\"]?[^'\"]" "$panel_env" "$user_env" || waiting+=("$name")
+	done
+	if ((${#waiting[@]})); then
+		note "проект ждёт переменные из .env.example: ${waiting[*]} — если приложение без них не запустится, задайте их на странице приложения в дашборде airlok"
 	fi
 
 	# Переменные сборки: NEXT_PUBLIC_*, VITE_* и отмеченные build: true в airlok.yml — их

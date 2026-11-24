@@ -117,6 +117,31 @@ BUN_COMMAND = re.compile(r"(^|[\s;&|])bunx?\s")
 # Настройки, от которых зависит, будет ли у приложения свой сервер.
 REACT_ROUTER_SPA = re.compile(r"\bssr\s*:\s*false\b")
 ASTRO_MIDDLEWARE = re.compile(r"""\bmode\s*:\s*["']middleware["']""")
+# Файлы, по которым папка без requirements.txt узнаётся как Python-приложение.
+PYTHON_START_FILES = ["bot.py", "main.py", "app.py", "run.py", "worker.py", "server.py"]
+# Пакет pip для модуля, который импортирует код. Только известные: имя модуля часто не совпадает
+# с пакетом (PIL — pillow), а угаданный пакет может оказаться чужим. Список тот же, что у сборщика
+# хостинга (internal/builder/pydeps.go).
+PYTHON_PACKAGES = {
+    "aiogram": "aiogram", "telegram": "python-telegram-bot", "telebot": "pytelegrambotapi", "telethon": "telethon",
+    "pyrogram": "pyrogram", "discord": "discord.py", "vkbottle": "vkbottle", "vk_api": "vk_api",
+    "fastapi": "fastapi", "starlette": "starlette", "uvicorn": "uvicorn", "flask": "flask", "django": "django",
+    "streamlit": "streamlit", "gradio": "gradio", "requests": "requests", "aiohttp": "aiohttp", "httpx": "httpx",
+    "websockets": "websockets", "dotenv": "python-dotenv", "yaml": "pyyaml", "PIL": "pillow", "bs4": "beautifulsoup4",
+    "lxml": "lxml", "numpy": "numpy", "pandas": "pandas", "matplotlib": "matplotlib", "sklearn": "scikit-learn",
+    "cv2": "opencv-python-headless", "sqlalchemy": "sqlalchemy", "psycopg2": "psycopg2-binary", "psycopg": "psycopg[binary]",
+    "asyncpg": "asyncpg", "aiosqlite": "aiosqlite", "redis": "redis", "pymongo": "pymongo", "motor": "motor",
+    "pydantic": "pydantic", "openai": "openai", "anthropic": "anthropic", "jwt": "pyjwt", "dateutil": "python-dateutil",
+    "pytz": "pytz", "apscheduler": "apscheduler", "schedule": "schedule", "aioschedule": "aioschedule",
+    "loguru": "loguru", "aiofiles": "aiofiles",
+}
+# Стандартная библиотека Python агента плюс модули, убранные в 3.12–3.13: их ещё импортирует код
+# для старых версий, а сборка может идти на другой версии, чем у агента.
+PYTHON_STDLIB = set(sys.stdlib_module_names) | {
+    "aifc", "asynchat", "asyncore", "audioop", "cgi", "cgitb", "chunk", "crypt", "distutils", "imghdr", "imp", "lib2to3",
+    "mailcap", "msilib", "nis", "nntplib", "ossaudiodev", "pipes", "smtpd", "sndhdr", "spwd", "sunau", "telnetlib", "uu", "xdrlib",
+}
+PYTHON_IMPORT = re.compile(r"^[ \t]*(?:from[ \t]+([A-Za-z_]\w*)[\w.]*[ \t]+import\b|import[ \t]+([^#\n;]+))", re.M)
 # Точка входа Python-приложения ищется в этих файлах по порядку.
 PYTHON_ENTRIES = ["main.py", "app.py", "app/main.py", "src/main.py", "server.py", "api.py", "wsgi.py", "asgi.py", "streamlit_app.py"]
 SEGMENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$")
@@ -320,7 +345,7 @@ def detect(root, stack="", kind="", build_command="", build_output="", run_comma
         plan["stack"], plan["framework"] = guess_stack(root, pkg, is_python)
         if not plan["stack"]:
             raise DetectError("не удалось понять, что это за проект: нет package.json, requirements.txt, pyproject.toml, "
-                              "go.mod или index.html. Укажите стек в airlok.yml (app.stack: static, nextjs, node, python или go) "
+                              "go.mod, index.html или main.py. Укажите стек в airlok.yml (app.stack: static, nextjs, node, python или go) "
                               "или каталог проекта внутри репозитория")
 
     if plan["stack"] in ("static", "nextjs", "node"):
@@ -376,6 +401,9 @@ def guess_stack(root, pkg, is_python):
         return "python", ""
     if exists(root, "index.html"):
         return "static", "HTML"
+    # Новички часто приносят один main.py без requirements.txt.
+    if any(exists(root, f) for f in PYTHON_START_FILES):
+        return "python", ""
     return "", ""
 
 
@@ -526,6 +554,62 @@ def django_wsgi(root):
     return ""
 
 
+def imported_modules(src):
+    """Модули верхнего уровня из import и from … import, без относительных."""
+    out = []
+    for frm, names in PYTHON_IMPORT.findall(src):
+        if frm:
+            out.append(frm)
+            continue
+        for part in names.split(","):
+            name = part.strip("() \t\\").split(" ", 1)[0].split(".", 1)[0]
+            if name:
+                out.append(name)
+    return out
+
+
+def package_files(root, name):
+    """.py-файлы своего пакета, не больше сотни: в огромной папке это уже не пакет приложения."""
+    out = []
+    for dirpath, dirs, files in os.walk(os.path.join(root, name)):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in ("__pycache__", "venv"))
+        for f in sorted(files):
+            path = os.path.join(dirpath, f)
+            if f.endswith(".py") and os.path.isfile(path) and not os.path.islink(path):
+                out.append(os.path.relpath(path, root))
+                if len(out) >= 100:
+                    return out
+    return out
+
+
+def infer_python_packages(root):
+    """Пакеты pip по импортам кода, когда у проекта нет requirements.txt. Код читается из корня и из
+    своих пакетов, которые он импортирует: чужие исходники в папке на список не влияют."""
+    local, files = set(), []
+    for name in sorted(os.listdir(root)):
+        path = os.path.join(root, name)
+        if name.endswith(".py") and os.path.isfile(path) and not os.path.islink(path):
+            local.add(name[:-3])
+            files.append(name)
+        elif os.path.isdir(path) and not os.path.islink(path) and not name.startswith("."):
+            local.add(name)
+
+    modules, scanned = set(), set()
+    while files:
+        for m in imported_modules(read_text(root, files.pop(0))):
+            if m not in local:
+                modules.add(m)
+            elif m not in scanned:
+                scanned.add(m)
+                files += package_files(root, m)
+
+    unknown = sorted(m for m in modules if m not in PYTHON_PACKAGES and m not in PYTHON_STDLIB)
+    if unknown:
+        raise DetectError("у Python-приложения нет requirements.txt, а по импортам не понять, какие пакеты ставить: "
+                          f"{', '.join(unknown)}. Положите в корень requirements.txt со списком пакетов (pip freeze > requirements.txt)")
+    return sorted(PYTHON_PACKAGES[m] for m in modules if m in PYTHON_PACKAGES)
+
+
 def plan_python(root, deps, run_command, plan):
     install = ["python -m venv /app/.venv"]
     pip = "/app/.venv/bin/pip install --disable-pip-version-check"
@@ -534,7 +618,11 @@ def plan_python(root, deps, run_command, plan):
     elif exists(root, "pyproject.toml"):
         install.append(pip + " .")
     else:
-        raise DetectError("для Python-приложения нужен requirements.txt или pyproject.toml")
+        pkgs = infer_python_packages(root)
+        if pkgs:
+            # Имена — из нашего списка, кавычки нужны из-за psycopg[binary].
+            install.append(pip + " " + " ".join(f"'{p}'" for p in pkgs))
+        deps += "\n" + "\n".join(pkgs)
 
     def has(name):
         return python_dep(deps, name)

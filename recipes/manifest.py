@@ -31,7 +31,7 @@ RESERVED_ENV = {"DATABASE_URL", "UPLOAD_DIR", "UPLOAD_MAX_BYTES", "DATA_DIR", "P
 EXAMPLE_FILES = (".env.example", ".env.sample", ".env.template")
 EXAMPLE_LINE = re.compile(r"^(#\s*)?(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 # Значение-заглушка: его всё равно нужно заменить своим.
-PLACEHOLDER = re.compile(r"^(<.*>|your[-_ ].*|change[-_ ]?me|replace[-_ ]?me|x{3,}|\.\.\.|todo)$", re.I)
+PLACEHOLDER = re.compile(r"^(<.*>|.*\byour[-_ ].*|change[-_ ]?me|replace[-_ ]?me|replace[-_ ]with[-_ ].*|paste[-_ ].*|.*[-_ ]here|x{3,}|\.\.\.|todo)$", re.I)
 # Комментарий говорит, что без значения можно обойтись.
 OPTIONAL_HINT = re.compile(r"необязательн|по умолчанию|можно не |optional|default", re.I)
 EXAMPLE_RESERVED = {"PORT", "HOST", "HOSTNAME", "HOME", "NODE_ENV"}
@@ -127,9 +127,9 @@ def example_value(raw):
 
 
 def parse_env_example(text):
-    """Пустое значение или заглушка — переменная обязательна, заполненное или закомментированная
-    строка — необязательна. «По умолчанию» или «необязательно» в комментарии над строкой тоже
-    делают её необязательной."""
+    """Пустое значение или заглушка — переменная обязательна (выкатку она всё же не останавливает,
+    см. ENV_HINTS), заполненное или закомментированная строка — необязательна. «По умолчанию» или
+    «необязательно» в комментарии над строкой тоже делают её необязательной."""
     out, notes = [], []
     for line in text.splitlines():
         line = line.strip()
@@ -145,7 +145,7 @@ def parse_env_example(text):
         if name in EXAMPLE_RESERVED or any(v["name"] == name for v in out):
             continue
         required = not commented and (value == "" or PLACEHOLDER.match(value) is not None) and not OPTIONAL_HINT.search(desc)
-        out.append({"name": name, "required": required})
+        out.append({"name": name, "required": required, "example": True})
     return out
 
 
@@ -252,8 +252,12 @@ def parse(data, root):
     # Что задаёт рецепт, спрашивать незачем; DATABASE_URL — только когда базу заводит он сам.
     provided = RESERVED_ENV - ({"DATABASE_URL"} if not db_enabled else set())
     from_compose = [{"name": n, "required": True} for n in docker["env"]] if docker else []
-    env = [v["name"] for v in merge_env(declared, from_compose, parse_env_example(read_example(root)))
-           if v["required"] and v["name"] not in provided]
+    needed = [v for v in merge_env(declared, from_compose, parse_env_example(read_example(root)))
+              if v["required"] and v["name"] not in provided]
+    # Пустое значение в .env.example — только подсказка: авторы оставляют пустыми и ключи
+    # необязательных интеграций, а без нужной переменной приложение само скажет об этом при запуске.
+    env = [v["name"] for v in needed if not v.get("example")]
+    hints = [v["name"] for v in needed if v.get("example")]
 
     resources = section(data, "resources")
     return {
@@ -283,6 +287,7 @@ def parse(data, root):
         "UPLOAD_MAX_MB": number(uploads, "max_size_mb", 10, 1, 512),
         "UPLOAD_EXTS": " ".join(sorted(set(exts))),
         "ENV_NAMES": " ".join(env),
+        "ENV_HINTS": " ".join(hints),
         # Явное build из airlok.yml; остальное решает имя (envkey.py build-env).
         "ENV_BUILD": " ".join(v["name"] for v in declared if v["build"] is True),
         "ENV_NO_BUILD": " ".join(v["name"] for v in declared if v["build"] is False),

@@ -23,7 +23,7 @@
     "url": "git+https://github.com/airlok-sh/airlok.git",
     "directory": "cli"
   },
-  "homepage": "https://airlok.ru",
+  "homepage": "https://www.airlok.ru",
   "keywords": [
     "deploy",
     "hosting",

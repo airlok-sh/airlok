@@ -83,3 +83,7 @@ npx @airlok/cli setup
 - Дашборд — [app.airlok.ru](https://app.airlok.ru)
 - Состояние сервиса — [app.airlok.ru/status](https://app.airlok.ru/status)
 - Поддержка — [app.airlok.ru/support](https://app.airlok.ru/support), Telegram — [@airlok_support_bot](https://t.me/airlok_support_bot)
+
+## Лицензия
+
+[Apache-2.0](LICENSE).

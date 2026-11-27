@@ -12,9 +12,10 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@airlok/cli"><img src="https://img.shields.io/npm/v/@airlok/cli?label=%40airlok%2Fcli" alt="npm"></a>
-  <a href="https://app.airlok.ru/status"><img src="https://img.shields.io/badge/status-app.airlok.ru-2ea043" alt="Статус"></a>
-  <a href="https://www.airlok.ru/docs/"><img src="https://img.shields.io/badge/docs-airlok.ru-0969da" alt="Документация"></a>
+  <a href="https://www.npmjs.com/package/@airlok/cli">npm</a> ·
+  <a href="https://www.airlok.ru/docs/">Документация</a> ·
+  <a href="https://app.airlok.ru/status">Статус</a> ·
+  <a href="https://app.airlok.ru/support">Поддержка</a>
 </p>
 
 ---

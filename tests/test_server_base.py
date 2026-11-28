@@ -363,6 +363,54 @@ class FirewallTest(AptCase):
         self.assertIn("FIREWALL=off\n", self.state())
 
 
+class BruteforceTest(AptCase):
+    def setUp(self):
+        super().setUp()
+        root = os.path.dirname(self.bin)
+        self.conf = os.path.join(root, "airlok-sshd.conf")
+        self.auth = os.path.join(root, "auth.log")
+        self.active = os.path.join(root, "active")
+        self.fake("systemctl", '[[ $1 == is-active ]] && [[ -e "%s" ]]' % self.active)
+        # На macOS нет dpkg: для «lt» хватает sort -V.
+        self.fake("dpkg", '[[ $3 == lt && $2 != "$4" && $(printf "%s\\n" "$2" "$4" | sort -V | head -1) == "$2" ]]')
+
+    def run_bruteforce(self, version, active=True):
+        self.fake("fail2ban-client", "echo 'Fail2Ban v%s'" % version)
+        if active:
+            open(self.active, "w").close()
+        script = 'source "$1"; eval "$2"; sleep() { :; }; F2B_SSHD_CONF=$3 AUTH_LOG=$4; bruteforce'
+        out = subprocess.run(["bash", "-c", script, "bash", LIB, func("bruteforce"), self.conf, self.auth], capture_output=True,
+                             text=True, env={**os.environ, "PATH": self.bin + os.pathsep + os.environ["PATH"]})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out
+
+    def test_old_fail2ban_without_auth_log_reads_journal(self):
+        out = self.run_bruteforce("0.11.2")
+        with open(self.conf) as f:
+            self.assertEqual(f.read(), "[sshd]\nbackend = systemd\n")
+        self.assertIn("systemctl restart fail2ban", self.called())
+        self.assertIn("fail2ban включён", out.stdout)
+
+    def test_auth_log_or_new_fail2ban_keep_package_defaults(self):
+        self.run_bruteforce("1.0.2")
+        open(self.auth, "w").close()
+        self.run_bruteforce("0.11.2")
+        self.assertFalse(os.path.exists(self.conf))
+        self.assertNotIn("systemctl restart fail2ban", self.called())
+
+    def test_own_jail_file_is_not_overwritten(self):
+        with open(self.conf, "w") as f:
+            f.write("[sshd]\nenabled = false\n")
+        self.run_bruteforce("0.11.2")
+        with open(self.conf) as f:
+            self.assertEqual(f.read(), "[sshd]\nenabled = false\n")
+
+    def test_dead_fail2ban_is_reported(self):
+        out = self.run_bruteforce("1.0.2", active=False)
+        self.assertIn("fail2ban не запустился", out.stdout)
+        self.assertNotIn("fail2ban включён", out.stdout)
+
+
 class DockerDaemonTest(AptCase):
     def setUp(self):
         super().setUp()

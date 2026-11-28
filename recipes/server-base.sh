@@ -22,6 +22,8 @@ SSH_GUARD_UNIT=airlok-ssh-guard.service
 # Агенту нужно окно дольше: человек идёт в терминал по подсказке из дашборда.
 SSH_ROLLBACK_SECONDS=${AIRLOK_SSH_ROLLBACK_SECONDS:-180}
 [[ $SSH_ROLLBACK_SECONDS =~ ^[1-9][0-9]{1,3}$ ]] || die "AIRLOK_SSH_ROLLBACK_SECONDS — число секунд от 10 до 9999"
+F2B_SSHD_CONF=/etc/fail2ban/jail.d/airlok-sshd.conf
+AUTH_LOG=/var/log/auth.log
 APT_LOG=/var/log/airlok-apt.log
 APT_LOCK_WAIT=${AIRLOK_APT_LOCK_WAIT:-600}
 # Установка зовёт apt два-три раза подряд: списки пакетов моложе этого заново не скачиваем. Отметку
@@ -39,7 +41,7 @@ preflight() {
 	step "Предварительная проверка"
 	local os mem disk
 	os=$(. /etc/os-release && echo "${ID}-${VERSION_ID}")
-	[[ $os == ubuntu-24.04 || $os == ubuntu-26.04 ]] || die "рецепт проверен только на Ubuntu 24.04 и 26.04, здесь ${os}"
+	[[ $os == ubuntu-22.04 || $os == ubuntu-24.04 || $os == ubuntu-26.04 ]] || die "рецепт проверен только на Ubuntu 22.04, 24.04 и 26.04, здесь ${os}"
 	disk=$(df -Pm / | awk 'NR==2{print $4}')
 	# Обновление агента не должно падать оттого, что сервер с тех пор обжили: место кончается,
 	# а на 443 встал VPN.
@@ -290,8 +292,20 @@ firewall() {
 
 bruteforce() {
 	step "Защита от перебора"
-	systemctl enable --now fail2ban >/dev/null 2>&1
-	ok "fail2ban включён"
+	# fail2ban 0.11 (Ubuntu 22.04) ищет вход по SSH в auth.log, а без rsyslog его нет,
+	# и fail2ban не стартует. Тогда пусть читает журнал systemd, как fail2ban 1.x.
+	if [[ ! -e $AUTH_LOG && ! -e $F2B_SSHD_CONF ]] && dpkg --compare-versions "$(fail2ban-client --version 2>/dev/null | sed -n 's/^Fail2Ban v//p')" lt 1.0; then
+		printf '[sshd]\nbackend = systemd\n' >"$F2B_SSHD_CONF"
+		systemctl restart fail2ban >/dev/null 2>&1 || true
+	fi
+	systemctl enable --now fail2ban >/dev/null 2>&1 || true
+	# Неверный jail роняет fail2ban уже после старта службы.
+	sleep 2
+	if systemctl is-active --quiet fail2ban; then
+		ok "fail2ban включён"
+	else
+		note "fail2ban не запустился, сервер работает без него: journalctl -u fail2ban"
+	fi
 }
 
 web() {
